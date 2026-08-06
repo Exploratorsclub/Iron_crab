@@ -5512,7 +5512,7 @@ impl ExecutionContext {
                 let plan = tx_builder::TxPlan {
                     instructions: vec![close_ix],
                 };
-                let sim = simulate_transaction(ctx, wallet, &plan, None).await;
+                let sim = simulate_transaction(ctx, wallet, &plan, None, None).await;
                 if sim.success {
                     let config = ctx.get_config();
                     if config.send_enabled {
@@ -5650,7 +5650,7 @@ impl ExecutionContext {
                 instructions: vec![close_ix],
             };
 
-            let sim = simulate_transaction(ctx, wallet, &plan, None).await;
+            let sim = simulate_transaction(ctx, wallet, &plan, None, None).await;
             if !sim.success {
                 warn!(token_account = %token_account, mint = %mint, token_program = %token_program, error = ?sim.error_code, "Close empty token account simulation failed; not sending");
                 continue;
@@ -6094,7 +6094,7 @@ impl ExecutionContext {
             }
 
             let plan = tx_builder::TxPlan { instructions: ixs };
-            let sim = simulate_transaction(&ctx, wallet, &plan, None).await;
+            let sim = simulate_transaction(&ctx, wallet, &plan, None, None).await;
             if !sim.success {
                 warn!(request_id = %request_id, token_account = %token_account_pk, mint = %mint, error = ?sim.error_code, "Burn simulation failed; not sending");
                 let rec = BurnOpRecord {
@@ -11614,8 +11614,14 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         info!(intent_id = %intent.intent_id, "Running simulation");
 
         let bundle_tip_exclude = bundle_tip_ix.as_ref().map(|ix| ix.accounts[1].pubkey);
-        let sim_result =
-            simulate_transaction(ctx, wallet_pubkey, &tx_plan_for_sim, bundle_tip_exclude).await;
+        let sim_result = simulate_transaction(
+            ctx,
+            wallet_pubkey,
+            &tx_plan_for_sim,
+            bundle_tip_exclude,
+            Some(&intent),
+        )
+        .await;
 
         if sim_result.success {
             break (
@@ -12210,14 +12216,15 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
             };
 
             if let Err(size_err) = check_versioned_tx_size(&versioned_tx) {
-                let serialized_len = versioned_tx_serialized_len(&versioned_tx).unwrap_or(0);
                 log_bundle_tx_size_rejection(
                     &intent,
-                    serialized_len,
+                    &versioned_tx,
                     &size_err,
+                    ctx.address_lookup_table.as_ref(),
                     ctx.address_lookup_table
                         .as_ref()
                         .is_some_and(|alt| alt.contains(&tip_account)),
+                    "before_jito_submit",
                 );
                 let reason = sim_failure_reject_reason(Some(&size_err));
                 checks.push(CheckResult {
@@ -13482,9 +13489,11 @@ fn check_versioned_tx_size(tx: &VersionedTransaction) -> Result<(), String> {
 
 fn log_bundle_tx_size_rejection(
     intent: &TradeIntent,
-    serialized_len: usize,
+    tx: &VersionedTransaction,
     size_err: &str,
+    alt: Option<&ironcrab::solana::address_lookup_table::LoadedAlt>,
     tip_filtered_from_alt: bool,
+    rejection_stage: &str,
 ) {
     let buy_dex = intent
         .metadata
@@ -13496,14 +13505,30 @@ fn log_bundle_tx_size_rejection(
         .get("sell_dex")
         .map(|s| s.as_str())
         .unwrap_or("?");
+    let serialized_len = versioned_tx_serialized_len(tx).unwrap_or(0);
+    let alt_configured = alt.is_some();
+    let analysis = ironcrab::solana::address_lookup_table::analyze_versioned_message_alt_usage(
+        &tx.message,
+        alt,
+    );
+    let static_not_in_alt: Vec<String> = analysis
+        .static_not_in_alt
+        .iter()
+        .map(|pk| pk.to_string())
+        .collect();
     warn!(
         intent_id = %intent.intent_id,
         serialized_len,
+        alt_configured,
+        alt_hit_count = analysis.alt_hit_count,
+        static_key_count = analysis.static_key_count,
         buy_dex,
         sell_dex,
         tip_filtered_from_alt,
+        static_not_in_alt = ?static_not_in_alt,
         error = %size_err,
-        "Bundle transaction exceeds Solana serialized size limit; rejecting before Jito submit"
+        rejection_stage,
+        "Bundle transaction exceeds Solana serialized size limit"
     );
     record_arb_bundle_tx_too_large();
 }
@@ -13533,6 +13558,7 @@ async fn simulate_transaction(
     wallet_pubkey: Pubkey,
     plan: &tx_builder::TxPlan,
     exclude_tip_from_alt: Option<Pubkey>,
+    bundle_size_intent: Option<&TradeIntent>,
 ) -> SimulationResult {
     let blockhash = match ctx.get_latest_blockhash().await {
         Ok(hash) => hash,
@@ -13547,30 +13573,63 @@ async fn simulate_transaction(
     };
 
     let tip_ref = exclude_tip_from_alt.as_ref();
-    let tx_result = prepare_unsigned_versioned_tx_for_simulation(
-        &wallet_pubkey,
-        plan,
-        blockhash,
-        ctx.address_lookup_table.as_ref(),
-        tip_ref,
-    );
-
-    let tx = match tx_result {
-        Ok(tx) => tx,
-        Err(e) => {
-            return SimulationResult {
-                success: false,
-                error_code: Some(e),
-                logs_preview: None,
-                compute_units_consumed: None,
-            };
+    let tx = if bundle_size_intent.is_some() {
+        match build_unsigned_versioned_tx(
+            &wallet_pubkey,
+            plan,
+            blockhash,
+            ctx.address_lookup_table.as_ref(),
+            tip_ref,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                return SimulationResult {
+                    success: false,
+                    error_code: Some(e),
+                    logs_preview: None,
+                    compute_units_consumed: None,
+                };
+            }
+        }
+    } else {
+        match prepare_unsigned_versioned_tx_for_simulation(
+            &wallet_pubkey,
+            plan,
+            blockhash,
+            ctx.address_lookup_table.as_ref(),
+            tip_ref,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                return SimulationResult {
+                    success: false,
+                    error_code: Some(e),
+                    logs_preview: None,
+                    compute_units_consumed: None,
+                };
+            }
         }
     };
 
-    if let Err(e) = check_versioned_tx_size(&tx) {
+    if let Err(size_err) = check_versioned_tx_size(&tx) {
+        if let Some(intent) = bundle_size_intent {
+            let tip_filtered_from_alt = exclude_tip_from_alt.as_ref().is_some_and(|tip| {
+                ctx.address_lookup_table
+                    .as_ref()
+                    .is_some_and(|alt| alt.contains(tip))
+            });
+            log_bundle_tx_size_rejection(
+                intent,
+                &tx,
+                &size_err,
+                ctx.address_lookup_table.as_ref(),
+                tip_filtered_from_alt,
+                "before_simulation_rpc",
+            );
+        }
         return SimulationResult {
             success: false,
-            error_code: Some(e),
+            error_code: Some(size_err),
             logs_preview: None,
             compute_units_consumed: None,
         };
