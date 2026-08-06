@@ -304,12 +304,22 @@ mod tests {
             data,
         };
 
-        let with_tip_in_alt =
-            compile_v0_versioned_message(&payer, &[ix.clone()], Some(&alt), None, blockhash)
-                .expect("compile with tip in ALT");
-        let tip_filtered =
-            compile_v0_versioned_message(&payer, &[ix], Some(&alt), Some(&tip), blockhash)
-                .expect("compile with tip filtered from ALT");
+        let with_tip_in_alt = compile_v0_versioned_message(
+            &payer,
+            std::slice::from_ref(&ix),
+            Some(&alt),
+            None,
+            blockhash,
+        )
+        .expect("compile with tip in ALT");
+        let tip_filtered = compile_v0_versioned_message(
+            &payer,
+            std::slice::from_ref(&ix),
+            Some(&alt),
+            Some(&tip),
+            blockhash,
+        )
+        .expect("compile with tip filtered from ALT");
 
         assert_ne!(with_tip_in_alt, tip_filtered);
     }

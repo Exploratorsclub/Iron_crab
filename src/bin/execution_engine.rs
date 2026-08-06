@@ -37,11 +37,7 @@ use solana_message::VersionedMessage;
 use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use solana_sdk::{
-    hash::Hash,
-    signature::Signer,
-    transaction::VersionedTransaction,
-};
+use solana_sdk::{hash::Hash, signature::Signer, transaction::VersionedTransaction};
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding, UiTransactionTokenBalance,
 };
