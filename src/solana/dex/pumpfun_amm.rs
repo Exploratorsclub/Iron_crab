@@ -71,6 +71,14 @@ fn pump_amm_singleton_global_volume_accumulator(pump_amm_program: &Pubkey) -> Pu
     Pubkey::find_program_address(&[b"global_volume_accumulator"], pump_amm_program).0
 }
 
+/// Public accessor for singleton `global_volume_accumulator` (BUY extended v2 pre-fee validation).
+#[must_use]
+pub fn pump_amm_singleton_global_volume_accumulator_pub() -> Pubkey {
+    let program_id =
+        Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).expect("PUMPFUN_AMM_PROGRAM_ID is valid");
+    pump_amm_singleton_global_volume_accumulator(&program_id)
+}
+
 /// Resolve swap metas #9/#10 from observed pool/parser/cache values.
 ///
 /// `protocol_fee_recipient` is **pool- and observation-specific** (not a global constant). If both
@@ -164,6 +172,23 @@ pub const PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2: usize = 23;
 pub const PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2: usize = 24;
 pub const PUMPFUN_AMM_SELL_EXT_THIRD_META_IX_V2: usize = 25;
 pub const PUMPFUN_AMM_SELL_FEE_TAIL_0_IX_V2: usize = 26;
+
+/// Standard 23-account `buy_exact_quote_in`: AMM program readonly meta index.
+pub const PUMPFUN_AMM_BUY_PROGRAM_IX: usize = 22;
+/// Extended v2 27-account `buy_exact_quote_in`: AMM program readonly meta index (mainnet ref `3XPKr7…`).
+pub const PUMPFUN_AMM_BUY_PROGRAM_IX_V2: usize = 16;
+
+/// Account count for standard PumpSwap `buy_exact_quote_in`.
+pub const PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS: usize = 23;
+
+#[must_use]
+pub fn pump_amm_buy_program_ix_index(account_count: usize) -> Option<usize> {
+    match account_count {
+        PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS => Some(PUMPFUN_AMM_BUY_PROGRAM_IX),
+        PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS => Some(PUMPFUN_AMM_BUY_PROGRAM_IX_V2),
+        _ => None,
+    }
+}
 
 /// Trailing-meta writability for tier-26 cashback `sell` (mainnet ref `3wNpdTky…`, pool `GrgDaBg4…`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7039,8 +7064,7 @@ impl PumpFunAmmDex {
         // BUY requires global_volume_accumulator and user_volume_accumulator.
         // See dex_parser.rs for reference account ordering from on-chain transactions.
         let metas = if is_buy {
-            // BUY: 23 accounts
-            vec![
+            let buy_base = vec![
                 AccountMeta::new(pool_market, false),                     // 0
                 AccountMeta::new(user, true),                             // 1
                 AccountMeta::new_readonly(global_config, false),          // 2
@@ -7063,14 +7087,72 @@ impl PumpFunAmmDex {
                     false,
                 ), // 14
                 AccountMeta::new_readonly(event_authority, false), // 15
-                AccountMeta::new(global_volume_accumulator, false), // 16 - REQUIRED for BUY!
-                AccountMeta::new(coin_creator_vault_ata, false), // 17
-                AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
-                AccountMeta::new(user_vol, false),         // 19 - user volume accumulator
-                AccountMeta::new_readonly(buy_fee_config, false), // 20
-                AccountMeta::new_readonly(buy_fee_program, false), // 21
-                AccountMeta::new_readonly(program_id, false), // 22
-            ]
+            ];
+
+            let buy_extended_v2 = sell_requires_pre_fee_metas && sell_requires_cashback_remaining;
+
+            if buy_extended_v2 {
+                let singleton_gva = pump_amm_singleton_global_volume_accumulator(&program_id);
+                let (buy_pre_fee_1, pre_fee_source) =
+                    pump_amm_resolve_sell_pre_fee_meta_1_for_build(
+                        &pool_market,
+                        singleton_gva,
+                        sell_pre_fee_meta_1,
+                    );
+                let buy_pre_fee_1 = buy_pre_fee_1.ok_or_else(|| {
+                    anyhow!(
+                        "pump_amm BUY: 27-account layout requires sell_pre_fee_meta_1 (cache/Geyser observation required; resolved={pre_fee_source})"
+                    )
+                })?;
+                let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
+                else {
+                    return Err(anyhow!(
+                        "pump_amm BUY: extended v2 layout required but sell_cashback_third_meta missing (Geyser/LivePoolCache observation required)"
+                    ));
+                };
+                let mut metas = buy_base;
+                metas.push(AccountMeta::new_readonly(program_id, false)); // 16
+                metas.push(AccountMeta::new(global_volume_accumulator, false)); // 17
+                metas.push(AccountMeta::new(coin_creator_vault_ata, false)); // 18
+                metas.push(AccountMeta::new_readonly(singleton_gva, false)); // 19 pre_fee_0
+                metas.push(AccountMeta::new_readonly(buy_pre_fee_1, false)); // 20 pre_fee_1
+                metas.push(AccountMeta::new_readonly(buy_fee_config, false)); // 21
+                metas.push(AccountMeta::new_readonly(buy_fee_program, false)); // 22
+                Self::push_pump_amm_sell_extended_trailing_metas(
+                    &mut metas,
+                    pool_market,
+                    base_mint,
+                    user,
+                    quote_mint,
+                    quote_tp,
+                    third,
+                    true,
+                    sell_requires_fee_tail,
+                    sell_extended_fee_tail_0,
+                    sell_extended_fee_tail_1,
+                    sell_extended_tail_0,
+                    sell_extended_tail_1,
+                    cold_path_prefer_derived_on_mismatch,
+                )?;
+                metas
+            } else if sell_requires_pre_fee_metas || sell_requires_cashback_remaining {
+                return Err(anyhow!(
+                    "pump_amm BUY: partial extended layout flags (pre_fee={sell_requires_pre_fee_metas}, cashback={sell_requires_cashback_remaining}) — need authoritative v2 layout from LivePoolCache"
+                ));
+            } else {
+                let mut metas = buy_base;
+                metas.push(AccountMeta::new(global_volume_accumulator, false)); // 16
+                metas.push(AccountMeta::new(coin_creator_vault_ata, false)); // 17
+                metas.push(AccountMeta::new_readonly(
+                    coin_creator_vault_authority,
+                    false,
+                )); // 18
+                metas.push(AccountMeta::new(user_vol, false)); // 19
+                metas.push(AccountMeta::new_readonly(buy_fee_config, false)); // 20
+                metas.push(AccountMeta::new_readonly(buy_fee_program, false)); // 21
+                metas.push(AccountMeta::new_readonly(program_id, false)); // 22
+                metas
+            }
         } else {
             // SELL: 21 base metas; some pools require three trailing accounts (mainnet 24-account sells).
             let mut metas = vec![
@@ -9079,6 +9161,71 @@ mod tests {
         assert_ne!(tail_0, Pubkey::default());
         assert_ne!(tail_1, Pubkey::default());
         assert_ne!(tail_2, Pubkey::default());
+    }
+
+    /// Arb/cross-dex regression: 27-account `buy_exact_quote_in` must place AMM program at #16, not singleton GVA at #16 (prod Custom(3008)).
+    #[test]
+    fn p184g_build_swap_27_account_buy_program_slot_is_amm_not_pre_fee() {
+        let pool_market = *PUMP_AMM_STUCK_POOL_MARKET;
+        let base_mint =
+            Pubkey::from_str("E2sHHwpzeVjhV3DjAMP8kYBeG27qT66xS3V9EBYVpump").expect("mint");
+        let user = Pubkey::new_unique();
+        let third = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_THIRD_META).unwrap();
+        let tail0 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_0).unwrap();
+        let tail1 = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_TAIL_1).unwrap();
+        let fee0 = Pubkey::new_unique();
+        let pool_gva = Pubkey::from_str("Ha1PxdHJRW6WHBhdwEX8LDxus283VvF7nnDLk1k5LZgk").unwrap();
+        let singleton_gva = Pubkey::from_str(PUMP_AMM_STUCK_POOL_CURATED_PRE_FEE_0).unwrap();
+        let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).unwrap();
+
+        let mut v14 = vec![Pubkey::default(); 14];
+        v14[0] = pool_market;
+        v14[1] = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap();
+        v14[2] = base_mint;
+        v14[3] = Pubkey::from_str(WSOL_MINT).unwrap();
+        v14[4] = Pubkey::new_unique();
+        v14[5] = Pubkey::new_unique();
+        v14[6] = Pubkey::new_unique();
+        v14[7] = Pubkey::new_unique();
+        v14[8] = Pubkey::new_unique();
+        v14[9] = Pubkey::new_unique();
+        v14[10] = Pubkey::new_unique();
+        v14[11] = pool_gva;
+        v14[12] = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap();
+        v14[13] = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            WSOL_MINT,
+            &base_mint.to_string(),
+            1,
+            1,
+            user,
+            &v14,
+            None,
+            true,
+            Some(third),
+            true,
+            None,
+            Some(tail0),
+            Some(tail1),
+            Some(fee0),
+            None,
+            false,
+            false,
+        )
+        .expect("27-account BUY build");
+
+        assert_eq!(
+            ixs[0].accounts.len(),
+            PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
+        );
+        let program_ix = pump_amm_buy_program_ix_index(ixs[0].accounts.len()).expect("program ix");
+        assert_eq!(ixs[0].accounts[program_ix].pubkey, program_id);
+        assert_ne!(ixs[0].accounts[program_ix].pubkey, singleton_gva);
+        assert_eq!(
+            ixs[0].accounts[PUMPFUN_AMM_SELL_PRE_FEE_0_IX_V2].pubkey,
+            singleton_gva
+        );
     }
 
     /// P184i: 27-account SELL uses validated cache tails only when they match intent-user derivation.
