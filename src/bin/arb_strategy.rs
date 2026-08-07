@@ -81,7 +81,9 @@ use ironcrab::metrics::{
     arb_vault_live_snapshot_cache_age_pin_bucket_inc, inc_arb_dlmm_bin_array_update_applied_total,
     inc_arb_dlmm_bin_array_update_received_total, inc_arb_dlmm_bin_rescreen_scheduled_total,
     inc_arb_pinned_meteora_pool_bin_cache_miss_total, inc_arb_v2_screen_meteora_sell_bin_hit_total,
-    inc_arb_v2_screen_meteora_sell_bin_miss_total, inc_arb_vault_balance_applied_total,
+    inc_arb_v2_screen_meteora_sell_bin_miss_total,
+    inc_arb_v2_screen_sell_stale_recovery_scheduled_total,
+    inc_arb_v2_screen_sell_stale_then_fresh_after_pin_total, inc_arb_vault_balance_applied_total,
     inc_arb_vault_live_snapshot_refreshed_total, inc_arb_vault_live_snapshot_seeded_total,
     inc_arb_vault_rescreen_scheduled_total, record_arb_heartbeat_phase,
     record_arb_intent_suppressed_implausible_token_out,
@@ -507,6 +509,30 @@ fn try_refresh_vault_from_live_cache(
     record_live_cache_age_at_snapshot("refresh", age_ms, pin_class);
     vault_cache.insert(pool_address.to_string(), new_vault);
     true
+}
+
+/// C1h5: for pinned pools, re-seed from SLAVE when local vault row exceeds state TTL (cold-start).
+fn try_overwrite_stale_pinned_vault_from_live_cache(
+    pool_address: &str,
+    live_pool_cache: &SharedLivePoolCache,
+    vault_cache: &mut HashMap<String, VaultBalanceCache>,
+    pin_class: &str,
+    state_ttl_ms: u64,
+) -> bool {
+    if pin_class != "pin" {
+        return false;
+    }
+    let Some(existing) = vault_cache.get(pool_address) else {
+        return false;
+    };
+    if existing.updated_at.elapsed().as_millis() as u64 <= state_ttl_ms {
+        return false;
+    }
+    if try_refresh_vault_from_live_cache(pool_address, live_pool_cache, vault_cache, pin_class) {
+        return true;
+    }
+    vault_cache.remove(pool_address);
+    try_seed_vault_from_live_cache(pool_address, live_pool_cache, vault_cache, pin_class)
 }
 
 /// H3: seed missing DLMM vault row from SLAVE cache on BinArrayUpdate (Geyser-only).
@@ -4794,6 +4820,8 @@ struct ArbContext {
     tracker_write: ArbTrackerWriteHandle,
     /// Latest-wins coalescer for PoolStateUpdate / DexPoolAccounts before tracker-write queue.
     tracker_write_coalescer: parking_lot::Mutex<ArbTrackerWriteCoalescer>,
+    /// C1h5: mints where sell-leg stale recovery (track dirty + rescreen) was scheduled.
+    v2_sell_stale_recovery_mints: RwLock<HashSet<String>>,
 }
 
 /// Cached vault balances from PoolStateUpdate events
@@ -6074,6 +6102,7 @@ impl ArbContext {
     ) {
         let pool_keys: Vec<String> = tracker_snapshot.pools.keys().cloned().collect();
         let pinned_pools = self.arb_pinned_pools.read();
+        let state_ttl_ms = self.config.read().arb_quote_state_ttl_ms;
         let vaults = self.vault_balances.read();
         let mut vault_balances = HashMap::with_capacity(pool_keys.len());
         for pool_key in &pool_keys {
@@ -6091,6 +6120,14 @@ impl ArbContext {
                     pin_class,
                 ) {
                     inc_arb_vault_live_snapshot_refreshed_total();
+                } else if try_overwrite_stale_pinned_vault_from_live_cache(
+                    pool_key,
+                    &self.live_pool_cache,
+                    &mut vault_balances,
+                    pin_class,
+                    state_ttl_ms,
+                ) {
+                    inc_arb_vault_live_snapshot_seeded_total();
                 }
             } else if try_seed_vault_from_live_cache(
                 pool_key,
@@ -6126,7 +6163,7 @@ impl ArbContext {
         record_v2_meteora_pinned_sell_bin_coverage(tracker_snapshot, &bin_arrays, &pinned_pools);
         let known_pools = self.known_pools.read();
         let selected_mints = self.arb_selected_mints.read();
-        tracker_snapshot.check_arbitrage(
+        let opp = tracker_snapshot.check_arbitrage(
             config,
             &known_pools,
             &vault_balances,
@@ -6139,7 +6176,138 @@ impl ArbContext {
                 selected_mints: Some(&selected_mints),
                 pinned_pools: Some(&pinned_pools),
             },
-        )
+        );
+        if opp.is_none() && config.arb_two_hop_v2_enabled {
+            self.try_schedule_v2_sell_leg_recovery(
+                tracker_snapshot,
+                config,
+                &vault_balances,
+                &bin_arrays,
+                &pinned_pools,
+            );
+        }
+        if opp.is_some()
+            && self
+                .v2_sell_stale_recovery_mints
+                .write()
+                .remove(&tracker_snapshot.base_mint)
+        {
+            inc_arb_v2_screen_sell_stale_then_fresh_after_pin_total();
+        }
+        opp
+    }
+
+    /// C1h5: when v2 screen fails on cross-dex sell leg for pinned pools, re-pin + rescreen.
+    fn try_schedule_v2_sell_leg_recovery(
+        &self,
+        tracker_snapshot: &TokenArbTracker,
+        config: &ArbConfig,
+        vault_balances: &HashMap<String, VaultBalanceCache>,
+        bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
+        pinned_pools: &HashSet<String>,
+    ) {
+        let token_decimals = match tracker_snapshot.token_decimals {
+            Some(d) => d,
+            None => return,
+        };
+        let known_pools = self.known_pools.read();
+        let freshness = TokenArbTracker::quote_freshness_config(config);
+        let probe = config.arb_probe_lamports;
+        let owned_candidates = tracker_snapshot.build_round_trip_candidates(
+            &known_pools,
+            vault_balances,
+            bin_arrays,
+            token_decimals,
+            Some(pinned_pools),
+        );
+        let candidates: Vec<RoundTripPoolCandidate<'_>> = owned_candidates
+            .iter()
+            .map(|(pool, vault, bins, dex)| RoundTripPoolCandidate {
+                pool,
+                vault: vault.as_ref(),
+                dlmm_bins: bins.as_ref(),
+                dex,
+            })
+            .collect();
+        let Err(RoundTripSelectFailure::InsufficientPools(insufficient)) =
+            select_round_trip_pools(&candidates, probe, &freshness)
+        else {
+            return;
+        };
+        if insufficient.subreason != RoundTripInsufficientSubreason::NoCrossDexSell {
+            return;
+        }
+        let recoverable = matches!(
+            insufficient.no_cross_dex_sell_detail,
+            Some(
+                NoCrossDexSellDetailReason::SellNotFresh
+                    | NoCrossDexSellDetailReason::SellMissingVault
+                    | NoCrossDexSellDetailReason::SellQuoteNone
+            )
+        );
+        if !recoverable {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut has_pinned_sell_stale = false;
+        for buy in &candidates {
+            let Some(buy_quote) = quote_exact_in_with_freshness(
+                buy.pool,
+                buy.vault,
+                buy.dlmm_bins,
+                NATIVE_SOL_MINT,
+                &buy.pool.token_mint,
+                probe,
+                &freshness,
+            ) else {
+                continue;
+            };
+            if !is_quote_fresh(&buy_quote, &freshness, buy.vault, now) {
+                continue;
+            }
+            for sell in &candidates {
+                if sell.dex == buy.dex {
+                    continue;
+                }
+                if !pinned_pools.contains(&sell.pool.pool_address) {
+                    continue;
+                }
+                let failure = classify_cross_dex_sell_failure(
+                    sell,
+                    buy_quote.amount_out,
+                    &freshness,
+                    now,
+                    token_decimals,
+                );
+                if failure.is_some() {
+                    has_pinned_sell_stale = true;
+                    break;
+                }
+            }
+            if has_pinned_sell_stale {
+                break;
+            }
+        }
+        if !has_pinned_sell_stale {
+            return;
+        }
+
+        self.v2_sell_stale_recovery_mints
+            .write()
+            .insert(tracker_snapshot.base_mint.clone());
+        inc_arb_v2_screen_sell_stale_recovery_scheduled_total();
+        self.arb_track_selection
+            .mark_dirty(&tracker_snapshot.base_mint);
+        if self
+            .two_hop_tx
+            .try_send(ArbTwoHopWorkerJob::Rescreen {
+                mint: tracker_snapshot.base_mint.clone(),
+            })
+            .is_ok()
+        {
+            inc_arb_vault_rescreen_scheduled_total();
+        }
     }
 
     /// Re-screen selected mints when DLMM bins arrive after the last trade-driven screen (H4).
@@ -7684,6 +7852,7 @@ async fn main() -> Result<()> {
         two_hop_tx,
         tracker_write,
         tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+        v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
     });
 
     spawn_arb_tracker_write_worker(Arc::clone(&ctx), tracker_write_rx);
@@ -8770,6 +8939,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -8882,6 +9052,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -8992,6 +9163,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9212,6 +9384,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9320,6 +9493,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9432,6 +9606,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9515,6 +9690,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9672,6 +9848,7 @@ mod two_hop_price_tests {
                 ArbTrackerWriteHandle { tx, capacity: 1 }
             },
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
         }
     }
 

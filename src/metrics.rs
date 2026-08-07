@@ -5146,6 +5146,12 @@ pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NOT_FRESH_AFTER: Lazy<Atomic
     Lazy::new(|| AtomicU64::new(0));
 /// PoolStateUpdate scheduled off-hot-loop rescreen for selected mints (C1vault).
 pub static ARB_VAULT_RESCREEN_SCHEDULED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// C1h5: v2 screen scheduled sell-leg recovery (track dirty + rescreen) after sell_not_fresh.
+pub static ARB_V2_SCREEN_SELL_STALE_RECOVERY_SCHEDULED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// C1h5: rescreen succeeded after prior sell-leg stale on pinned pool (cold-start recovery).
+pub static ARB_V2_SCREEN_SELL_STALE_THEN_FRESH_AFTER_PIN_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_MISS_TOTAL: Lazy<AtomicU64> =
@@ -5807,6 +5813,16 @@ pub fn arb_two_hop_v2_no_fresh_buy_quote_detail_inc(reason: &str) {
 /// Increment `arb_vault_rescreen_scheduled_total`.
 pub fn inc_arb_vault_rescreen_scheduled_total() {
     ARB_VAULT_RESCREEN_SCHEDULED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_v2_screen_sell_stale_recovery_scheduled_total`.
+pub fn inc_arb_v2_screen_sell_stale_recovery_scheduled_total() {
+    ARB_V2_SCREEN_SELL_STALE_RECOVERY_SCHEDULED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_v2_screen_sell_stale_then_fresh_after_pin_total`.
+pub fn inc_arb_v2_screen_sell_stale_then_fresh_after_pin_total() {
+    ARB_V2_SCREEN_SELL_STALE_THEN_FRESH_AFTER_PIN_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Increment `arb_v2_screen_meteora_sell_bin_hit_total`.
@@ -10779,6 +10795,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_vault_rescreen_scheduled_total",
         ARB_VAULT_RESCREEN_SCHEDULED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_screen_sell_stale_recovery_scheduled_total",
+        ARB_V2_SCREEN_SELL_STALE_RECOVERY_SCHEDULED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_screen_sell_stale_then_fresh_after_pin_total",
+        ARB_V2_SCREEN_SELL_STALE_THEN_FRESH_AFTER_PIN_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "arb_v2_screen_meteora_sell_bin_hit_total",
