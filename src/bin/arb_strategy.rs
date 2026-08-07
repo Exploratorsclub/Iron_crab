@@ -13917,10 +13917,7 @@ mod pool_accounts_coverage_tests {
 
         let trackers = ctx.trackers.read();
         let tracker = trackers.get(token_mint).unwrap();
-        assert_eq!(
-            tracker.get_pool_accounts(pool).map(|a| a.clone()),
-            Some(accounts)
-        );
+        assert_eq!(tracker.get_pool_accounts(pool).cloned(), Some(accounts));
         assert!(!ctx.pending_pool_accounts.read().contains_key(pool));
     }
 
