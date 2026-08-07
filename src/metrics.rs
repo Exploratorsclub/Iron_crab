@@ -4911,6 +4911,41 @@ pub static ARB_TRIANGLE_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64:
 /// Count of arb opportunities rejected due to missing DexPoolAccounts for pump_amm
 pub static ARB_REJECTED_MISSING_ACCOUNTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// DexPoolAccounts backfill into arb tracker from SLAVE LivePoolCache (Geyser-only).
+pub static ARB_POOL_ACCOUNTS_BACKFILL_LIVE_CACHE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// DexPoolAccounts applied from pending buffer when tracker is created later.
+pub static ARB_POOL_ACCOUNTS_BACKFILL_PENDING_BUFFER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// DexPoolAccounts found via cross-mint tracker lookup (e.g. Orca WSOL/USDC under WSOL tracker).
+pub static ARB_POOL_ACCOUNTS_BACKFILL_CROSS_MINT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// DexPoolAccounts resolved from the global pool_address → accounts index.
+pub static ARB_POOL_ACCOUNTS_BACKFILL_INDEX: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbPoolAccountsBackfillSource {
+    LiveCache,
+    PendingBuffer,
+    CrossMintLookup,
+    Index,
+}
+
+pub fn inc_arb_pool_accounts_backfill(source: ArbPoolAccountsBackfillSource) {
+    match source {
+        ArbPoolAccountsBackfillSource::LiveCache => {
+            ARB_POOL_ACCOUNTS_BACKFILL_LIVE_CACHE.fetch_add(1, Ordering::Relaxed);
+        }
+        ArbPoolAccountsBackfillSource::PendingBuffer => {
+            ARB_POOL_ACCOUNTS_BACKFILL_PENDING_BUFFER.fetch_add(1, Ordering::Relaxed);
+        }
+        ArbPoolAccountsBackfillSource::CrossMintLookup => {
+            ARB_POOL_ACCOUNTS_BACKFILL_CROSS_MINT.fetch_add(1, Ordering::Relaxed);
+        }
+        ArbPoolAccountsBackfillSource::Index => {
+            ARB_POOL_ACCOUNTS_BACKFILL_INDEX.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Arb intents published without `expected_token_output` because the reserve/bin quote was implausible.
 pub static ARB_INTENT_SUPPRESSED_IMPLAUSIBLE_TOKEN_OUT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -10706,6 +10741,22 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_rejected_missing_accounts_total",
         ARB_REJECTED_MISSING_ACCOUNTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_pool_accounts_backfill_total{source=\"live_cache\"}",
+        ARB_POOL_ACCOUNTS_BACKFILL_LIVE_CACHE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_pool_accounts_backfill_total{source=\"pending_buffer\"}",
+        ARB_POOL_ACCOUNTS_BACKFILL_PENDING_BUFFER.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_pool_accounts_backfill_total{source=\"cross_mint_lookup\"}",
+        ARB_POOL_ACCOUNTS_BACKFILL_CROSS_MINT.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_pool_accounts_backfill_total{source=\"index\"}",
+        ARB_POOL_ACCOUNTS_BACKFILL_INDEX.load(Ordering::Relaxed)
     );
     line!(
         "arb_intent_suppressed_implausible_token_out_total",
