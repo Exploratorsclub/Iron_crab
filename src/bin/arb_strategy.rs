@@ -173,6 +173,10 @@ const ARB_TRACK_INCREMENTAL_MINTS_MAX: usize = 64;
 
 /// Bounded queue for off-hot-loop 2-hop trade detection (Scope D).
 const ARB_TWO_HOP_WORKER_QUEUE_CAP: usize = 4096;
+/// C1h5: min interval between sell-leg stale recovery rescreens per mint.
+const V2_SELL_STALE_RECOVERY_MIN_INTERVAL_MS: u64 = 30_000;
+/// C1h5: cap buy candidates scanned when detecting pinned sell-leg staleness.
+const V2_SELL_STALE_RECOVERY_MAX_BUY_CANDIDATES: usize = 4;
 /// Max PoolCache updates applied per burst before yielding (main-loop decoupling).
 const ARB_POOL_CACHE_APPLY_BATCH_MAX: usize = 20;
 /// Single-writer queue for `trackers` / `vault_balances` mutations.
@@ -4499,7 +4503,10 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
                     }
                     let ctx_for_check = Arc::clone(&ctx);
                     let opp = tokio::task::spawn_blocking(move || {
-                        ctx_for_check.check_arbitrage_for_tracker(&tracker_snapshot, &config)
+                        ctx_for_check.two_hop_v2_check_and_maybe_schedule_recovery(
+                            &tracker_snapshot,
+                            &config,
+                        )
                     })
                     .await
                     .ok()
@@ -4551,7 +4558,10 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
                     // C1f: live scoped vault/bin snapshot at screen time — ApplyTrade captures
                     // bins in the writer thread and can be stale vs the global cache.
                     let opp = tokio::task::spawn_blocking(move || {
-                        ctx_for_check.check_arbitrage_for_tracker(&tracker_snapshot, &config)
+                        ctx_for_check.two_hop_v2_check_and_maybe_schedule_recovery(
+                            &tracker_snapshot,
+                            &config,
+                        )
                     })
                     .await
                     .ok()
@@ -4820,8 +4830,8 @@ struct ArbContext {
     tracker_write: ArbTrackerWriteHandle,
     /// Latest-wins coalescer for PoolStateUpdate / DexPoolAccounts before tracker-write queue.
     tracker_write_coalescer: parking_lot::Mutex<ArbTrackerWriteCoalescer>,
-    /// C1h5: mints where sell-leg stale recovery (track dirty + rescreen) was scheduled.
-    v2_sell_stale_recovery_mints: RwLock<HashSet<String>>,
+    /// C1h5: last sell-leg stale recovery schedule time per mint (rate limit).
+    v2_sell_stale_recovery_last_scheduled: RwLock<HashMap<String, Instant>>,
 }
 
 /// Cached vault balances from PoolStateUpdate events
@@ -6163,7 +6173,7 @@ impl ArbContext {
         record_v2_meteora_pinned_sell_bin_coverage(tracker_snapshot, &bin_arrays, &pinned_pools);
         let known_pools = self.known_pools.read();
         let selected_mints = self.arb_selected_mints.read();
-        let opp = tracker_snapshot.check_arbitrage(
+        tracker_snapshot.check_arbitrage(
             config,
             &known_pools,
             &vault_balances,
@@ -6176,49 +6186,67 @@ impl ArbContext {
                 selected_mints: Some(&selected_mints),
                 pinned_pools: Some(&pinned_pools),
             },
-        );
-        if opp.is_none() && config.arb_two_hop_v2_enabled {
-            self.try_schedule_v2_sell_leg_recovery(
-                tracker_snapshot,
-                config,
-                &vault_balances,
-                &bin_arrays,
-                &pinned_pools,
-            );
-        }
-        if opp.is_some()
-            && self
-                .v2_sell_stale_recovery_mints
+        )
+    }
+
+    /// Two-hop v2 screen plus optional C1h5 sell-leg recovery (spawn_blocking only).
+    fn two_hop_v2_check_and_maybe_schedule_recovery(
+        &self,
+        tracker_snapshot: &TokenArbTracker,
+        config: &ArbConfig,
+    ) -> Option<ArbOpportunity> {
+        let opp = self.check_arbitrage_for_tracker(tracker_snapshot, config);
+        if let Some(opp) = opp {
+            if self
+                .v2_sell_stale_recovery_last_scheduled
                 .write()
                 .remove(&tracker_snapshot.base_mint)
-        {
-            inc_arb_v2_screen_sell_stale_then_fresh_after_pin_total();
+                .is_some()
+            {
+                inc_arb_v2_screen_sell_stale_then_fresh_after_pin_total();
+            }
+            return Some(opp);
         }
-        opp
+        if config.arb_two_hop_v2_enabled {
+            self.try_schedule_v2_sell_leg_recovery(tracker_snapshot, config);
+        }
+        None
     }
 
     /// C1h5: when v2 screen fails on cross-dex sell leg for pinned pools, re-pin + rescreen.
+    /// Must run only from spawn_blocking (two-hop worker); clones lock snapshots before heavy work.
     fn try_schedule_v2_sell_leg_recovery(
         &self,
         tracker_snapshot: &TokenArbTracker,
         config: &ArbConfig,
-        vault_balances: &HashMap<String, VaultBalanceCache>,
-        bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
-        pinned_pools: &HashSet<String>,
     ) {
+        let mint = &tracker_snapshot.base_mint;
+        {
+            let last = self.v2_sell_stale_recovery_last_scheduled.read();
+            if let Some(prev) = last.get(mint) {
+                if prev.elapsed() < Duration::from_millis(V2_SELL_STALE_RECOVERY_MIN_INTERVAL_MS) {
+                    return;
+                }
+            }
+        }
+
         let token_decimals = match tracker_snapshot.token_decimals {
             Some(d) => d,
             None => return,
         };
-        let known_pools = self.known_pools.read();
+
+        let pinned_pools = self.arb_pinned_pools.read().clone();
+        let known_pools = self.known_pools.read().clone();
+        let (vault_balances, bin_arrays) = self.snapshot_vault_bins_for_tracker(tracker_snapshot);
+
         let freshness = TokenArbTracker::quote_freshness_config(config);
         let probe = config.arb_probe_lamports;
         let owned_candidates = tracker_snapshot.build_round_trip_candidates(
             &known_pools,
-            vault_balances,
-            bin_arrays,
+            &vault_balances,
+            &bin_arrays,
             token_decimals,
-            Some(pinned_pools),
+            Some(&pinned_pools),
         );
         let candidates: Vec<RoundTripPoolCandidate<'_>> = owned_candidates
             .iter()
@@ -6251,7 +6279,11 @@ impl ArbContext {
 
         let now = Instant::now();
         let mut has_pinned_sell_stale = false;
-        for buy in &candidates {
+        let mut buy_checks = 0usize;
+        'buy: for buy in &candidates {
+            if buy_checks >= V2_SELL_STALE_RECOVERY_MAX_BUY_CANDIDATES {
+                break;
+            }
             let Some(buy_quote) = quote_exact_in_with_freshness(
                 buy.pool,
                 buy.vault,
@@ -6266,6 +6298,7 @@ impl ArbContext {
             if !is_quote_fresh(&buy_quote, &freshness, buy.vault, now) {
                 continue;
             }
+            buy_checks += 1;
             for sell in &candidates {
                 if sell.dex == buy.dex {
                     continue;
@@ -6273,37 +6306,32 @@ impl ArbContext {
                 if !pinned_pools.contains(&sell.pool.pool_address) {
                     continue;
                 }
-                let failure = classify_cross_dex_sell_failure(
+                if classify_cross_dex_sell_failure(
                     sell,
                     buy_quote.amount_out,
                     &freshness,
                     now,
                     token_decimals,
-                );
-                if failure.is_some() {
+                )
+                .is_some()
+                {
                     has_pinned_sell_stale = true;
-                    break;
+                    break 'buy;
                 }
-            }
-            if has_pinned_sell_stale {
-                break;
             }
         }
         if !has_pinned_sell_stale {
             return;
         }
 
-        self.v2_sell_stale_recovery_mints
+        self.v2_sell_stale_recovery_last_scheduled
             .write()
-            .insert(tracker_snapshot.base_mint.clone());
+            .insert(mint.clone(), Instant::now());
         inc_arb_v2_screen_sell_stale_recovery_scheduled_total();
-        self.arb_track_selection
-            .mark_dirty(&tracker_snapshot.base_mint);
+        self.arb_track_selection.mark_dirty(mint);
         if self
             .two_hop_tx
-            .try_send(ArbTwoHopWorkerJob::Rescreen {
-                mint: tracker_snapshot.base_mint.clone(),
-            })
+            .try_send(ArbTwoHopWorkerJob::Rescreen { mint: mint.clone() })
             .is_ok()
         {
             inc_arb_vault_rescreen_scheduled_total();
@@ -7852,7 +7880,7 @@ async fn main() -> Result<()> {
         two_hop_tx,
         tracker_write,
         tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
-        v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
+        v2_sell_stale_recovery_last_scheduled: RwLock::new(HashMap::new()),
     });
 
     spawn_arb_tracker_write_worker(Arc::clone(&ctx), tracker_write_rx);
@@ -8939,7 +8967,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
-            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
+            v2_sell_stale_recovery_last_scheduled: RwLock::new(HashMap::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9052,7 +9080,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
-            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
+            v2_sell_stale_recovery_last_scheduled: RwLock::new(HashMap::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9163,7 +9191,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
-            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
+            v2_sell_stale_recovery_last_scheduled: RwLock::new(HashMap::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9249,6 +9277,162 @@ mod event_pipeline_tests {
         assert!(
             ticks >= 5,
             "expected heartbeat to tick under PoolCache burst + trade load, got {ticks}"
+        );
+    }
+
+    fn sample_pool_state_market_event(pool: &str) -> MarketEvent {
+        MarketEvent::new(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            format!("evt-psu-{pool}"),
+            "geyser",
+            Some(1),
+            MarketEventKind::PoolStateUpdate {
+                pool_address: pool.to_string(),
+                dex: "raydium".to_string(),
+                reserve_base: 5_000_000,
+                reserve_quote: 10_000_000_000,
+                update_slot: 1,
+                active_id: None,
+                bin_step: None,
+                base_mint: NATIVE_SOL_MINT.to_string(),
+                quote_mint: "TokenMint11111111111111111111111111111111".to_string(),
+            },
+        )
+    }
+
+    /// C1h5 regression: market-event consumer must keep progressing under load while
+    /// sell-leg recovery runs on spawn_blocking (no pipeline hang).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn event_pipeline_continues_under_load_after_c1h5() {
+        use ironcrab::execution::live_pool_cache::create_shared_cache;
+        use ironcrab::metrics::ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL;
+
+        let live_pool_cache = create_shared_cache();
+        let log_dir = std::env::temp_dir().join(format!("arb_c1h5_pipeline_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&log_dir).expect("test log dir");
+        let jsonl_writer =
+            JsonlWriter::new(JsonlWriterConfig::new("arb_c1h5_pipeline").with_log_dir(log_dir))
+                .expect("jsonl writer");
+        let (tracker_write_tx, tracker_write_rx) =
+            mpsc::channel::<ArbTrackerWriteJob>(ARB_TRACKER_WRITE_QUEUE_CAP);
+        let tracker_write = ArbTrackerWriteHandle {
+            tx: tracker_write_tx,
+            capacity: ARB_TRACKER_WRITE_QUEUE_CAP,
+        };
+        let (two_hop_tx, two_hop_rx) = mpsc::channel::<ArbTwoHopWorkerJob>(64);
+
+        let config = ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            two_hop_enabled: true,
+            ..Default::default()
+        };
+
+        let mut known_pools = HashSet::new();
+        for i in 0..8usize {
+            known_pools.insert(format!("pool-{i}"));
+        }
+
+        let ctx = Arc::new(ArbContext {
+            run_id: TEST_RUN.to_string(),
+            config: RwLock::new(config),
+            nats: None,
+            jsonl_writer,
+            trackers: RwLock::new(HashMap::new()),
+            events_received: AtomicU64::new(0),
+            pools_tracked: AtomicU64::new(0),
+            opportunities_found: AtomicU64::new(0),
+            intents_generated: AtomicU64::new(0),
+            intent_counter: AtomicU64::new(0),
+            zero_amount_trades: AtomicU64::new(0),
+            data_quality_rejects: AtomicU64::new(0),
+            last_market_event: RwLock::new(Instant::now()),
+            vault_balances: RwLock::new(HashMap::new()),
+            bin_arrays: RwLock::new(HashMap::new()),
+            live_pool_cache,
+            known_pools: RwLock::new(known_pools),
+            multi_hop: Arc::new(MultiHopArbitrage::new(
+                MultiHopConfig::default(),
+                create_shared_cache(),
+            )),
+            spread_too_large_warn_last: RwLock::new(HashMap::new()),
+            eligibility_forensics: ArbEligibilityForensics::new(),
+            v2_eligibility_forensics: ArbV2EligibilityForensics::new(),
+            arb_pinned_pools: RwLock::new({
+                let mut pinned = HashSet::new();
+                pinned.insert("pool-1".to_string());
+                pinned
+            }),
+            arb_selected_mints: RwLock::new(HashSet::new()),
+            arb_trade_signal_pairs: RwLock::new(HashMap::new()),
+            arb_trade_signal_pair_order: RwLock::new(Vec::new()),
+            arb_track_mint_snapshots: RwLock::new(ArbTrackMintSnapshotCache::default()),
+            arb_track_selection: dummy_arb_track_selection_handle(),
+            arb_track_published: AtomicU64::new(0),
+            two_hop_tx,
+            tracker_write,
+            tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
+            v2_sell_stale_recovery_last_scheduled: RwLock::new(HashMap::new()),
+        });
+        spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
+        spawn_arb_two_hop_worker(ctx.clone(), two_hop_rx);
+
+        let consumed_before = MARKET_EVENTS_CONSUMED_TOTAL.load(Ordering::Relaxed);
+        let high_before = ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL.load(Ordering::Relaxed);
+
+        let events_ctx = ctx.clone();
+        let pipeline = tokio::spawn(async move {
+            for i in 0..120usize {
+                let pool = format!("pool-{i}");
+                let trade = sample_trade_event(&pool);
+                process_arb_market_event(&events_ctx, trade, ArbEventPriority::High).await;
+                let psu = sample_pool_state_market_event(&pool);
+                process_arb_market_event(&events_ctx, psu, ArbEventPriority::High).await;
+                if i % 10 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        let recovery_ctx = ctx.clone();
+        let recovery = tokio::spawn(async move {
+            let mint = "TokenMint11111111111111111111111111111111".to_string();
+            for _ in 0..30usize {
+                let tracker = {
+                    let trackers = recovery_ctx.trackers.read();
+                    trackers.get(&mint).cloned()
+                };
+                if let Some(tracker) = tracker {
+                    let config = recovery_ctx.config.read().clone();
+                    let ctx_blocking = recovery_ctx.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        ctx_blocking.two_hop_v2_check_and_maybe_schedule_recovery(&tracker, &config)
+                    })
+                    .await;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(8), async {
+            pipeline.await.expect("pipeline task panicked");
+            recovery.await.expect("recovery task panicked");
+        })
+        .await
+        .expect("event pipeline + recovery load test timed out");
+
+        let consumed_after = MARKET_EVENTS_CONSUMED_TOTAL.load(Ordering::Relaxed);
+        let high_after = ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL.load(Ordering::Relaxed);
+        let consumed_delta = consumed_after.saturating_sub(consumed_before);
+        let high_delta = high_after.saturating_sub(high_before);
+        assert!(
+            consumed_delta >= 240,
+            "market_events_consumed must progress under C1h5 load (delta={consumed_delta})"
+        );
+        assert!(
+            high_delta >= 240,
+            "high_processed must progress under C1h5 load (delta={high_delta})"
         );
     }
 
@@ -9384,7 +9568,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
-            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
+            v2_sell_stale_recovery_last_scheduled: RwLock::new(HashMap::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9493,7 +9677,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
-            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
+            v2_sell_stale_recovery_last_scheduled: RwLock::new(HashMap::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9606,7 +9790,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
-            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
+            v2_sell_stale_recovery_last_scheduled: RwLock::new(HashMap::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9690,7 +9874,7 @@ mod event_pipeline_tests {
             two_hop_tx,
             tracker_write,
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
-            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
+            v2_sell_stale_recovery_last_scheduled: RwLock::new(HashMap::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9848,7 +10032,7 @@ mod two_hop_price_tests {
                 ArbTrackerWriteHandle { tx, capacity: 1 }
             },
             tracker_write_coalescer: parking_lot::Mutex::new(ArbTrackerWriteCoalescer::new()),
-            v2_sell_stale_recovery_mints: RwLock::new(HashSet::new()),
+            v2_sell_stale_recovery_last_scheduled: RwLock::new(HashMap::new()),
         }
     }
 
