@@ -231,6 +231,62 @@ pub fn estimate_size_reduction(instructions: &[Instruction], alt: &LoadedAlt) ->
     (accounts_in_alt, bytes_saved)
 }
 
+/// Analysis of how a compiled v0 message uses (or misses) the loaded ALT.
+#[derive(Debug, Clone)]
+pub struct AltCompileAnalysis {
+    /// Static account keys in the v0 message header.
+    pub static_key_count: usize,
+    /// Instruction account indices that resolve via address lookup tables.
+    pub alt_hit_count: usize,
+    /// Static keys not present in the loaded ALT (top-N for ops `setup_alt --extra-addresses`).
+    pub static_not_in_alt: Vec<Pubkey>,
+}
+
+/// Analyze ALT usage for a compiled v0 message.
+pub fn analyze_v0_alt_usage(message: &v0::Message, alt: Option<&LoadedAlt>) -> AltCompileAnalysis {
+    let static_key_count = message.account_keys.len();
+    let mut alt_hit_count = 0usize;
+    for ix in &message.instructions {
+        for account_index in &ix.accounts {
+            if *account_index as usize >= static_key_count {
+                alt_hit_count += 1;
+            }
+        }
+    }
+
+    let static_not_in_alt: Vec<Pubkey> = match alt {
+        Some(loaded) => message
+            .account_keys
+            .iter()
+            .filter(|pk| !loaded.contains(pk))
+            .take(10)
+            .copied()
+            .collect(),
+        None => message.account_keys.clone(),
+    };
+
+    AltCompileAnalysis {
+        static_key_count,
+        alt_hit_count,
+        static_not_in_alt,
+    }
+}
+
+/// Analyze ALT usage from a versioned message (legacy messages have no lookups).
+pub fn analyze_versioned_message_alt_usage(
+    message: &VersionedMessage,
+    alt: Option<&LoadedAlt>,
+) -> AltCompileAnalysis {
+    match message {
+        VersionedMessage::V0(v0_msg) => analyze_v0_alt_usage(v0_msg, alt),
+        VersionedMessage::Legacy(legacy) => AltCompileAnalysis {
+            static_key_count: legacy.account_keys.len(),
+            alt_hit_count: 0,
+            static_not_in_alt: legacy.account_keys.clone(),
+        },
+    }
+}
+
 /// Parse common accounts from the constant list.
 pub fn get_common_accounts() -> Vec<Pubkey> {
     COMMON_ACCOUNTS
@@ -322,5 +378,47 @@ mod tests {
         .expect("compile with tip filtered from ALT");
 
         assert_ne!(with_tip_in_alt, tip_filtered);
+    }
+
+    #[test]
+    fn analyze_v0_alt_usage_counts_static_and_lookup_refs() {
+        use solana_sdk::instruction::{AccountMeta, Instruction};
+        use solana_system_program;
+
+        let payer = Pubkey::new_unique();
+        let in_alt = Pubkey::new_unique();
+        let static_only = Pubkey::new_unique();
+        let blockhash = solana_sdk::hash::Hash::new_unique();
+        let loaded = LoadedAlt {
+            address: Pubkey::new_unique(),
+            accounts: vec![in_alt],
+        };
+        let mut data = vec![2, 0, 0, 0];
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let ix = Instruction {
+            program_id: solana_system_program::id(),
+            accounts: vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(in_alt, false),
+                AccountMeta::new(static_only, false),
+            ],
+            data,
+        };
+        let message = compile_v0_versioned_message(
+            &payer,
+            std::slice::from_ref(&ix),
+            Some(&loaded),
+            None,
+            blockhash,
+        )
+        .expect("compile");
+        let v0_msg = match message {
+            VersionedMessage::V0(m) => m,
+            _ => panic!("expected v0"),
+        };
+        let analysis = analyze_v0_alt_usage(&v0_msg, Some(&loaded));
+        assert!(analysis.static_key_count >= 2);
+        assert!(analysis.alt_hit_count >= 1);
+        assert!(analysis.static_not_in_alt.contains(&static_only));
     }
 }

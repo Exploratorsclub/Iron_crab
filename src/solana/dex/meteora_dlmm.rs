@@ -905,7 +905,31 @@ impl Dex for MeteoraDlmm {
         let token_x_program_sdk = Pubkey::new_from_array(token_x_program_spl.to_bytes());
         let token_y_program_sdk = Pubkey::new_from_array(token_y_program_spl.to_bytes());
 
-        let ix = swap_builder.build_swap_with_bins_sync(
+        let bin_array_coverage = {
+            let use_active_only = self
+                .extra_data
+                .get(crate::solana::dex::meteora_swap_builder::METEORA_BIN_ARRAY_COVERAGE_KEY)
+                .is_some_and(|entry| {
+                    entry.value()
+                        == crate::solana::dex::meteora_swap_builder::METEORA_BIN_ARRAY_COVERAGE_ACTIVE_ONLY
+                });
+            if use_active_only {
+                crate::solana::dex::meteora_swap_builder::BinArrayCoverage::ActiveOnly
+            } else {
+                crate::solana::dex::meteora_swap_builder::BinArrayCoverage::AdjacentThree
+            }
+        };
+
+        if bin_array_coverage
+            == crate::solana::dex::meteora_swap_builder::BinArrayCoverage::ActiveOnly
+        {
+            debug!(
+                pool = %pool_addr,
+                "meteora_dlmm: using ActiveOnly bin-array coverage for atomic bundle TX size"
+            );
+        }
+
+        let ix = swap_builder.build_swap_with_bins_sync_coverage(
             &pool_addr,
             &pool.reserve_x,
             &pool.reserve_y,
@@ -921,6 +945,7 @@ impl Dex for MeteoraDlmm {
             direction,
             pool.active_id,
             pool.bin_step,
+            bin_array_coverage,
         )?;
 
         Ok(vec![ix])

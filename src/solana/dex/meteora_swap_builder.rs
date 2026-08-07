@@ -43,6 +43,20 @@ pub enum SwapDirection {
     YtoX,
 }
 
+/// Bin-array coverage for DLMM swap remaining accounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinArrayCoverage {
+    /// Active bin array only — for size-constrained atomic bundles (small swaps).
+    ActiveOnly,
+    /// Active ± 1 — default for general swaps.
+    AdjacentThree,
+}
+
+/// Extra-data key for [`MeteoraDlmm`] bin-array coverage (cross-dex atomic bundles).
+pub const METEORA_BIN_ARRAY_COVERAGE_KEY: &str = "bin_array_coverage";
+/// Value: use [`BinArrayCoverage::ActiveOnly`] for minimal TX size.
+pub const METEORA_BIN_ARRAY_COVERAGE_ACTIVE_ONLY: &str = "active_only";
+
 /// Builder for Meteora DLMM swap instructions (GEYSER-FIRST: no RPC in hot path)
 pub struct MeteoraDlmmSwapBuilder {
     #[allow(dead_code)] // RPC kept for potential future use outside hot path
@@ -81,16 +95,31 @@ impl MeteoraDlmmSwapBuilder {
         lb_pair: &Pubkey,
         active_id: i32,
     ) -> Result<Vec<Pubkey>> {
+        Self::derive_bin_arrays_for_active_id_with_coverage(
+            lb_pair,
+            active_id,
+            BinArrayCoverage::AdjacentThree,
+        )
+    }
+
+    /// Derive bin-array PDAs with explicit coverage (GEYSER-FIRST: no RPC).
+    pub fn derive_bin_arrays_for_active_id_with_coverage(
+        lb_pair: &Pubkey,
+        active_id: i32,
+        coverage: BinArrayCoverage,
+    ) -> Result<Vec<Pubkey>> {
         let active_array_index = Self::bin_id_to_bin_array_index(active_id);
 
-        // Include active + adjacent bin arrays to handle edge cases
-        let indices: Vec<i64> = vec![
-            active_array_index - 1,
-            active_array_index,
-            active_array_index + 1,
-        ];
+        let indices: Vec<i64> = match coverage {
+            BinArrayCoverage::ActiveOnly => vec![active_array_index],
+            BinArrayCoverage::AdjacentThree => vec![
+                active_array_index - 1,
+                active_array_index,
+                active_array_index + 1,
+            ],
+        };
 
-        let mut bin_arrays = Vec::with_capacity(3);
+        let mut bin_arrays = Vec::with_capacity(indices.len());
         for index in indices {
             let pda = Self::derive_bin_array_pda(lb_pair, index)?;
             bin_arrays.push(pda);
@@ -100,6 +129,7 @@ impl MeteoraDlmmSwapBuilder {
             pool = %lb_pair,
             active_id = active_id,
             active_array_index = active_array_index,
+            coverage = ?coverage,
             bin_arrays_count = bin_arrays.len(),
             "Meteora: derived bin array PDAs (GEYSER-FIRST, no RPC)"
         );
@@ -249,6 +279,47 @@ impl MeteoraDlmmSwapBuilder {
         active_id: i32,
         _bin_step: u16,
     ) -> Result<Instruction> {
+        self.build_swap_with_bins_sync_coverage(
+            lb_pair,
+            reserve_x,
+            reserve_y,
+            user_token_x,
+            user_token_y,
+            token_x_mint,
+            token_y_mint,
+            token_x_program,
+            token_y_program,
+            user,
+            amount_in,
+            min_amount_out,
+            direction,
+            active_id,
+            _bin_step,
+            BinArrayCoverage::AdjacentThree,
+        )
+    }
+
+    /// Same as [`build_swap_with_bins_sync`] but with explicit bin-array coverage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_swap_with_bins_sync_coverage(
+        &self,
+        lb_pair: &Pubkey,
+        reserve_x: &Pubkey,
+        reserve_y: &Pubkey,
+        user_token_x: &Pubkey,
+        user_token_y: &Pubkey,
+        token_x_mint: &Pubkey,
+        token_y_mint: &Pubkey,
+        token_x_program: &Pubkey,
+        token_y_program: &Pubkey,
+        user: &Pubkey,
+        amount_in: u64,
+        min_amount_out: u64,
+        direction: SwapDirection,
+        active_id: i32,
+        _bin_step: u16,
+        bin_array_coverage: BinArrayCoverage,
+    ) -> Result<Instruction> {
         ensure!(amount_in > 0, "Amount in must be positive");
         ensure!(min_amount_out > 0, "Min amount out must be positive");
 
@@ -294,7 +365,11 @@ impl MeteoraDlmmSwapBuilder {
 
         // Derive bin array PDAs (GEYSER-FIRST: no RPC to check existence!)
         // If a bin array doesn't exist, the TX simulation will fail with a clear error.
-        let bin_arrays = Self::derive_bin_arrays_for_active_id(lb_pair, active_id)?;
+        let bin_arrays = Self::derive_bin_arrays_for_active_id_with_coverage(
+            lb_pair,
+            active_id,
+            bin_array_coverage,
+        )?;
 
         // Log the derived bin arrays for debugging
         info!(
@@ -429,5 +504,24 @@ mod tests {
         // Different indices should give different PDAs
         let pda3 = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, 1).unwrap();
         assert_ne!(pda1, pda3);
+    }
+
+    #[test]
+    fn active_only_bin_coverage_has_fewer_accounts_than_adjacent_three() {
+        let lb_pair = Pubkey::new_unique();
+        let active_only = MeteoraDlmmSwapBuilder::derive_bin_arrays_for_active_id_with_coverage(
+            &lb_pair,
+            100,
+            BinArrayCoverage::ActiveOnly,
+        )
+        .expect("active only");
+        let adjacent = MeteoraDlmmSwapBuilder::derive_bin_arrays_for_active_id_with_coverage(
+            &lb_pair,
+            100,
+            BinArrayCoverage::AdjacentThree,
+        )
+        .expect("adjacent three");
+        assert_eq!(active_only.len(), 1);
+        assert_eq!(adjacent.len(), 3);
     }
 }
