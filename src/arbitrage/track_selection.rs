@@ -428,14 +428,14 @@ fn bundle_from_pinable_pair(
         selected_pool(
             mint,
             buy_pool,
-            bundle_priority,
+            TrackPoolReadiness::QuoteReady,
             ArbTrackActiveReason::MultiDex,
             per_pool_readiness,
         ),
         selected_pool(
             mint,
             sell_pool,
-            bundle_priority,
+            TrackPoolReadiness::QuoteReady,
             ArbTrackActiveReason::MultiDex,
             per_pool_readiness,
         ),
@@ -505,10 +505,13 @@ fn selected_pool(
     reason: ArbTrackActiveReason,
     per_pool_readiness: &HashMap<String, TrackPoolReadiness>,
 ) -> SelectedTrackPool {
-    let readiness = per_pool_readiness
+    let classified = per_pool_readiness
         .get(&pool.pool_address)
         .copied()
-        .unwrap_or(default_readiness);
+        .unwrap_or(TrackPoolReadiness::Rejected);
+    // C1h5: bundle default_readiness (e.g. QuoteReady for cross-dex legs) must not be
+    // downgraded by classify-only buy freshness — sell-leg pins need must_hot on cold start.
+    let readiness = classified.max(default_readiness);
     SelectedTrackPool {
         mint: mint.mint.clone(),
         pool: pool.pool_address.clone(),
@@ -548,7 +551,7 @@ fn classify_pool_readiness(
     if !is_structurally_quote_capable(pool) {
         return TrackPoolReadiness::Rejected;
     }
-    if can_fresh_buy_quote(pool, config, now) {
+    if can_fresh_buy_quote(pool, config, now) || can_fresh_sell_quote(pool, config, now) {
         TrackPoolReadiness::QuoteReady
     } else if is_warmable_pool(pool, config, now) {
         TrackPoolReadiness::Warmable
@@ -557,11 +560,46 @@ fn classify_pool_readiness(
     }
 }
 
+/// Probe token amount for sell-direction freshness (CPMM estimate from cached reserves).
+fn probe_token_amount_for_sell(pool: &TrackPoolInput, probe_lamports: u64) -> u64 {
+    let Some(vault) = &pool.vault else {
+        return 1;
+    };
+    if vault.reserve_base == 0 || vault.reserve_quote == 0 {
+        return 1;
+    }
+    let token = vault.reserve_base as u128;
+    let sol = vault.reserve_quote as u128;
+    let sol_in = probe_lamports as u128;
+    let out = token.saturating_mul(sol_in) / sol.saturating_add(sol_in);
+    out.max(1) as u64
+}
+
+fn can_fresh_sell_quote(
+    pool: &TrackPoolInput,
+    config: &TrackSelectionConfig,
+    now: Instant,
+) -> bool {
+    let probe_tokens = probe_token_amount_for_sell(pool, config.probe_lamports);
+    let Some(quote) = quote_exact_in_with_freshness(
+        &pool.quote_pool,
+        pool.vault.as_ref(),
+        pool.dlmm_bins.as_ref(),
+        &pool.quote_pool.token_mint,
+        NATIVE_SOL_MINT,
+        probe_tokens,
+        &config.freshness,
+    ) else {
+        return false;
+    };
+    is_quote_fresh(&quote, &config.freshness, pool.vault.as_ref(), now)
+}
+
 fn is_warmable_pool(pool: &TrackPoolInput, config: &TrackSelectionConfig, now: Instant) -> bool {
     if !pool.known || !is_structurally_quote_capable(pool) {
         return false;
     }
-    if can_fresh_buy_quote(pool, config, now) {
+    if can_fresh_buy_quote(pool, config, now) || can_fresh_sell_quote(pool, config, now) {
         return false;
     }
     // Known + structural DEX support; reserve/bin freshness may be missing.
@@ -1064,5 +1102,85 @@ mod tests {
         }
         let result = select_arb_track_pools(&mints, &default_config(10));
         assert!(result.selected.len() <= 10);
+    }
+
+    /// C1h5: cross-dex pinable bundles must emit QuoteReady on both legs (must_hot) even when
+    /// classify only sees warmable buy-side freshness (sell-leg cold-start).
+    #[test]
+    fn pinable_cross_dex_pair_promotes_warmable_legs_to_quote_ready() {
+        let mint = mint_input(
+            MINT,
+            vec![
+                pool_input(
+                    "meteora_dlmm",
+                    "dlmm_buy",
+                    MINT,
+                    true,
+                    true,
+                    Some(vault(RESERVE_BASE, RESERVE_QUOTE)),
+                    10,
+                ),
+                pool_input("pump_amm", "pump_sell", MINT, true, false, None, 5),
+            ],
+            10,
+            None,
+        );
+        let result = select_arb_track_pools(&[mint], &default_config(500));
+        assert_eq!(result.selected.len(), 2);
+        for entry in &result.selected {
+            assert_eq!(
+                entry.readiness,
+                TrackPoolReadiness::QuoteReady,
+                "pool {} must be quote_ready for must_hot pin",
+                entry.pool
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_sell_quote_classifies_pool_quote_ready_without_fresh_buy() {
+        use std::time::{Duration, Instant};
+
+        let mut sell_vault = vault(RESERVE_BASE, RESERVE_QUOTE);
+        sell_vault.updated_at = Instant::now();
+        let pool = pool_input(
+            "pump_amm",
+            "sell_only_fresh",
+            MINT,
+            true,
+            true,
+            Some(sell_vault),
+            1,
+        );
+        let config = TrackSelectionConfig {
+            max_pools: 10,
+            max_pools_per_mint: 3,
+            probe_lamports: 10_000_000,
+            freshness: QuoteFreshnessConfig {
+                trade_ttl_ms: 30_000,
+                state_ttl_ms: 120_000,
+            },
+        };
+        assert!(can_fresh_sell_quote(&pool, &config, Instant::now()));
+        assert_eq!(
+            classify_pool_readiness(&pool, &config, Instant::now()),
+            TrackPoolReadiness::QuoteReady
+        );
+
+        let stale_vault = vault(RESERVE_BASE, RESERVE_QUOTE);
+        let stale_pool = pool_input(
+            "pump_amm",
+            "sell_stale",
+            MINT,
+            true,
+            true,
+            Some({
+                let mut v = stale_vault;
+                v.updated_at = Instant::now() - Duration::from_secs(400);
+                v
+            }),
+            1,
+        );
+        assert!(!can_fresh_sell_quote(&stale_pool, &config, Instant::now()));
     }
 }
