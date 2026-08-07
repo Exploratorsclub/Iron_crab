@@ -9323,9 +9323,11 @@ mod event_pipeline_tests {
         };
         let (two_hop_tx, two_hop_rx) = mpsc::channel::<ArbTwoHopWorkerJob>(64);
 
-        let mut config = ArbConfig::default();
-        config.arb_two_hop_v2_enabled = true;
-        config.two_hop_enabled = true;
+        let config = ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            two_hop_enabled: true,
+            ..Default::default()
+        };
 
         let mut known_pools = HashSet::new();
         for i in 0..8usize {
