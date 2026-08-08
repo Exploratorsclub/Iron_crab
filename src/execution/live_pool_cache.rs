@@ -645,6 +645,29 @@ impl LivePoolCache {
         false
     }
 
+    /// Apply paired vault ATA balances into an existing pool row (Geyser-only, no RPC).
+    ///
+    /// Used on arb-pin admit when tracked vault rows already have `last_balance` but the
+    /// MASTER `LivePoolCache` row still lacks reserve basis after cold start.
+    pub fn apply_vault_pair_balances_to_reserve_basis(
+        &self,
+        pool: &Pubkey,
+        base_vault: &Pubkey,
+        base_balance: u64,
+        quote_vault: &Pubkey,
+        quote_balance: u64,
+        slot: u64,
+    ) -> bool {
+        if base_balance > 0 {
+            self.update_vault_balance(base_vault, base_balance, slot);
+        }
+        if quote_balance > 0 {
+            self.update_vault_balance(quote_vault, quote_balance, slot);
+        }
+        self.get(pool)
+            .is_some_and(|state| pool_state_has_reserve_basis(&state))
+    }
+
     /// Update vault balance for a pool
     pub fn update_vault_balance(&self, vault: &Pubkey, balance: u64, slot: u64) {
         if let Some(mapping) = self.vault_to_pool.get(vault) {
@@ -2619,6 +2642,41 @@ mod tests {
             age_after < 20,
             "stale-slot heartbeat must refresh cache age when reserves are quotable"
         );
+    }
+
+    #[test]
+    fn apply_vault_pair_balances_sets_reserve_basis_from_tracked_rows() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let token = Pubkey::new_unique();
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: token,
+                token_1_mint: wsol,
+                token_0_vault: base_vault,
+                token_1_vault: quote_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            100,
+        );
+        assert!(
+            cache.apply_vault_pair_balances_to_reserve_basis(
+                &pool,
+                &base_vault,
+                1_000_000,
+                &quote_vault,
+                2_000_000,
+                100,
+            ),
+            "tracked vault balances must backfill reserve basis"
+        );
+        let state = cache.get(&pool).expect("cached");
+        assert!(pool_state_has_reserve_basis(&state));
     }
 
     #[test]

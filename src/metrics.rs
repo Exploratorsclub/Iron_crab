@@ -5106,6 +5106,10 @@ pub static ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| 
 /// v2 screen refreshed stale vault_balances from fresher SLAVE LivePoolCache (C1h).
 pub static ARB_VAULT_LIVE_SNAPSHOT_REFRESHED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// P1: JetStream PoolCacheUpdate consumed into global vault_balances for pinned/tracked pool.
+pub static ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// P1: pinned pool PoolCacheUpdate arrived but SLAVE cache could not seed vault row.
+pub static ARB_VAULT_SEED_FROM_CACHE_MISS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 // --- C1h2: Freshness root-cause forensics ---
 pub static ARB_TWO_HOP_V2_SELL_NOT_FRESH_DETAIL_EM_AGE: Lazy<AtomicU64> =
@@ -5779,6 +5783,16 @@ pub fn inc_arb_vault_live_snapshot_seeded_total() {
 /// Increment `arb_vault_live_snapshot_refreshed_total`.
 pub fn inc_arb_vault_live_snapshot_refreshed_total() {
     ARB_VAULT_LIVE_SNAPSHOT_REFRESHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_vault_seed_from_cache_ok_total`.
+pub fn inc_arb_vault_seed_from_cache_ok_total() {
+    ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `arb_vault_seed_from_cache_miss_total`.
+pub fn inc_arb_vault_seed_from_cache_miss_total() {
+    ARB_VAULT_SEED_FROM_CACHE_MISS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// C1h2: `arb_two_hop_v2_sell_not_fresh_detail_total{kind,cause}`.
@@ -10869,6 +10883,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_vault_live_snapshot_refreshed_total",
         ARB_VAULT_LIVE_SNAPSHOT_REFRESHED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_vault_seed_from_cache_ok_total",
+        ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_vault_seed_from_cache_miss_total",
+        ARB_VAULT_SEED_FROM_CACHE_MISS_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "arb_vault_rescreen_scheduled_total",
