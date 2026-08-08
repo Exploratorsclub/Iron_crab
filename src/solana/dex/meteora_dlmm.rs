@@ -29,6 +29,9 @@ use crate::solana::rpc::SolanaRpc;
 /// Meteora DLMM Program ID
 pub const METEORA_DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
+/// Key used by cross_dex_handler via [`Dex::cache_extra_data`] to pin the active LB pair.
+pub const POOL_ADDRESS_HINT_KEY: &str = "pool_address_hint";
+
 /// LB Pair account size (904 bytes)
 #[cfg(feature = "rpc_fallback")]
 const LB_PAIR_ACCOUNT_SIZE: usize = 904;
@@ -94,6 +97,53 @@ impl MeteoraDlmm {
     /// List all tracked pool addresses
     pub fn list_pools(&self) -> Vec<Pubkey> {
         self.pools.iter().map(|entry| *entry.key()).collect()
+    }
+
+    /// Resolve the LB pair for a swap, preferring an explicit pool hint from cross_dex_handler.
+    fn resolve_pool_for_swap(
+        &self,
+        input_mint: &Pubkey,
+        output_mint: &Pubkey,
+    ) -> Option<(Pubkey, PoolCache)> {
+        if let Some(hint_entry) = self.extra_data.get(POOL_ADDRESS_HINT_KEY) {
+            if let Ok(pool_pk) = Pubkey::from_str(hint_entry.value()) {
+                if let Some(pool_entry) = self.pools.get(&pool_pk) {
+                    let pool = pool_entry.value();
+                    let forward = pool.pool.token_x_mint == *input_mint
+                        && pool.pool.token_y_mint == *output_mint;
+                    let reverse = pool.pool.token_x_mint == *output_mint
+                        && pool.pool.token_y_mint == *input_mint;
+                    if forward || reverse {
+                        debug!(
+                            pool = %pool_pk,
+                            direction = if forward { "forward" } else { "reverse" },
+                            "meteora_dlmm pool resolved via pool_address_hint"
+                        );
+                        return Some((pool_pk, pool.clone()));
+                    }
+                    tracing::warn!(
+                        pool = %pool_pk,
+                        input = %input_mint,
+                        output = %output_mint,
+                        "pool_address_hint pool mints do not match swap pair; falling back to mint scan"
+                    );
+                } else {
+                    tracing::warn!(
+                        pool = %pool_pk,
+                        "pool_address_hint set but pool not in connector cache; falling back to mint scan"
+                    );
+                }
+            }
+        }
+
+        self.pools
+            .iter()
+            .find(|entry| {
+                let pool = &entry.value().pool;
+                (pool.token_x_mint == *input_mint && pool.token_y_mint == *output_mint)
+                    || (pool.token_x_mint == *output_mint && pool.token_y_mint == *input_mint)
+            })
+            .map(|entry| (*entry.key(), entry.value().clone()))
     }
 
     /// Find pools containing a specific mint
@@ -744,20 +794,10 @@ impl Dex for MeteoraDlmm {
         let input_mint_pk = Pubkey::from_str(input_mint)?;
         let output_mint_pk = Pubkey::from_str(output_mint)?;
 
-        // Find pool for this pair
-        let pool_entry = self
-            .pools
-            .iter()
-            .find(|entry| {
-                let pool = &entry.value().pool;
-                (pool.token_x_mint == input_mint_pk && pool.token_y_mint == output_mint_pk)
-                    || (pool.token_x_mint == output_mint_pk && pool.token_y_mint == input_mint_pk)
-            })
+        let (pool_addr, pool_cache) = self
+            .resolve_pool_for_swap(&input_mint_pk, &output_mint_pk)
             .ok_or_else(|| anyhow!("No pool found for {}/{}", input_mint, output_mint))?;
-
-        let pool_addr = *pool_entry.key();
-        let pool = pool_entry.value().pool.clone();
-        drop(pool_entry); // Release DashMap lock before async call
+        let pool = pool_cache.pool.clone();
 
         // Validate that we have real active_id/bin_step from DexPoolAccounts
         // If active_id is 0 and bin_step is default (10), the Intent may be missing data
@@ -964,6 +1004,7 @@ impl Dex for MeteoraDlmm {
     /// Used by cross_dex_handler to pass Token-2022 program info.
     ///
     /// Supported keys:
+    /// - [`POOL_ADDRESS_HINT_KEY`] -> LB pair address from cross-DEX arb intent
     /// - "token_program:<mint>" -> token program ID (SPL Token or Token-2022)
     fn cache_extra_data(&self, key: &str, value: &str) {
         debug!(
@@ -1009,6 +1050,63 @@ mod tests {
             err_msg.contains("GEYSER-ONLY"),
             "expected GEYSER-ONLY in error, got: {}",
             err_msg
+        );
+    }
+
+    /// Cross-DEX arb: explicit pool_address_hint + injected pool must build swap IX without mint-pair scan failure.
+    #[tokio::test]
+    async fn test_build_swap_ix_async_uses_pool_address_hint() {
+        use super::POOL_ADDRESS_HINT_KEY;
+        use crate::solana::dex::Dex;
+
+        const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let mut meteora = MeteoraDlmm::new_with_live_cache(rpc, None, false);
+        meteora.set_user_authority(Pubkey::new_unique());
+
+        let pool_pk = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let reserve_x = Pubkey::new_unique();
+        let reserve_y = Pubkey::new_unique();
+
+        meteora
+            .set_pool_from_accounts(
+                &pool_pk.to_string(),
+                &[
+                    pool_pk.to_string(),
+                    sol_mint.to_string(),
+                    token_mint.to_string(),
+                    reserve_x.to_string(),
+                    reserve_y.to_string(),
+                    "active_id:100".to_string(),
+                    "bin_step:10".to_string(),
+                ],
+            )
+            .expect("set_pool_from_accounts");
+
+        meteora.cache_extra_data(POOL_ADDRESS_HINT_KEY, &pool_pk.to_string());
+        meteora.cache_extra_data(
+            &format!("token_program:{}", sol_mint),
+            &spl_token::id().to_string(),
+        );
+        meteora.cache_extra_data(
+            &format!("token_program:{}", token_mint),
+            &spl_token::id().to_string(),
+        );
+
+        let ixs = meteora
+            .build_swap_ix_async(SOL_MINT, &token_mint.to_string(), 1_000_000, 1)
+            .await
+            .expect("build_swap_ix_async with pool_address_hint");
+
+        assert!(!ixs.is_empty());
+        assert_eq!(ixs[0].program_id.to_string(), super::METEORA_DLMM_PROGRAM);
+        assert!(
+            ixs.iter()
+                .any(|ix| ix.accounts.iter().any(|a| a.pubkey == pool_pk)),
+            "swap ix must reference hinted LB pair"
         );
     }
 
