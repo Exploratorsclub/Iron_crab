@@ -4973,6 +4973,9 @@ pub fn record_arb_bundle_tx_too_large() {
 pub static ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+const ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA_LINE: &str =
+    "arb_bundle_ata_create_skipped_total{reason=\"known_ata\"}";
+
 pub fn record_arb_bundle_ata_create_skipped_known_ata() {
     ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA.fetch_add(1, Ordering::Relaxed);
 }
@@ -10820,7 +10823,7 @@ async fn metrics_response() -> Response<Body> {
         ARB_BUNDLE_TX_TOO_LARGE.load(Ordering::Relaxed)
     );
     line!(
-        "arb_bundle_ata_create_skipped_total{{reason=\"known_ata\"}}",
+        ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA_LINE,
         ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA.load(Ordering::Relaxed)
     );
     line!(
@@ -12930,6 +12933,30 @@ mod arb_quote_pair_slot_skew_metrics_tests {
         assert_eq!(
             ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.load(Ordering::Relaxed),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod arb_bundle_ata_create_skipped_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn known_ata_metric_line_uses_single_brace_prometheus_labels() {
+        assert!(!ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA_LINE.contains("{{"));
+        let label_start = ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA_LINE
+            .find("{reason=")
+            .expect("metric must expose reason label");
+        assert_eq!(
+            ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA_LINE[..label_start]
+                .matches('{')
+                .count(),
+            0,
+            "metric name must not contain braces before label set"
+        );
+        assert_eq!(
+            &ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA_LINE[label_start..],
+            "{reason=\"known_ata\"}"
         );
     }
 }
