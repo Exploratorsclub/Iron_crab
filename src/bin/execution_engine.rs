@@ -134,7 +134,7 @@ use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::router::Router;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::dex_parser::SOL_MINT;
-use ironcrab::solana::jito::{JitoClient, JitoRegion};
+use ironcrab::solana::jito::{BundleStatusValue, JitoClient, JitoRegion};
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::solana::token_utils::get_token_decimals_or_default;
 use ironcrab::solana::tx_sender::TxSender;
@@ -1526,6 +1526,9 @@ struct ExecutionConfig {
     /// Timeout for bundle confirmation (seconds)
     jito_timeout_secs: u64,
 
+    /// Timeout for cross-DEX arb bundle confirmation (seconds; longer than default)
+    jito_arb_timeout_secs: u64,
+
     // === P1: Fee/Compute Policies ===
     /// Centralized fee policy (engine owns compute budget and priority fees)
     fee_policy: FeePolicy,
@@ -1604,6 +1607,7 @@ impl Default for ExecutionConfig {
             jito_tip_lamports: 10_000, // 0.00001 SOL default tip
             jito_region: "frankfurt".to_string(),
             jito_timeout_secs: 30,
+            jito_arb_timeout_secs: 45,
             // P1: Fee/Compute Policy
             fee_policy: FeePolicy::default(),
             liquidation_priority_fee_micro_lamports: None,
@@ -10409,6 +10413,51 @@ fn simulation_result_on_rpc_timeout() -> SimulationResult {
     }
 }
 
+/// Minimum Jito bundle tip for cross-DEX arb (lamports).
+const BUNDLE_TIP_MIN_LAMPORTS: u64 = 100_000;
+/// Maximum Jito bundle tip for cross-DEX arb (lamports).
+const BUNDLE_TIP_MAX_LAMPORTS: u64 = 2_000_000;
+/// Default tip share of estimated arb profit when metadata has no explicit bps.
+const BUNDLE_TIP_DEFAULT_BPS: u64 = 750;
+
+fn is_cross_dex_arb_bundle(intent: &TradeIntent) -> bool {
+    CrossDexHandler::is_cross_dex_arb_intent(intent)
+        || intent
+            .metadata
+            .get("cross_dex_arb")
+            .is_some_and(|v| v == "true")
+}
+
+/// Dynamic bundle tip: scale from `estimated_profit_lamports` for cross-DEX arb when metadata present.
+fn effective_bundle_tip_lamports(intent: &TradeIntent, config: &ExecutionConfig) -> u64 {
+    if is_cross_dex_arb_bundle(intent) {
+        if let Some(profit) = intent
+            .metadata
+            .get("estimated_profit_lamports")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            let tip_bps = intent
+                .metadata
+                .get("bundle_tip_bps")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(BUNDLE_TIP_DEFAULT_BPS);
+            let scaled = (profit as u128 * tip_bps as u128 / 10_000) as u64;
+            return scaled.clamp(BUNDLE_TIP_MIN_LAMPORTS, BUNDLE_TIP_MAX_LAMPORTS);
+        }
+    }
+    intent
+        .bundle_tip_lamports
+        .unwrap_or(config.jito_tip_lamports)
+}
+
+fn bundle_confirm_timeout_secs(intent: &TradeIntent, config: &ExecutionConfig) -> u64 {
+    if is_cross_dex_arb_bundle(intent) {
+        config.jito_arb_timeout_secs
+    } else {
+        config.jito_timeout_secs
+    }
+}
+
 /// Process a single TradeIntent through the execution pipeline
 async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Result<()> {
     try_record_execution_intent_header_to_receive_ms(
@@ -11516,12 +11565,12 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         let mut bundle_tip_ix: Option<solana_sdk::instruction::Instruction> = None;
         let mut bundle_tip_lamports: Option<u64> = None;
         if requires_bundle && config.send_enabled {
-            let tip_lamports = intent
-                .bundle_tip_lamports
-                .unwrap_or(config.jito_tip_lamports);
+            let tip_lamports = effective_bundle_tip_lamports(&intent, &config);
             info!(
                 intent_id = %intent.intent_id,
                 tip_lamports = %tip_lamports,
+                cross_dex_arb = is_cross_dex_arb_bundle(&intent),
+                estimated_profit = intent.metadata.get("estimated_profit_lamports"),
                 "Building Jito tip instruction for bundle"
             );
             let jito_client = ctx
@@ -12075,6 +12124,9 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     // Track bundle result for decision record
     let mut bundle_id: Option<String> = None;
     let mut send_signature: Option<String> = None;
+    let mut bundle_wallet_confirm_rx: Option<
+        tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>,
+    > = None;
     let mut send_method_used: Option<String> = None;
     let mut sent_tx: Option<VersionedTransaction> = None;
     let mut sent_anything = false;
@@ -12214,6 +12266,20 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
                 }
             };
+
+            if let Some(sig) = versioned_tx.signatures.first() {
+                if *sig != Signature::default() {
+                    let sig_str = sig.to_string();
+                    send_signature = Some(sig_str.clone());
+                    bundle_wallet_confirm_rx =
+                        Some(register_wallet_tx_confirm_waiter(ctx, &sig_str));
+                    info!(
+                        intent_id = %intent.intent_id,
+                        signature = %sig_str,
+                        "Bundle TX signature known pre-send; registered JetStream confirm waiter"
+                    );
+                }
+            }
 
             if let Err(size_err) = check_versioned_tx_size(&versioned_tx) {
                 log_bundle_tx_size_rejection(
@@ -12466,59 +12532,66 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         .as_ref()
                         .expect("bundle_config gate ensures jito_client is present");
 
-                    match jito_client
-                        .wait_for_bundle(bid, config.jito_timeout_secs)
-                        .await
+                    let bundle_timeout_secs = bundle_confirm_timeout_secs(&intent, &config);
+                    let tx_sig = sr.signature.as_deref().or(send_signature.as_deref());
+
+                    match confirm_bundle_landing(
+                        ctx,
+                        jito_client,
+                        bid,
+                        tx_sig,
+                        bundle_timeout_secs,
+                        slot_at_send,
+                        bundle_wallet_confirm_rx,
+                    )
+                    .await
                     {
-                        Ok(status) => {
-                            // Bundle landed successfully
+                        Ok(ConfirmOutcome::Confirmed { details, slot }) => {
                             JITO_BUNDLES_LANDED_TOTAL.fetch_add(1, Ordering::Relaxed);
                             TX_CONFIRMED_TOTAL.fetch_add(1, Ordering::Relaxed);
-
-                            // If Jito returned tx signatures, record the first as a convenience.
-                            if let Some(sig0) = status.transactions.first().cloned() {
-                                sr.signature = Some(sig0.clone());
+                            if let Some(sig) = tx_sig {
+                                sr.signature = Some(sig.to_string());
                             }
-
                             checks.push(CheckResult {
                                 check_name: "confirm".to_string(),
                                 passed: true,
                                 reason_code: None,
-                                details: Some(format!(
-                                    "bundle_id={bid} slot={} confirmation_status={} txs={}",
-                                    status.slot,
-                                    status.confirmation_status,
-                                    status.transactions.len()
-                                )),
+                                details: Some(details),
                             });
-                            tx_landing_slot = Some(status.slot);
+                            tx_landing_slot = slot;
                             final_outcome = DecisionOutcome::Confirmed;
                         }
-                        Err(e) => {
-                            let error_msg = format!("{e:?}");
-                            let is_timeout =
-                                error_msg.contains("timeout") || error_msg.contains("Timeout");
-
-                            if is_timeout {
-                                JITO_BUNDLES_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                checks.push(CheckResult {
-                                    check_name: "confirm".to_string(),
-                                    passed: false,
-                                    reason_code: Some(RejectReason::BundleTimeout.to_string()),
-                                    details: Some(error_msg),
-                                });
-                                final_outcome = DecisionOutcome::Sent;
-                            } else {
-                                JITO_BUNDLES_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                                checks.push(CheckResult {
-                                    check_name: "confirm".to_string(),
-                                    passed: false,
-                                    reason_code: Some(RejectReason::BundleFailed.to_string()),
-                                    details: Some(error_msg),
-                                });
-                                final_outcome = DecisionOutcome::FailedConfirmed;
-                            }
+                        Ok(ConfirmOutcome::FailedConfirmed { details, slot }) => {
+                            JITO_BUNDLES_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            checks.push(CheckResult {
+                                check_name: "confirm".to_string(),
+                                passed: false,
+                                reason_code: Some(RejectReason::BundleFailed.to_string()),
+                                details: Some(details),
+                            });
+                            tx_landing_slot = slot;
+                            final_outcome = DecisionOutcome::FailedConfirmed;
+                        }
+                        Ok(ConfirmOutcome::TimeoutSent { details }) => {
+                            JITO_BUNDLES_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            TX_CONFIRM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            checks.push(CheckResult {
+                                check_name: "confirm".to_string(),
+                                passed: false,
+                                reason_code: Some(RejectReason::BundleTimeout.to_string()),
+                                details: Some(details),
+                            });
+                            final_outcome = DecisionOutcome::Sent;
+                        }
+                        Err(error_msg) => {
+                            JITO_BUNDLES_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            checks.push(CheckResult {
+                                check_name: "confirm".to_string(),
+                                passed: false,
+                                reason_code: Some(RejectReason::BundleFailed.to_string()),
+                                details: Some(error_msg),
+                            });
+                            final_outcome = DecisionOutcome::FailedConfirmed;
                         }
                     }
                 }
@@ -14137,6 +14210,151 @@ async fn publish_pre_confirm_execution_result(
             .await?;
     }
     Ok(())
+}
+
+/// Bundle landing: parallel Jito `getBundleStatuses` poll and JetStream WalletTxConfirmed when
+/// the signed bundle TX signature is known. On timeout, performs one final bundle status poll.
+async fn confirm_bundle_landing(
+    ctx: &ExecutionContext,
+    jito_client: &JitoClient,
+    bundle_id: &str,
+    tx_signature: Option<&str>,
+    timeout_secs: u64,
+    slot_at_send: Option<u64>,
+    pre_registered_rx: Option<tokio::sync::oneshot::Receiver<WalletTxConfirmNotify>>,
+) -> std::result::Result<ConfirmOutcome, String> {
+    let start = std::time::Instant::now();
+    let deadline = Duration::from_secs(timeout_secs.max(1));
+
+    enum BundleConfirmRace {
+        Jito(std::result::Result<BundleStatusValue, anyhow::Error>),
+        Geyser(std::result::Result<WalletTxConfirmNotify, tokio::sync::oneshot::error::RecvError>),
+    }
+
+    let race_result = tokio::time::timeout(
+        deadline,
+        async {
+            tokio::select! {
+                jito_res = jito_client.wait_for_bundle(bundle_id, timeout_secs) => {
+                    BundleConfirmRace::Jito(jito_res)
+                }
+                geyser_res = async {
+                    if let Some(sig) = tx_signature {
+                        let rx = match pre_registered_rx {
+                            Some(rx) => rx,
+                            None => register_wallet_tx_confirm_waiter(ctx, sig),
+                        };
+                        rx.await
+                    } else {
+                        futures::future::pending::<
+                            std::result::Result<WalletTxConfirmNotify, tokio::sync::oneshot::error::RecvError>,
+                        >()
+                        .await
+                    }
+                } => BundleConfirmRace::Geyser(geyser_res),
+            }
+        },
+    )
+    .await;
+
+    match race_result {
+        Ok(BundleConfirmRace::Jito(Ok(status))) => {
+            return Ok(ConfirmOutcome::Confirmed {
+                details: format!(
+                    "method=jito_bundle bundle_id={bundle_id} slot={} confirmation_status={} txs={}",
+                    status.slot,
+                    status.confirmation_status,
+                    status.transactions.len()
+                ),
+                slot: Some(status.slot),
+            });
+        }
+        Ok(BundleConfirmRace::Jito(Err(e))) => {
+            let msg = e.to_string();
+            if !msg.contains("timeout") && !msg.contains("Timeout") {
+                return Ok(ConfirmOutcome::FailedConfirmed {
+                    details: format!("method=jito_bundle bundle_id={bundle_id} {msg}"),
+                    slot: None,
+                });
+            }
+        }
+        Ok(BundleConfirmRace::Geyser(Ok(confirm))) => {
+            if confirm.err.is_none() {
+                TX_CONFIRM_JETSTREAM_TOTAL.fetch_add(1, Ordering::Relaxed);
+                record_confirm_latency_metrics(start, slot_at_send, Some(confirm.slot));
+                return Ok(ConfirmOutcome::Confirmed {
+                    details: format!(
+                        "method=jetstream_bundle bundle_id={bundle_id} slot={} elapsed_ms={}",
+                        confirm.slot,
+                        start.elapsed().as_millis()
+                    ),
+                    slot: Some(confirm.slot),
+                });
+            }
+            record_confirm_latency_metrics(start, slot_at_send, Some(confirm.slot));
+            return Ok(ConfirmOutcome::FailedConfirmed {
+                details: format!(
+                    "method=jetstream_bundle bundle_id={bundle_id} err={} slot={}",
+                    confirm.err.as_deref().unwrap_or("unknown"),
+                    confirm.slot
+                ),
+                slot: Some(confirm.slot),
+            });
+        }
+        Ok(BundleConfirmRace::Geyser(Err(_))) => {
+            debug!(
+                bundle_id = %bundle_id,
+                "JetStream confirm channel dropped during bundle wait"
+            );
+        }
+        Err(_) => {
+            debug!(
+                bundle_id = %bundle_id,
+                elapsed_ms = start.elapsed().as_millis(),
+                "Bundle confirm deadline elapsed; performing final status poll"
+            );
+        }
+    }
+
+    // Final poll: getBundleStatuses
+    if let Ok(statuses) = jito_client
+        .get_bundle_status(&[bundle_id.to_string()])
+        .await
+    {
+        if let Some(status) = statuses.into_iter().find(|s| s.bundle_id == bundle_id) {
+            if status.confirmation_status == "confirmed"
+                || status.confirmation_status == "finalized"
+            {
+                return Ok(ConfirmOutcome::Confirmed {
+                    details: format!(
+                        "method=jito_bundle_final_poll bundle_id={bundle_id} slot={} confirmation_status={}",
+                        status.slot, status.confirmation_status
+                    ),
+                    slot: Some(status.slot),
+                });
+            }
+            if status.err.is_some() {
+                return Ok(ConfirmOutcome::FailedConfirmed {
+                    details: format!(
+                        "method=jito_bundle_final_poll bundle_id={bundle_id} err={:?}",
+                        status.err
+                    ),
+                    slot: Some(status.slot),
+                });
+            }
+        }
+    }
+
+    if let Some(sig) = tx_signature {
+        ctx.pending_tx_confirms.write().remove(sig);
+    }
+
+    Ok(ConfirmOutcome::TimeoutSent {
+        details: format!(
+            "bundle_id={bundle_id} timeout_secs={timeout_secs} elapsed_ms={}",
+            start.elapsed().as_millis()
+        ),
+    })
 }
 
 /// PR3: JetStream WalletTxConfirmed wait (market-data Geyser → JetStream → EE).
