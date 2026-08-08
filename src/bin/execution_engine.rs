@@ -13598,16 +13598,23 @@ fn log_bundle_tx_size_rejection(
         .iter()
         .map(|pk| pk.to_string())
         .collect();
+    let alt_in_table_but_static: Vec<String> = analysis
+        .alt_in_table_but_static
+        .iter()
+        .map(|pk| pk.to_string())
+        .collect();
     warn!(
         intent_id = %intent.intent_id,
         serialized_len,
         alt_configured,
         alt_hit_count = analysis.alt_hit_count,
         static_key_count = analysis.static_key_count,
+        alt_in_table_but_static_count = analysis.alt_in_table_but_static_count,
         buy_dex,
         sell_dex,
         tip_filtered_from_alt,
         static_not_in_alt = ?static_not_in_alt,
+        alt_in_table_but_static = ?alt_in_table_but_static,
         error = %size_err,
         rejection_stage,
         "Bundle transaction exceeds Solana serialized size limit"

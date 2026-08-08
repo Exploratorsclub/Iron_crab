@@ -533,6 +533,45 @@ Logs: `journalctl -u arb-strategy | grep "Arb check rejected"`
 
 **PR235:** Watchdog `exit(1)` ist default **aus** (`MARKET_DATA_MD_STATE_STALL_EXIT_ENABLED=false`); Stalls werden als `market_data_md_state_stalls_total` + WARN geloggt. Restart-Loop durch md-state sollte nach Deploy verschwinden — bei anhaltenden Stalls Metriken `md_state_deferred_jobs_len`, `md_state_burst_in_progress`, `md_state_register_skipped_idempotent_total` prüfen.
 
+## On-Chain Address Lookup Table (ALT)
+
+Cross-DEX-Arb-Bundles (z. B. `meteora_dlmm → pump_amm`) nutzen v0-Transaktionen mit einer **on-chain ALT**. Der execution-engine lädt die ALT **nur beim Start** (`load_alt`) — es gibt **keinen** Runtime-Merge mit `COMMON_ACCOUNTS` aus dem Code.
+
+| Feld | Prod-Wert |
+|------|-----------|
+| ALT-Adresse | `2J74oVKaviWzVr9gaLDvmBf3VAVVpzy88i3YCnyDwvuX` |
+| Config-Key | `address_lookup_table` in `my_config.server.toml` |
+
+### Wann ALT extenden?
+
+Nach jedem Deploy, der `COMMON_ACCOUNTS` in `src/solana/address_lookup_table.rs` ändert (siehe `docs/ALT_GLOBAL_KEYS_AUDIT.md`).
+
+### Audit (read-only)
+
+```bash
+cargo run --bin setup-alt -- \
+  --rpc-url http://127.0.0.1:8899 \
+  --alt-address 2J74oVKaviWzVr9gaLDvmBf3VAVVpzy88i3YCnyDwvuX \
+  --audit-only
+```
+
+Listet alle `COMMON_ACCOUNTS`-Pubkeys, die **noch nicht** in der on-chain ALT sind.
+
+### Extend (Cold Path — manuell, nicht im Deploy-Script)
+
+```bash
+cargo run --bin setup-alt -- \
+  --rpc-url http://127.0.0.1:8899 \
+  --keypair /home/ironcrab/.config/solana/id.json \
+  --alt-address 2J74oVKaviWzVr9gaLDvmBf3VAVVpzy88i3YCnyDwvuX
+```
+
+Danach **execution-engine neu starten**, damit die erweiterte ALT geladen wird.
+
+### Diagnose bei `tx_too_large`
+
+Logs enthalten u. a. `alt_hit_count`, `static_key_count`, `alt_in_table_but_static_count`, `static_not_in_alt`. Hohe `static_not_in_alt` bei fehlenden **globalen** Keys → ALT extenden. Pool-PDAs/Vaults/Bin-Arrays gehören **nicht** in die ALT (Architektur-Entscheidung).
+
 ## Siehe auch
 
 - [Iron_crab-eval/docs/spec/](https://github.com/Exploratorsclub/Iron_crab-eval) — Spezifikation (TARGET_ARCHITECTURE, ROLE_SEPARATION, DEFINITION_OF_DONE, STORAGE_CONVENTIONS)

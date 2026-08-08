@@ -1543,7 +1543,7 @@ mod tests {
     };
     use crate::solana::address_lookup_table::{
         analyze_versioned_message_alt_usage, compile_v0_versioned_message, get_common_accounts,
-        LoadedAlt,
+        AltCompileAnalysis, LoadedAlt,
     };
     use crate::solana::compute_budget_helper;
     use crate::solana::dex::pumpfun_amm::{
@@ -1810,10 +1810,11 @@ mod tests {
         (plan, wallet, token_mint)
     }
 
-    fn compile_cross_dex_bundle_tx(
+    fn compile_cross_dex_bundle_tx_with_alt(
         wallet: &Keypair,
         plan: &CrossDexSwapPlan,
-    ) -> (VersionedTransaction, usize, usize) {
+        alt_accounts: Vec<Pubkey>,
+    ) -> (VersionedTransaction, usize, usize, AltCompileAnalysis) {
         let tip = Pubkey::from_str(JITO_TIP_ACCOUNT).unwrap();
         let mut ixs = Vec::new();
         ixs.push(compute_budget_helper::set_compute_unit_limit(450_000));
@@ -1831,6 +1832,41 @@ mod tests {
             data: tip_data,
         });
 
+        let alt = LoadedAlt {
+            address: Pubkey::new_unique(),
+            accounts: alt_accounts,
+        };
+        let blockhash = Hash::new_unique();
+        let message =
+            compile_v0_versioned_message(&wallet.pubkey(), &ixs, Some(&alt), Some(&tip), blockhash)
+                .expect("compile v0 message");
+        let tx = VersionedTransaction::try_new(message, &[wallet]).expect("sign tx");
+        let analysis = analyze_versioned_message_alt_usage(&tx.message, Some(&alt));
+        let size = versioned_tx_serialized_len(&tx);
+        (tx, size, analysis.alt_hit_count, analysis)
+    }
+
+    /// Optimistic ALT: every instruction account is in the table (not prod-realistic).
+    fn compile_cross_dex_bundle_tx_optimistic_alt(
+        wallet: &Keypair,
+        plan: &CrossDexSwapPlan,
+    ) -> (VersionedTransaction, usize, usize, AltCompileAnalysis) {
+        let tip = Pubkey::from_str(JITO_TIP_ACCOUNT).unwrap();
+        let mut ixs = Vec::new();
+        ixs.push(compute_budget_helper::set_compute_unit_limit(450_000));
+        ixs.push(compute_budget_helper::set_compute_unit_price(1_000));
+        ixs.extend(plan.buy_instructions.iter().cloned());
+        ixs.extend(plan.sell_instructions.iter().cloned());
+        let mut tip_data = vec![2, 0, 0, 0];
+        tip_data.extend_from_slice(&10_000u64.to_le_bytes());
+        ixs.push(Instruction {
+            program_id: Pubkey::from_str("11111111111111111111111111111111").unwrap(),
+            accounts: vec![
+                AccountMeta::new(wallet.pubkey(), true),
+                AccountMeta::new(tip, false),
+            ],
+            data: tip_data,
+        });
         let mut alt_pubkeys = get_common_accounts();
         for ix in &ixs {
             alt_pubkeys.push(ix.program_id);
@@ -1840,19 +1876,23 @@ mod tests {
         }
         alt_pubkeys.sort();
         alt_pubkeys.dedup();
+        compile_cross_dex_bundle_tx_with_alt(wallet, plan, alt_pubkeys)
+    }
 
-        let alt = LoadedAlt {
-            address: Pubkey::new_unique(),
-            accounts: alt_pubkeys,
-        };
-        let blockhash = Hash::new_unique();
-        let message =
-            compile_v0_versioned_message(&wallet.pubkey(), &ixs, Some(&alt), Some(&tip), blockhash)
-                .expect("compile v0 message");
-        let tx = VersionedTransaction::try_new(message, &[wallet]).expect("sign tx");
-        let analysis = analyze_versioned_message_alt_usage(&tx.message, Some(&alt));
-        let size = versioned_tx_serialized_len(&tx);
-        (tx, size, analysis.alt_hit_count)
+    /// Prod-realistic ALT: only `COMMON_ACCOUNTS` globals (EE loads on-chain ALT, no runtime merge).
+    fn compile_cross_dex_bundle_tx_realistic_alt(
+        wallet: &Keypair,
+        plan: &CrossDexSwapPlan,
+    ) -> (VersionedTransaction, usize, usize, AltCompileAnalysis) {
+        compile_cross_dex_bundle_tx_with_alt(wallet, plan, get_common_accounts())
+    }
+
+    fn compile_cross_dex_bundle_tx(
+        wallet: &Keypair,
+        plan: &CrossDexSwapPlan,
+    ) -> (VersionedTransaction, usize, usize) {
+        let (tx, size, alt_hits, _) = compile_cross_dex_bundle_tx_optimistic_alt(wallet, plan);
+        (tx, size, alt_hits)
     }
 
     #[tokio::test]
@@ -1888,11 +1928,49 @@ mod tests {
             "prod-like pump sell must use 24-account extended layout"
         );
 
-        let (_tx, size, alt_hits) = compile_cross_dex_bundle_tx(&wallet, &plan);
+        let (_tx, size, alt_hits, _) = compile_cross_dex_bundle_tx_optimistic_alt(&wallet, &plan);
         assert!(
             size <= MAX_SERIALIZED_TX_BYTES,
-            "serialized_len={size} alt_hit_count={alt_hits} (max {MAX_SERIALIZED_TX_BYTES})"
+            "optimistic ALT serialized_len={size} alt_hit_count={alt_hits} (max {MAX_SERIALIZED_TX_BYTES})"
         );
+    }
+
+    /// Prod-realistic: ALT contains only `COMMON_ACCOUNTS` (EE loads on-chain ALT, no runtime merge).
+    /// Documents remaining byte gap when globals are correct but pool-specific keys stay static.
+    #[tokio::test]
+    async fn cross_dex_meteora_pump_bundle_realistic_common_alt_size_audit() {
+        let (plan, wallet, _) = build_prod_pattern_cross_dex_plan(true).await;
+        let (tx, size, alt_hits, analysis) =
+            compile_cross_dex_bundle_tx_realistic_alt(&wallet, &plan);
+
+        eprintln!(
+            "realistic_common_alt: serialized_len={size} alt_hit_count={alt_hits} \
+             static_key_count={} alt_in_table_but_static_count={} \
+             static_not_in_alt={:?} alt_in_table_but_static={:?}",
+            analysis.static_key_count,
+            analysis.alt_in_table_but_static_count,
+            analysis
+                .static_not_in_alt
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>(),
+            analysis
+                .alt_in_table_but_static
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>(),
+        );
+
+        // With corrected COMMON_ACCOUNTS globals, prod ALT extend should bring this under 1232.
+        // Pool-specific keys (vaults, bin arrays, user ATAs) correctly remain static / not in ALT.
+        assert!(
+            size <= MAX_SERIALIZED_TX_BYTES,
+            "realistic COMMON_ACCOUNTS ALT still too large: serialized_len={size} \
+             alt_hit_count={alt_hits} static_key_count={} \
+             (extend on-chain ALT per docs/ALT_GLOBAL_KEYS_AUDIT.md)",
+            analysis.static_key_count
+        );
+        let _ = tx;
     }
 
     #[tokio::test]
