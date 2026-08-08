@@ -582,12 +582,10 @@ pub const ARB_TOKEN_OUT_FLOOR_TRADE_AMOUNT_LAMPORTS: u64 = 10_000_000;
 /// Returns true when execution-engine can reliably build a cross-DEX swap plan for this pair.
 ///
 /// Strategy must not publish intents for unsupported pairs (I-12: log + metric, no silent drop).
-pub fn is_arb_route_executable(buy_dex: &str, sell_dex: &str) -> bool {
-    // Prod 2026-08-06: orca ↔ meteora_dlmm fails in EE `build_swap_plan` (Intent 000004).
-    !matches!(
-        (buy_dex, sell_dex),
-        ("orca", "meteora_dlmm") | ("meteora_dlmm", "orca")
-    )
+pub fn is_arb_route_executable(_buy_dex: &str, _sell_dex: &str) -> bool {
+    // Temporarily denied orca ↔ meteora_dlmm on 2026-08-06 (EE `build_swap_plan` failed; Intent 000004).
+    // Reopened post pool_address_hint fixes #380 (Orca) and #381 (Meteora).
+    true
 }
 
 /// Returns true when reserve/bin-walker `token_out` is plausible vs a price-based estimate.
@@ -3049,8 +3047,8 @@ mod tests {
 
     #[test]
     fn arb_route_gate_blocks_orca_meteora_dlmm_pairs() {
-        assert!(!is_arb_route_executable("orca", "meteora_dlmm"));
-        assert!(!is_arb_route_executable("meteora_dlmm", "orca"));
+        assert!(is_arb_route_executable("orca", "meteora_dlmm"));
+        assert!(is_arb_route_executable("meteora_dlmm", "orca"));
         assert!(is_arb_route_executable("meteora_dlmm", "pump_amm"));
         assert!(is_arb_route_executable("pump_amm", "meteora_dlmm"));
     }

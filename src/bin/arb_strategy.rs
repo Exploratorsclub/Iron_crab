@@ -14103,7 +14103,8 @@ mod pool_accounts_coverage_tests {
             "orca DexPoolAccounts layout must include vaults + tick metadata"
         );
 
-        assert!(create_arb_intent(&ctx, &opp).is_none());
+        // Route gate reopened post #380/#381 — meteora_dlmm ↔ orca intents publish when accounts resolve.
+        assert!(create_arb_intent(&ctx, &opp).is_some());
         assert_eq!(
             ARB_REJECTED_MISSING_ACCOUNTS.load(Ordering::Relaxed),
             before_missing,
