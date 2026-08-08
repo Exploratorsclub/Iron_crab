@@ -144,6 +144,13 @@ pub struct CrossDexValidation {
     pub reject_reason: Option<String>,
 }
 
+/// Options for [`CrossDexHandler::build_swap_plan`] (bundle size / hot-path hints).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CrossDexPlanOptions {
+    /// When true, omit token ATA `CreateIdempotent` — wallet snapshot proves ATA exists.
+    pub skip_token_ata_create: bool,
+}
+
 /// Result of building Cross-DEX swap instructions
 #[derive(Debug)]
 pub struct CrossDexSwapPlan {
@@ -1186,6 +1193,7 @@ impl CrossDexHandler {
         &self,
         intent: &TradeIntent,
         validation: &CrossDexValidation,
+        options: CrossDexPlanOptions,
     ) -> Result<CrossDexSwapPlan> {
         // buy_quote.amount_out is the expected token output from buy leg
         // This is used as amount_in for the sell leg
@@ -1301,10 +1309,16 @@ impl CrossDexHandler {
         let token_program_sdk = Pubkey::new_from_array(token_program.to_bytes());
 
         // ====================================================================
-        // Create Token ATA (idempotent) - only for the token being traded
+        // Create Token ATA (idempotent) - only when wallet ATA is not yet known
         // ====================================================================
         let mut ata_creation_instructions = Vec::new();
-        if let Some(wallet) = self.wallet_pubkey {
+        if options.skip_token_ata_create {
+            debug!(
+                token_mint = %token_mint,
+                "Skipping token ATA CreateIdempotent (wallet snapshot proves ATA exists)"
+            );
+            crate::metrics::record_arb_bundle_ata_create_skipped_known_ata();
+        } else if let Some(wallet) = self.wallet_pubkey {
             let wallet_spl =
                 spl_token::solana_program::pubkey::Pubkey::new_from_array(wallet.to_bytes());
 
@@ -1520,11 +1534,42 @@ impl CrossDexHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache, PumpAmmState};
+    use crate::execution::live_pool_cache::{
+        CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState,
+    };
+    use crate::ipc::{
+        ExplicitAmount, IntentOrigin, IntentTier, RecordHeader, TradeIntent, TradeResources,
+        TradeSide, TradingRegime,
+    };
+    use crate::solana::address_lookup_table::{
+        analyze_versioned_message_alt_usage, compile_v0_versioned_message, get_common_accounts,
+        LoadedAlt,
+    };
+    use crate::solana::compute_budget_helper;
+    use crate::solana::dex::pumpfun_amm::{
+        PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR, PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
+        PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
+    };
     use crate::solana::dex::router::Router;
+    use crate::solana::dex::Quote;
     use crate::solana::rpc::SolanaRpc;
+    use crate::storage::locks::LockManager;
+    use solana_sdk::hash::Hash;
     use solana_sdk::pubkey::Pubkey;
+    use solana_sdk::signature::Keypair;
+    use solana_sdk::signer::Signer;
+    use solana_sdk::transaction::VersionedTransaction;
+    use std::collections::HashMap;
     use std::str::FromStr;
+
+    const MAX_SERIALIZED_TX_BYTES: usize = 1232;
+    const JITO_TIP_ACCOUNT: &str = "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5";
+
+    fn versioned_tx_serialized_len(tx: &VersionedTransaction) -> usize {
+        bincode::serialize(tx)
+            .expect("serialize versioned tx")
+            .len()
+    }
 
     fn make_pump_amm_cache_with_reserves(
         pool_market: Pubkey,
@@ -1548,6 +1593,318 @@ mod tests {
             100,
         );
         Arc::new(cache)
+    }
+
+    fn pump_amm_v14_pool_accounts(pool_market: Pubkey, base_mint: Pubkey) -> Vec<Pubkey> {
+        vec![
+            pool_market,
+            Pubkey::from_str("ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw").unwrap(),
+            base_mint,
+            Pubkey::from_str(SOL_MINT).unwrap(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR).unwrap(),
+            Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR).unwrap(),
+        ]
+    }
+
+    fn seed_prod_like_cross_dex_cache(
+        cache: &LivePoolCache,
+        buy_pool: Pubkey,
+        sell_pool: Pubkey,
+        token_mint: Pubkey,
+    ) {
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        cache.upsert(
+            buy_pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: sol_mint,
+                token_y_mint: token_mint,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: -281,
+                bin_step: 10,
+                reserve_x_balance: Some(50_000_000_000),
+                reserve_y_balance: Some(1_000_000_000_000),
+            }),
+            100,
+        );
+        let sell_pool_accounts = pump_amm_v14_pool_accounts(sell_pool, token_mint);
+        cache.upsert(
+            sell_pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: token_mint,
+                quote_mint: sol_mint,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000_000_000_000),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: sell_pool_accounts,
+                creator: None,
+            }),
+            100,
+        );
+        let tail_0 = Pubkey::from_str("5CXzL4rxA677oGhKUDBxxapLk6wLpRPLmackZDHGmZCQ").unwrap();
+        let tail_1 = Pubkey::from_str("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD").unwrap();
+        let third = Pubkey::from_str("HjQjngTDqoHE6aaGhUqfz9aQ7WZcBRjy5xB8PScLSr8i").unwrap();
+        cache.merge_pump_amm_sell_extended_layout(
+            &sell_pool,
+            true,
+            Some(third),
+            Some(tail_0),
+            Some(tail_1),
+            None,
+            None,
+            false,
+            false,
+            None,
+        );
+        cache.set_pump_amm_sell_layout_ready(&sell_pool, true);
+    }
+
+    fn cross_dex_test_intent(
+        token_mint: &Pubkey,
+        buy_pool: &Pubkey,
+        sell_pool: &Pubkey,
+    ) -> TradeIntent {
+        let mut metadata = HashMap::new();
+        metadata.insert("buy_dex".to_string(), "meteora_dlmm".to_string());
+        metadata.insert("sell_dex".to_string(), "pump_amm".to_string());
+        metadata.insert("buy_pool".to_string(), buy_pool.to_string());
+        metadata.insert("sell_pool".to_string(), sell_pool.to_string());
+        metadata.insert("spread_bps".to_string(), "50".to_string());
+        metadata.insert(
+            "estimated_profit_lamports".to_string(),
+            "500000".to_string(),
+        );
+
+        let buy_accounts: Vec<String> = [
+            buy_pool.to_string(),
+            SOL_MINT.to_string(),
+            token_mint.to_string(),
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+            "active_id:-281".to_string(),
+            "bin_step:10".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let sell_accounts: Vec<String> = pump_amm_v14_pool_accounts(*sell_pool, *token_mint)
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+        let mut accounts = Vec::new();
+        accounts.push(format!("buy_pool_accounts_start:{}", buy_accounts.len()));
+        accounts.extend(buy_accounts);
+        accounts.push(format!("sell_pool_accounts_start:{}", sell_accounts.len()));
+        accounts.extend(sell_accounts);
+
+        TradeIntent {
+            header: RecordHeader {
+                schema_version: 1,
+                ts_unix_ms: 1,
+                component: "test".to_string(),
+                build: "test".to_string(),
+                run_id: "run".to_string(),
+            },
+            intent_id: "arb-test-size".to_string(),
+            source: "arb-strategy".to_string(),
+            tier: IntentTier::Arb,
+            origin_type: IntentOrigin::StrategyA,
+            deadline_slot: None,
+            ttl_ms: Some(30_000),
+            required_capital: ExplicitAmount {
+                raw: 100_000_000,
+                decimals: 9,
+                ui: None,
+            },
+            resources: TradeResources {
+                input_mint: SOL_MINT.to_string(),
+                output_mint: token_mint.to_string(),
+                pools: vec![buy_pool.to_string(), sell_pool.to_string()],
+                accounts,
+                token_program: Some(spl_token::id().to_string()),
+            },
+            expected_roi_bps: 50,
+            max_slippage_bps: 500,
+            side: TradeSide::Buy,
+            regime: TradingRegime::NotApplicable,
+            trigger_event_id: None,
+            require_bundle: Some(true),
+            bundle_tip_lamports: Some(10_000),
+            hint_compute_units: None,
+            hint_priority_fee_micro_lamports: None,
+            hint_urgency: None,
+            metadata,
+            execution: None,
+            swap_path: None,
+        }
+    }
+
+    fn cross_dex_validation_fixture(token_mint: &Pubkey) -> CrossDexValidation {
+        CrossDexValidation {
+            is_valid: true,
+            buy_quote: Some(Quote {
+                amount_out: 1_000_000,
+                price_impact_bps: 0,
+                route: vec![],
+                fee_bps: 0,
+                in_reserve: 0,
+                out_reserve: 0,
+                input_mint: SOL_MINT.to_string(),
+                output_mint: token_mint.to_string(),
+                tick_spacing: None,
+            }),
+            sell_quote: Some(Quote {
+                amount_out: 101_000_000,
+                price_impact_bps: 0,
+                route: vec![],
+                fee_bps: 0,
+                in_reserve: 0,
+                out_reserve: 0,
+                input_mint: token_mint.to_string(),
+                output_mint: SOL_MINT.to_string(),
+                tick_spacing: None,
+            }),
+            actual_spread_bps: 50,
+            estimated_profit_lamports: 500_000,
+            reject_reason: None,
+        }
+    }
+
+    async fn build_prod_pattern_cross_dex_plan(
+        skip_token_ata: bool,
+    ) -> (CrossDexSwapPlan, Keypair, Pubkey) {
+        let wallet = Keypair::new();
+        let token_mint = Pubkey::new_unique();
+        let buy_pool = Pubkey::from_str("2TD1fMPg2w7Hjt8bASSdxi92YFNQFgvdznqVApe3NGpn").unwrap();
+        let sell_pool = Pubkey::new_unique();
+
+        let cache = Arc::new(LivePoolCache::new());
+        seed_prod_like_cross_dex_cache(&cache, buy_pool, sell_pool, token_mint);
+
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mut handler = CrossDexHandler::new(rpc.clone(), Some(wallet.pubkey()))
+            .with_rpc_url("http://127.0.0.1:0".to_string())
+            .with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes");
+
+        let intent = cross_dex_test_intent(&token_mint, &buy_pool, &sell_pool);
+        let validation = cross_dex_validation_fixture(&token_mint);
+        let plan = handler
+            .build_swap_plan(
+                &intent,
+                &validation,
+                CrossDexPlanOptions {
+                    skip_token_ata_create: skip_token_ata,
+                },
+            )
+            .await
+            .expect("build_swap_plan");
+        (plan, wallet, token_mint)
+    }
+
+    fn compile_cross_dex_bundle_tx(
+        wallet: &Keypair,
+        plan: &CrossDexSwapPlan,
+    ) -> (VersionedTransaction, usize, usize) {
+        let tip = Pubkey::from_str(JITO_TIP_ACCOUNT).unwrap();
+        let mut ixs = Vec::new();
+        ixs.push(compute_budget_helper::set_compute_unit_limit(450_000));
+        ixs.push(compute_budget_helper::set_compute_unit_price(1_000));
+        ixs.extend(plan.buy_instructions.iter().cloned());
+        ixs.extend(plan.sell_instructions.iter().cloned());
+        let mut tip_data = vec![2, 0, 0, 0];
+        tip_data.extend_from_slice(&10_000u64.to_le_bytes());
+        ixs.push(Instruction {
+            program_id: Pubkey::from_str("11111111111111111111111111111111").unwrap(),
+            accounts: vec![
+                AccountMeta::new(wallet.pubkey(), true),
+                AccountMeta::new(tip, false),
+            ],
+            data: tip_data,
+        });
+
+        let mut alt_pubkeys = get_common_accounts();
+        for ix in &ixs {
+            alt_pubkeys.push(ix.program_id);
+            for meta in &ix.accounts {
+                alt_pubkeys.push(meta.pubkey);
+            }
+        }
+        alt_pubkeys.sort();
+        alt_pubkeys.dedup();
+
+        let alt = LoadedAlt {
+            address: Pubkey::new_unique(),
+            accounts: alt_pubkeys,
+        };
+        let blockhash = Hash::new_unique();
+        let message =
+            compile_v0_versioned_message(&wallet.pubkey(), &ixs, Some(&alt), Some(&tip), blockhash)
+                .expect("compile v0 message");
+        let tx = VersionedTransaction::try_new(message, &[wallet]).expect("sign tx");
+        let analysis = analyze_versioned_message_alt_usage(&tx.message, Some(&alt));
+        let size = versioned_tx_serialized_len(&tx);
+        (tx, size, analysis.alt_hit_count)
+    }
+
+    #[tokio::test]
+    async fn cross_dex_ata_skip_omits_create_idempotent_instruction() {
+        let (with_ata, _, _) = build_prod_pattern_cross_dex_plan(false).await;
+        let (without_ata, _, _) = build_prod_pattern_cross_dex_plan(true).await;
+        assert!(
+            with_ata.buy_instructions.len() > without_ata.buy_instructions.len(),
+            "ATA skip must remove at least one buy instruction"
+        );
+        assert_eq!(
+            without_ata.buy_instructions.len() + 1,
+            with_ata.buy_instructions.len()
+        );
+    }
+
+    #[test]
+    fn lock_manager_wallet_snapshot_seen_implies_ata_known() {
+        let lm = LockManager::new(1_000_000_000);
+        let mint = "9Pfyn4Hvbg1z9y8K9f6K9f6K9f6K9f6K9f6K9f6pump";
+        assert!(!lm.token_wallet_snapshot_seen(mint));
+        lm.set_available_token_balance(mint.to_string(), 0);
+        assert!(lm.token_wallet_snapshot_seen(mint));
+    }
+
+    #[tokio::test]
+    async fn cross_dex_meteora_pump_bundle_fits_1232_with_ata_skip_and_alt() {
+        let (plan, wallet, _) = build_prod_pattern_cross_dex_plan(true).await;
+        let sell_ix = plan.sell_instructions.first().expect("sell leg present");
+        assert_eq!(
+            sell_ix.accounts.len(),
+            PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
+            "prod-like pump sell must use 24-account extended layout"
+        );
+
+        let (_tx, size, alt_hits) = compile_cross_dex_bundle_tx(&wallet, &plan);
+        assert!(
+            size <= MAX_SERIALIZED_TX_BYTES,
+            "serialized_len={size} alt_hit_count={alt_hits} (max {MAX_SERIALIZED_TX_BYTES})"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_dex_ata_skip_reduces_serialized_bundle_size() {
+        let (plan_with, wallet_with, _) = build_prod_pattern_cross_dex_plan(false).await;
+        let (plan_without, wallet_without, _) = build_prod_pattern_cross_dex_plan(true).await;
+        let (_, size_with, _) = compile_cross_dex_bundle_tx(&wallet_with, &plan_with);
+        let (_, size_without, _) = compile_cross_dex_bundle_tx(&wallet_without, &plan_without);
+        assert!(
+            size_without < size_with,
+            "ATA skip should reduce size: with={size_with} without={size_without}"
+        );
     }
 
     #[tokio::test]
