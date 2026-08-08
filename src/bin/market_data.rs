@@ -4622,9 +4622,65 @@ impl MarketDataContext {
         if !is_momentum && !is_arb {
             return;
         }
+        let _ = self.try_touch_live_pool_reserve_basis_for_hot_pool(pool);
         // Arb-only: force cache seed so SLAVE vault_balances populate before first Geyser vault tick.
         let force_arb_seed = is_arb && !is_momentum;
         self.try_publish_balance_updated_from_cache(pool, force_arb_seed);
+    }
+
+    /// Geyser-only: backfill MASTER reserve basis from tracked vault `last_balance` rows or touch age.
+    fn try_touch_live_pool_reserve_basis_for_hot_pool(&self, pool: Pubkey) -> bool {
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return false;
+        };
+        if cached_pool_has_fresh_reserve_basis(&state) {
+            return self
+                .live_pool_cache
+                .touch_freshness_on_existing_reserve_basis(&pool);
+        }
+        if matches!(state, CachedPoolState::PumpFun(_)) {
+            return false;
+        }
+        let slot = self
+            .live_pool_cache
+            .get_with_metadata(&pool)
+            .map(|(_, slot, _)| slot)
+            .unwrap_or(0);
+        let mut base_vault: Option<Pubkey> = None;
+        let mut quote_vault: Option<Pubkey> = None;
+        let mut base_balance = 0u64;
+        let mut quote_balance = 0u64;
+        {
+            let vaults = self.tracked_vaults.read();
+            for (vault_pk, info) in vaults.iter() {
+                if info.pool_address != pool {
+                    continue;
+                }
+                let balance = info.last_balance.load(std::sync::atomic::Ordering::Relaxed);
+                if info.is_base_vault {
+                    base_vault = Some(*vault_pk);
+                    base_balance = balance;
+                } else {
+                    quote_vault = Some(*vault_pk);
+                    quote_balance = balance;
+                }
+            }
+        }
+        let (Some(base_vault), Some(quote_vault)) = (base_vault, quote_vault) else {
+            return false;
+        };
+        if base_balance == 0 && quote_balance == 0 {
+            return false;
+        }
+        self.live_pool_cache
+            .apply_vault_pair_balances_to_reserve_basis(
+                &pool,
+                &base_vault,
+                base_balance,
+                &quote_vault,
+                quote_balance,
+                slot,
+            )
     }
 
     /// Back-compat alias for momentum-only call sites.
@@ -5591,6 +5647,7 @@ impl MarketDataContext {
                 }
                 continue;
             }
+            let _ = self.try_touch_live_pool_reserve_basis_for_hot_pool(pool);
             let consumer = match pin {
                 GeyserPinReason::ArbMultiDex => ExplicitConsumer::Arb,
                 GeyserPinReason::MomentumActive | GeyserPinReason::Wallet => {
@@ -6246,6 +6303,7 @@ impl MarketDataContext {
             if self.try_admit_pool_consumer_group(admission, pool_pk, ExplicitConsumer::Arb) {
                 inc_market_data_arb_admission_admitted_total();
                 let registered = self.register_geyser_reserves_for_arb_active_pool(pool_pk);
+                let _ = self.try_touch_live_pool_reserve_basis_for_hot_pool(pool_pk);
                 self.record_arb_active_pool_reserve_registration_outcome(pool_pk, registered);
                 if registered || self.explicit_physical_publish_needed(admission) {
                     batch_dirty = true;
@@ -17332,6 +17390,77 @@ mod pr_b_geyser_tracking_tests {
             MARKET_DATA_BALANCE_UPDATED_FROM_CACHE_TOTAL.load(Ordering::Relaxed),
             counter_before,
             "without NATS the publish is a no-op, but pool_has_live=false proves no early skip"
+        );
+    }
+
+    #[test]
+    fn arb_pin_touch_reserve_basis_hydrates_from_tracked_vault_balances() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            vaults.insert(
+                coin,
+                VaultInfo {
+                    pool_address: pool,
+                    dex: "raydium_cpmm".to_string(),
+                    base_mint: base,
+                    quote_mint: quote,
+                    is_base_vault: true,
+                    last_balance: std::sync::atomic::AtomicU64::new(1_000_000),
+                    last_used_at: Instant::now(),
+                    pinned: true,
+                    pin: Some(GeyserPinReason::ArbMultiDex),
+                    active_id: None,
+                    bin_step: None,
+                    sibling_vault: Some(pc),
+                },
+            );
+            vaults.insert(
+                pc,
+                VaultInfo {
+                    pool_address: pool,
+                    dex: "raydium_cpmm".to_string(),
+                    base_mint: base,
+                    quote_mint: quote,
+                    is_base_vault: false,
+                    last_balance: std::sync::atomic::AtomicU64::new(2_000_000),
+                    last_used_at: Instant::now(),
+                    pinned: true,
+                    pin: Some(GeyserPinReason::ArbMultiDex),
+                    active_id: None,
+                    bin_step: None,
+                    sibling_vault: Some(coin),
+                },
+            );
+        }
+
+        assert!(ctx.try_touch_live_pool_reserve_basis_for_hot_pool(pool));
+        assert!(
+            cached_pool_has_fresh_reserve_basis(&ctx.live_pool_cache.get(&pool).unwrap()),
+            "tracked vault last_balance must backfill MASTER reserve basis for arb pin"
         );
     }
 

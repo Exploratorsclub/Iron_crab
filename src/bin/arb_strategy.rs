@@ -86,7 +86,8 @@ use ironcrab::metrics::{
     inc_arb_v2_screen_sell_stale_then_fresh_after_pin_total,
     inc_arb_v2_sell_stale_recovery_outcome_total, inc_arb_vault_balance_applied_total,
     inc_arb_vault_live_snapshot_refreshed_total, inc_arb_vault_live_snapshot_seeded_total,
-    inc_arb_vault_rescreen_scheduled_total, record_arb_heartbeat_phase,
+    inc_arb_vault_rescreen_scheduled_total, inc_arb_vault_seed_from_cache_miss_total,
+    inc_arb_vault_seed_from_cache_ok_total, record_arb_heartbeat_phase,
     record_arb_intent_suppressed_implausible_token_out,
     record_arb_intent_suppressed_unsupported_route, record_arb_price_freshness_stale_age_ms,
     record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
@@ -5760,6 +5761,62 @@ impl ArbContext {
         }
     }
 
+    /// P1: seed global `vault_balances` from SLAVE cache on JetStream PoolCacheUpdate for pinned pools.
+    fn consume_vault_seed_from_pool_cache_update(&self, update: &PoolCacheUpdate) -> bool {
+        if matches!(update.update_type, PoolCacheUpdateType::PoolRemoved) {
+            return false;
+        }
+        let pool_address = update.pool_address.as_str();
+        let is_pinned = self.arb_pinned_pools.read().contains(pool_address);
+        let mints_with_pool: Vec<String> = if is_pinned {
+            let selected = self.arb_selected_mints.read();
+            let trackers = self.trackers.read();
+            trackers
+                .iter()
+                .filter(|(mint, tracker)| {
+                    selected.contains(mint.as_str()) && tracker.pools.contains_key(pool_address)
+                })
+                .map(|(mint, _)| mint.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !is_pinned {
+            return false;
+        }
+        let pin_class = "pin";
+        let vault_wait = Instant::now();
+        let mut vault_cache = self.vault_balances.write();
+        record_arb_writer_lock_wait(ArbWriterLockKind::VaultBalancesWrite, vault_wait.elapsed());
+        let seeded = if try_refresh_vault_from_live_cache(
+            pool_address,
+            &self.live_pool_cache,
+            &mut vault_cache,
+            pin_class,
+        ) {
+            inc_arb_vault_live_snapshot_refreshed_total();
+            true
+        } else if try_seed_vault_from_live_cache(
+            pool_address,
+            &self.live_pool_cache,
+            &mut vault_cache,
+            pin_class,
+        ) {
+            inc_arb_vault_live_snapshot_seeded_total();
+            true
+        } else {
+            false
+        };
+        drop(vault_cache);
+        if seeded {
+            inc_arb_vault_seed_from_cache_ok_total();
+            self.schedule_arb_vault_rescreen_for_mints(pool_address, &mints_with_pool);
+        } else {
+            inc_arb_vault_seed_from_cache_miss_total();
+        }
+        seeded
+    }
+
     /// Handle PoolStateUpdate event - cache vault balances from Geyser
     /// This eliminates RPC calls to fetch vault balances during quoting.
     #[allow(clippy::too_many_arguments)]
@@ -7609,7 +7666,9 @@ fn process_arb_tracker_write_job(ctx: Arc<ArbContext>, job: ArbTrackerWriteJob) 
 
     match job {
         ArbTrackerWriteJob::SeedPoolCache { update } => {
-            if ctx.seed_trackers_for_pool_cache_update(&update) {
+            let vault_seeded = ctx.consume_vault_seed_from_pool_cache_update(&update);
+            let tracker_seeded = ctx.seed_trackers_for_pool_cache_update(&update);
+            if tracker_seeded || vault_seeded {
                 arb_strategy_pool_cache_update_seeded_inc();
                 if let Some(mint) = arb_tracked_token_mint(&update.base_mint, &update.quote_mint) {
                     ctx.publish_proactive_arb_track_for_mint(mint);
@@ -12195,6 +12254,94 @@ mod two_hop_price_tests {
         assert!(
             age_ms <= 120_000,
             "screen seed should land in le_120s freshness bucket, got age_ms={age_ms}"
+        );
+    }
+
+    #[test]
+    fn pool_cache_update_consume_seeds_pinned_vault_and_metrics() {
+        use ironcrab::metrics::ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL;
+        use std::sync::atomic::Ordering;
+
+        let cache = create_shared_cache();
+        let ctx = test_arb_context(cache.clone());
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+
+        let update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            2_000_000_000,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update);
+
+        ctx.arb_pinned_pools.write().insert(pool_str.clone());
+        let ok_before = ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL.load(Ordering::Relaxed);
+        assert!(ctx.consume_vault_seed_from_pool_cache_update(&update));
+        assert_eq!(
+            ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL.load(Ordering::Relaxed),
+            ok_before + 1
+        );
+        assert!(ctx.vault_balances.read().contains_key(&pool_str));
+    }
+
+    #[test]
+    fn pool_cache_update_consume_miss_when_pinned_pool_lacks_reserve_basis() {
+        use ironcrab::metrics::ARB_VAULT_SEED_FROM_CACHE_MISS_TOTAL;
+        use std::sync::atomic::Ordering;
+
+        let cache = create_shared_cache();
+        let ctx = test_arb_context(cache.clone());
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let pool_str = pool.to_string();
+        let mint_str = token_mint.to_string();
+        cache.upsert(
+            pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: token_mint,
+                token_mint_b: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: 0,
+                sqrt_price: 1,
+                liquidity: 1,
+                fee_rate: 300,
+                protocol_fee_rate: 100,
+                tick_spacing: 64,
+                vault_a_balance: None,
+                vault_b_balance: None,
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            1,
+        );
+        let update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str,
+            NATIVE_SOL_MINT.to_string(),
+            0,
+            0,
+            1,
+        );
+        ctx.arb_pinned_pools.write().insert(pool_str);
+        let miss_before = ARB_VAULT_SEED_FROM_CACHE_MISS_TOTAL.load(Ordering::Relaxed);
+        assert!(!ctx.consume_vault_seed_from_pool_cache_update(&update));
+        assert_eq!(
+            ARB_VAULT_SEED_FROM_CACHE_MISS_TOTAL.load(Ordering::Relaxed),
+            miss_before + 1
         );
     }
 
