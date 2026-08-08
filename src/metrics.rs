@@ -5187,6 +5187,19 @@ pub static ARB_V2_SCREEN_SELL_STALE_RECOVERY_SCHEDULED_TOTAL: Lazy<AtomicU64> =
 /// C1h5: rescreen succeeded after prior sell-leg stale on pinned pool (cold-start recovery).
 pub static ARB_V2_SCREEN_SELL_STALE_THEN_FRESH_AFTER_PIN_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// C1h5 v2: sell-leg recovery outcome (`scheduled`, `fresh_after_pin`, `rescreen_still_stale`, …).
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SCHEDULED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_PIN: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_RESCREEN_STILL_STALE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_RATE_LIMIT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_NO_STALE_SELL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_REPUBLISH_BOTH_LEGS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_MISS_TOTAL: Lazy<AtomicU64> =
@@ -5858,6 +5871,20 @@ pub fn inc_arb_v2_screen_sell_stale_recovery_scheduled_total() {
 /// Increment `arb_v2_screen_sell_stale_then_fresh_after_pin_total`.
 pub fn inc_arb_v2_screen_sell_stale_then_fresh_after_pin_total() {
     ARB_V2_SCREEN_SELL_STALE_THEN_FRESH_AFTER_PIN_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// C1h5 v2: recovery pipeline outcome counter.
+pub fn inc_arb_v2_sell_stale_recovery_outcome_total(outcome: &str) {
+    let counter = match outcome {
+        "scheduled" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SCHEDULED,
+        "fresh_after_pin" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_PIN,
+        "rescreen_still_stale" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_RESCREEN_STILL_STALE,
+        "skipped_rate_limit" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_RATE_LIMIT,
+        "skipped_no_stale_sell" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_NO_STALE_SELL,
+        "republish_both_legs" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_REPUBLISH_BOTH_LEGS,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Increment `arb_v2_screen_meteora_sell_bin_hit_total`.
@@ -10854,6 +10881,30 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_v2_screen_sell_stale_then_fresh_after_pin_total",
         ARB_V2_SCREEN_SELL_STALE_THEN_FRESH_AFTER_PIN_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"scheduled\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SCHEDULED.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"fresh_after_pin\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_PIN.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"rescreen_still_stale\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_RESCREEN_STILL_STALE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"skipped_rate_limit\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_RATE_LIMIT.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"skipped_no_stale_sell\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_NO_STALE_SELL.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"republish_both_legs\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_REPUBLISH_BOTH_LEGS.load(Ordering::Relaxed)
     );
     line!(
         "arb_v2_screen_meteora_sell_bin_hit_total",
