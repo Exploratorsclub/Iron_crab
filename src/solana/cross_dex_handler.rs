@@ -1380,12 +1380,6 @@ impl CrossDexHandler {
                 &format!("token_program:{}", token_mint),
                 &token_program_sdk.to_string(),
             );
-            if buy_dex == "meteora_dlmm" {
-                buy_connector.cache_extra_data(
-                    crate::solana::dex::meteora_swap_builder::METEORA_BIN_ARRAY_COVERAGE_KEY,
-                    crate::solana::dex::meteora_swap_builder::METEORA_BIN_ARRAY_COVERAGE_ACTIVE_ONLY,
-                );
-            }
 
             buy_connector
                 .build_swap_ix_async(SOL_MINT, token_mint, buy_amount_in, buy_min_out)
@@ -1427,12 +1421,6 @@ impl CrossDexHandler {
                 &format!("token_program:{}", token_mint),
                 &token_program_sdk.to_string(),
             );
-            if sell_dex == "meteora_dlmm" {
-                sell_connector.cache_extra_data(
-                    crate::solana::dex::meteora_swap_builder::METEORA_BIN_ARRAY_COVERAGE_KEY,
-                    crate::solana::dex::meteora_swap_builder::METEORA_BIN_ARRAY_COVERAGE_ACTIVE_ONLY,
-                );
-            }
 
             if let Some(ref accts) = sell_accounts {
                 sell_connector

@@ -1110,6 +1110,108 @@ mod tests {
         );
     }
 
+    /// Cross-DEX arb must use AdjacentThree (active±1 bin arrays), not ActiveOnly.
+    /// Prod SimFail 3005 (AccountNotEnoughKeys) was caused by cross_dex_handler forcing ActiveOnly.
+    #[tokio::test]
+    async fn cross_dex_meteora_default_uses_adjacent_three_bin_arrays() {
+        use super::POOL_ADDRESS_HINT_KEY;
+        use crate::solana::dex::meteora_swap_builder::{
+            BinArrayCoverage, MeteoraDlmmSwapBuilder, METEORA_BIN_ARRAY_COVERAGE_ACTIVE_ONLY,
+            METEORA_BIN_ARRAY_COVERAGE_KEY,
+        };
+        use crate::solana::dex::Dex;
+
+        const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+        const METEORA_FIXED_ACCOUNTS: usize = 15;
+
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let mut meteora = MeteoraDlmm::new_with_live_cache(rpc, None, false);
+        meteora.set_user_authority(Pubkey::new_unique());
+
+        let pool_pk = Pubkey::from_str("2TD1fMPg2w7Hjt8bASSdxi92YFNQFgvdznqVApe3NGpn").unwrap();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let reserve_x = Pubkey::new_unique();
+        let reserve_y = Pubkey::new_unique();
+        let active_id: i32 = -281;
+
+        meteora
+            .set_pool_from_accounts(
+                &pool_pk.to_string(),
+                &[
+                    pool_pk.to_string(),
+                    sol_mint.to_string(),
+                    token_mint.to_string(),
+                    reserve_x.to_string(),
+                    reserve_y.to_string(),
+                    format!("active_id:{active_id}"),
+                    "bin_step:10".to_string(),
+                ],
+            )
+            .expect("set_pool_from_accounts");
+
+        meteora.cache_extra_data(POOL_ADDRESS_HINT_KEY, &pool_pk.to_string());
+        meteora.cache_extra_data(
+            &format!("token_program:{}", sol_mint),
+            &spl_token::id().to_string(),
+        );
+        meteora.cache_extra_data(
+            &format!("token_program:{}", token_mint),
+            &spl_token::id().to_string(),
+        );
+
+        let ixs = meteora
+            .build_swap_ix_async(SOL_MINT, &token_mint.to_string(), 1_000_000, 1)
+            .await
+            .expect("build_swap_ix_async without ActiveOnly override");
+        let swap_ix = &ixs[0];
+        let bin_array_count = swap_ix
+            .accounts
+            .len()
+            .saturating_sub(METEORA_FIXED_ACCOUNTS);
+        assert!(
+            bin_array_count >= 3,
+            "cross-DEX default must include ≥3 bin arrays (AdjacentThree), got {bin_array_count}"
+        );
+
+        let expected_bins = MeteoraDlmmSwapBuilder::derive_bin_arrays_for_active_id_with_coverage(
+            &pool_pk,
+            active_id,
+            BinArrayCoverage::AdjacentThree,
+        )
+        .expect("derive adjacent three");
+        assert_eq!(expected_bins.len(), 3);
+        for (i, expected) in expected_bins.iter().enumerate() {
+            let actual = swap_ix
+                .accounts
+                .get(METEORA_FIXED_ACCOUNTS + i)
+                .map(|m| m.pubkey)
+                .unwrap_or_default();
+            assert_eq!(
+                actual, *expected,
+                "bin_array[{i}] mismatch for active_id={active_id}"
+            );
+        }
+
+        // ActiveOnly is still available via explicit extra_data (not used by cross_dex_handler).
+        meteora.cache_extra_data(
+            METEORA_BIN_ARRAY_COVERAGE_KEY,
+            METEORA_BIN_ARRAY_COVERAGE_ACTIVE_ONLY,
+        );
+        let active_only_ixs = meteora
+            .build_swap_ix_async(SOL_MINT, &token_mint.to_string(), 1_000_000, 1)
+            .await
+            .expect("build_swap_ix_async with ActiveOnly");
+        let active_only_count = active_only_ixs[0]
+            .accounts
+            .len()
+            .saturating_sub(METEORA_FIXED_ACCOUNTS);
+        assert_eq!(
+            active_only_count, 1,
+            "ActiveOnly should produce exactly 1 bin array"
+        );
+    }
+
     #[test]
     fn test_constant_product_quote() {
         let meteora = MeteoraDlmm::new(Arc::new(SolanaRpc::new("https://dummy")));
