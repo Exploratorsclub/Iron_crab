@@ -15,7 +15,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ironcrab::solana::address_lookup_table::{
-    create_alt_instructions, extend_alt_instruction, get_common_accounts, load_alt,
+    common_accounts_missing_from_alt, create_alt_instructions, extend_alt_instruction,
+    get_common_accounts, load_alt, REMOVED_WRONG_PUMPSWAP_GLOBAL_CONFIG,
 };
 use ironcrab::wallet::Treasury;
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -52,6 +53,11 @@ struct Args {
     /// Dry run - don't actually send transactions
     #[arg(long)]
     dry_run: bool,
+
+    /// Compare on-chain ALT against `COMMON_ACCOUNTS` and print missing globals (no TX).
+    /// Requires `--alt-address`.
+    #[arg(long)]
+    audit_only: bool,
 }
 
 #[tokio::main]
@@ -76,6 +82,34 @@ async fn main() -> Result<()> {
     info!(authority = %authority, "Loaded keypair");
 
     let rpc = RpcClient::new_with_commitment(args.rpc_url.clone(), CommitmentConfig::confirmed());
+
+    if args.audit_only {
+        let alt_str = args
+            .alt_address
+            .as_deref()
+            .context("--audit-only requires --alt-address")?;
+        let alt_pubkey = Pubkey::from_str(alt_str).context("invalid ALT address")?;
+        let existing = load_alt(&rpc, &alt_pubkey).await?;
+        let missing = common_accounts_missing_from_alt(&existing);
+        println!("\n========================================");
+        println!("ALT AUDIT (COMMON_ACCOUNTS vs on-chain)");
+        println!("========================================");
+        println!("ALT Address: {}", alt_pubkey);
+        println!("On-chain entries: {}", existing.accounts.len());
+        println!("COMMON_ACCOUNTS entries: {}", get_common_accounts().len());
+        println!("Missing from on-chain ALT (must extend): {}", missing.len());
+        for pk in &missing {
+            println!("  {pk}");
+        }
+        if existing.contains(&Pubkey::from_str(REMOVED_WRONG_PUMPSWAP_GLOBAL_CONFIG)?) {
+            warn!(
+                removed = REMOVED_WRONG_PUMPSWAP_GLOBAL_CONFIG,
+                "On-chain ALT still contains removed wrong PumpSwap global_config entry"
+            );
+        }
+        println!("========================================\n");
+        return Ok(());
+    }
 
     // Check balance
     let balance = rpc.get_balance(&authority).await?;

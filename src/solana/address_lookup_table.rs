@@ -24,6 +24,16 @@ use solana_sdk::{
 use std::str::FromStr;
 use tracing::info;
 
+/// Well-known PumpSwap AMM global accounts (same for all pools).
+pub const PUMPSWAP_AMM_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
+/// PumpSwap `__event_authority` PDA under `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`.
+pub const PUMPSWAP_AMM_EVENT_AUTHORITY: &str = "GS4CU59F31iL7aR2Q8zVS8DRrcRnXX1yjQ66TqNVQnaR";
+/// Pump.fun bonding-curve event authority (not the PumpSwap AMM PDA).
+pub const PUMPFUN_BONDING_EVENT_AUTHORITY: &str = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1";
+/// Former COMMON_ACCOUNTS entry — not PumpSwap global_config; kept for audit diffs only.
+pub const REMOVED_WRONG_PUMPSWAP_GLOBAL_CONFIG: &str =
+    "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg";
+
 /// Well-known program IDs and accounts that should be in every ALT.
 /// These are used in almost every transaction.
 pub const COMMON_ACCOUNTS: &[&str] = &[
@@ -43,13 +53,15 @@ pub const COMMON_ACCOUNTS: &[&str] = &[
     // ===== PumpSwap AMM =====
     "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", // PumpSwap AMM Program
     "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ", // PumpSwap Fee Program
+    PUMPSWAP_AMM_GLOBAL_CONFIG,                    // PumpSwap global_config (swap ix account #2)
     "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx", // PumpSwap Fee Config (global constant)
+    PUMPSWAP_AMM_EVENT_AUTHORITY,                  // PumpSwap __event_authority PDA (swap ix #15)
     "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw", // PumpSwap global_volume_accumulator PDA
-    "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg", // PumpSwap Global Config
     // ===== Pump.fun Bonding Curve =====
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", // Pump.fun Bonding Program
     "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf", // Pump.fun Global Account
     "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM", // Pump.fun Fee Account
+    PUMPFUN_BONDING_EVENT_AUTHORITY,               // Pump.fun bonding-curve event_authority
     // ===== Orca Whirlpool =====
     "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", // Orca Whirlpool Program
     // ===== Raydium =====
@@ -241,6 +253,14 @@ pub struct AltCompileAnalysis {
     pub alt_hit_count: usize,
     /// Static keys not present in the loaded ALT (top-N for ops `setup_alt --extra-addresses`).
     pub static_not_in_alt: Vec<Pubkey>,
+    /// Static keys that are present in the loaded ALT but were not compiled as lookups.
+    ///
+    /// Expected cases: fee payer (signer), Jito tip when `exclude_tip_from_alt` is set, and any
+    /// account the v0 compiler must keep static (signers). A high count with low `alt_hit_count`
+    /// usually means the on-chain ALT is missing pool-specific keys, not a compile bug.
+    pub alt_in_table_but_static: Vec<Pubkey>,
+    /// Total static keys that exist in the loaded ALT table.
+    pub alt_in_table_but_static_count: usize,
 }
 
 /// Analyze ALT usage for a compiled v0 message.
@@ -266,10 +286,24 @@ pub fn analyze_v0_alt_usage(message: &v0::Message, alt: Option<&LoadedAlt>) -> A
         None => message.account_keys.clone(),
     };
 
+    let alt_in_table_but_static_all: Vec<Pubkey> = match alt {
+        Some(loaded) => message
+            .account_keys
+            .iter()
+            .filter(|pk| loaded.contains(pk))
+            .copied()
+            .collect(),
+        None => Vec::new(),
+    };
+    let alt_in_table_but_static_count = alt_in_table_but_static_all.len();
+    let alt_in_table_but_static = alt_in_table_but_static_all.into_iter().take(10).collect();
+
     AltCompileAnalysis {
         static_key_count,
         alt_hit_count,
         static_not_in_alt,
+        alt_in_table_but_static,
+        alt_in_table_but_static_count,
     }
 }
 
@@ -284,6 +318,8 @@ pub fn analyze_versioned_message_alt_usage(
             static_key_count: legacy.account_keys.len(),
             alt_hit_count: 0,
             static_not_in_alt: legacy.account_keys.clone(),
+            alt_in_table_but_static: Vec::new(),
+            alt_in_table_but_static_count: 0,
         },
     }
 }
@@ -296,9 +332,76 @@ pub fn get_common_accounts() -> Vec<Pubkey> {
         .collect()
 }
 
+/// Pubkeys in [`COMMON_ACCOUNTS`] that are missing from a loaded on-chain ALT.
+pub fn common_accounts_missing_from_alt(alt: &LoadedAlt) -> Vec<Pubkey> {
+    get_common_accounts()
+        .into_iter()
+        .filter(|pk| !alt.contains(pk))
+        .collect()
+}
+
+/// Collect unique pubkeys referenced by instructions (program IDs + account metas).
+pub fn collect_instruction_pubkeys(instructions: &[Instruction]) -> Vec<Pubkey> {
+    let mut keys = Vec::new();
+    for ix in instructions {
+        keys.push(ix.program_id);
+        for meta in &ix.accounts {
+            keys.push(meta.pubkey);
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Global instruction pubkeys (from `COMMON_ACCOUNTS`) vs per-pool keys for bundle audits.
+pub fn partition_globals_vs_pool_specific(
+    instruction_keys: &[Pubkey],
+    alt: &LoadedAlt,
+) -> (Vec<Pubkey>, Vec<Pubkey>) {
+    let common = get_common_accounts();
+    let mut globals_missing = Vec::new();
+    let mut pool_specific = Vec::new();
+    for pk in instruction_keys {
+        if common.contains(pk) {
+            if !alt.contains(pk) {
+                globals_missing.push(*pk);
+            }
+        } else {
+            pool_specific.push(*pk);
+        }
+    }
+    globals_missing.sort();
+    globals_missing.dedup();
+    pool_specific.sort();
+    pool_specific.dedup();
+    (globals_missing, pool_specific)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pumpswap_global_constants_match_pdas() {
+        let program = Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
+        let (event_authority, _) = Pubkey::find_program_address(&[b"__event_authority"], &program);
+        let (gva, _) = Pubkey::find_program_address(&[b"global_volume_accumulator"], &program);
+        assert_eq!(
+            event_authority,
+            Pubkey::from_str(PUMPSWAP_AMM_EVENT_AUTHORITY).unwrap()
+        );
+        assert_eq!(
+            gva,
+            Pubkey::from_str("C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw").unwrap()
+        );
+        assert!(get_common_accounts().contains(&event_authority));
+        assert!(
+            get_common_accounts().contains(&Pubkey::from_str(PUMPSWAP_AMM_GLOBAL_CONFIG).unwrap())
+        );
+        assert!(!get_common_accounts()
+            .contains(&Pubkey::from_str(REMOVED_WRONG_PUMPSWAP_GLOBAL_CONFIG).unwrap()));
+    }
 
     #[test]
     fn test_common_accounts_parse() {
@@ -421,5 +524,47 @@ mod tests {
         assert!(analysis.static_key_count >= 2);
         assert!(analysis.alt_hit_count >= 1);
         assert!(analysis.static_not_in_alt.contains(&static_only));
+    }
+
+    #[test]
+    fn analyze_v0_alt_usage_tracks_in_table_but_static() {
+        use solana_sdk::instruction::{AccountMeta, Instruction};
+        use solana_system_program;
+
+        let payer = Pubkey::new_unique();
+        let in_alt = Pubkey::new_unique();
+        let blockhash = solana_sdk::hash::Hash::new_unique();
+        let loaded = LoadedAlt {
+            address: Pubkey::new_unique(),
+            accounts: vec![payer, in_alt],
+        };
+        let mut data = vec![2, 0, 0, 0];
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let ix = Instruction {
+            program_id: solana_system_program::id(),
+            accounts: vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(in_alt, false),
+            ],
+            data,
+        };
+        let message = compile_v0_versioned_message(
+            &payer,
+            std::slice::from_ref(&ix),
+            Some(&loaded),
+            None,
+            blockhash,
+        )
+        .expect("compile");
+        let v0_msg = match message {
+            VersionedMessage::V0(m) => m,
+            _ => panic!("expected v0"),
+        };
+        let analysis = analyze_v0_alt_usage(&v0_msg, Some(&loaded));
+        assert!(
+            analysis.alt_in_table_but_static_count >= 1,
+            "signer payer stays static even when present in ALT"
+        );
+        assert!(analysis.alt_in_table_but_static.contains(&payer));
     }
 }
