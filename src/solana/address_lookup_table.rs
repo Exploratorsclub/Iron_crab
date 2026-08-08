@@ -43,7 +43,8 @@ pub const COMMON_ACCOUNTS: &[&str] = &[
     // ===== PumpSwap AMM =====
     "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", // PumpSwap AMM Program
     "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ", // PumpSwap Fee Program
-    "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw", // PumpSwap Fee Config (common)
+    "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx", // PumpSwap Fee Config (global constant)
+    "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw", // PumpSwap global_volume_accumulator PDA
     "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg", // PumpSwap Global Config
     // ===== Pump.fun Bonding Curve =====
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", // Pump.fun Bonding Program

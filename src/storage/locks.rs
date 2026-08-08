@@ -608,6 +608,14 @@ impl LockManager {
         self.available_tokens.read().get(mint).copied().unwrap_or(0)
     }
 
+    /// True when execution-engine has applied at least one `WalletBalanceSnapshot` for this mint.
+    ///
+    /// Balance may be zero — a snapshot still proves the wallet ATA was observed on-chain (Geyser).
+    /// Used to omit idempotent ATA-create instructions in size-constrained cross-DEX arb bundles.
+    pub fn token_wallet_snapshot_seen(&self, mint: &str) -> bool {
+        self.available_tokens.read().contains_key(mint)
+    }
+
     /// Count the number of token mints with non-zero available balance.
     /// Used as Single Source of Truth for open positions count,
     /// replacing the error-prone dual-path AtomicUsize counter.

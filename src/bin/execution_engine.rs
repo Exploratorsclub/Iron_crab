@@ -11345,7 +11345,16 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                 });
 
                 // Build the two-leg swap instruction plan.
-                let plan = match handler.build_swap_plan(&intent, &validation).await {
+                let skip_token_ata = ctx
+                    .lock_manager
+                    .token_wallet_snapshot_seen(&intent.resources.output_mint);
+                let plan_opts = ironcrab::solana::cross_dex_handler::CrossDexPlanOptions {
+                    skip_token_ata_create: skip_token_ata,
+                };
+                let plan = match handler
+                    .build_swap_plan(&intent, &validation, plan_opts)
+                    .await
+                {
                     Ok(p) => p,
                     Err(e) => {
                         let reason = RejectReason::UnsupportedIntent;

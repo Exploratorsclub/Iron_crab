@@ -4969,6 +4969,14 @@ pub fn record_arb_bundle_tx_too_large() {
     ARB_BUNDLE_TX_TOO_LARGE.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Cross-DEX arb bundle omitted token ATA CreateIdempotent (wallet snapshot proved ATA exists).
+pub static ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub fn record_arb_bundle_ata_create_skipped_known_ata() {
+    ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA.fetch_add(1, Ordering::Relaxed);
+}
+
 /// 2-hop cross-DEX opportunities that passed all filters in arb-strategy
 pub static ARB_TWO_HOP_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -10810,6 +10818,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_bundle_tx_too_large_total",
         ARB_BUNDLE_TX_TOO_LARGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_bundle_ata_create_skipped_total{{reason=\"known_ata\"}}",
+        ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA.load(Ordering::Relaxed)
     );
     line!(
         "arb_two_hop_opportunities_total",
