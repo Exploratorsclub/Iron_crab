@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tracing::{debug, error, info, warn};
@@ -219,6 +220,11 @@ use ironcrab::storage::{JsonlWriterConfig, QueuedJsonlWriter};
 /// PR165: when false, `md-watchdog` stops `sd_notify(WATCHDOG)` so systemd can restart on Tokio stall.
 #[cfg(unix)]
 static MD_SYSTEMD_WATCHDOG_NOTIFY: AtomicBool = AtomicBool::new(true);
+
+/// PR167 post-incident 2026-08-08: snapshot pubkey count for scaled ingest-liveness startup grace.
+static MARKET_DATA_SNAPSHOT_RESTORE_PUBKEYS: AtomicU64 = AtomicU64::new(0);
+/// Shared Geyser connect barrier — ingest liveness skips stall detection while restore is pending.
+static MARKET_DATA_GEYSER_CONNECT_BARRIER: OnceLock<Arc<GeyserConnectBarrier>> = OnceLock::new();
 
 /// Default capacity for off-hot-path market-events JSONL queue.
 const MARKET_DATA_JSONL_QUEUE_CAP: usize = 16_384;
@@ -3936,6 +3942,7 @@ impl MarketDataContext {
         };
         let start = Instant::now();
         let pubkey_count = snapshot.explicit_pubkey_count() as u64;
+        MARKET_DATA_SNAPSHOT_RESTORE_PUBKEYS.store(pubkey_count, Ordering::Release);
         info!(
             path = %path.display(),
             pubkeys = pubkey_count,
@@ -8476,6 +8483,7 @@ async fn main() -> Result<()> {
         geyser_explicit_config_error: parking_lot::RwLock::new(None),
         geyser_prune_resume: parking_lot::Mutex::new(GeyserPruneResume::default()),
     });
+    let _ = MARKET_DATA_GEYSER_CONNECT_BARRIER.set(Arc::clone(&ctx.geyser_connect_barrier));
 
     // === Main Loop: Geyser subscription or simulation ===
 
@@ -8653,6 +8661,30 @@ fn spawn_market_data_metrics_runtime(addr: std::net::SocketAddr) {
         .expect("spawn md-metrics thread");
 }
 
+/// PR167: startup grace for ingest liveness — same budget as I-MD-6 restore barrier.
+fn market_data_ingest_liveness_startup_grace_duration(snapshot_pubkey_count: u64) -> Duration {
+    MarketDataContext::geyser_restore_barrier_timeout(snapshot_pubkey_count)
+}
+
+/// PR167 post-incident 2026-08-08: skip stall detection during snapshot restore or scaled warmup.
+fn market_data_ingest_liveness_in_startup_grace(
+    process_started: Instant,
+    snapshot_pubkey_count: u64,
+    barrier: Option<&GeyserConnectBarrier>,
+) -> bool {
+    if barrier.is_some_and(GeyserConnectBarrier::is_pending) {
+        return true;
+    }
+    process_started.elapsed()
+        < market_data_ingest_liveness_startup_grace_duration(snapshot_pubkey_count)
+}
+
+fn market_data_ingest_liveness_in_startup_grace_live(process_started: Instant) -> bool {
+    let snapshot_pubkey_count = MARKET_DATA_SNAPSHOT_RESTORE_PUBKEYS.load(Ordering::Acquire);
+    let barrier = MARKET_DATA_GEYSER_CONNECT_BARRIER.get().map(Arc::as_ref);
+    market_data_ingest_liveness_in_startup_grace(process_started, snapshot_pubkey_count, barrier)
+}
+
 /// PR167: detect global ingest stall (TX + account + head slot all frozen).
 /// PR233: OS thread — survives Tokio runtime freeze (same pattern as md-watchdog).
 fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
@@ -8664,7 +8696,6 @@ fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
             const CHECK_INTERVAL: Duration = Duration::from_secs(10);
             const STALL_WINDOW: Duration = Duration::from_secs(50);
             const RECOVERY_WAIT: Duration = Duration::from_secs(60);
-            const STARTUP_GRACE: Duration = Duration::from_secs(120);
             let mut last_tx = market_data_tx_handler_processed_value();
             let mut last_account = geyser_account_listener_account_updates_value();
             let mut last_head = market_data_geyser_head_slot_value();
@@ -8674,7 +8705,7 @@ fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
             let mut recovery_requested_at: Option<Instant> = None;
             loop {
                 std::thread::sleep(CHECK_INTERVAL);
-                if process_started.elapsed() < STARTUP_GRACE {
+                if market_data_ingest_liveness_in_startup_grace_live(process_started) {
                     last_tx = market_data_tx_handler_processed_value();
                     last_account = geyser_account_listener_account_updates_value();
                     last_head = market_data_geyser_head_slot_value();
@@ -8775,7 +8806,6 @@ fn spawn_market_data_md_state_liveness_task(process_started: Instant) {
     std::thread::Builder::new()
         .name("md-state-liveness".into())
         .spawn(move || {
-            const STARTUP_GRACE: Duration = Duration::from_secs(120);
             let queue_saturation = ((MARKET_DATA_GEYSER_TRACKING_QUEUE_CAP as f64)
                 * MARKET_DATA_MD_STATE_STALL_QUEUE_FRAC)
                 as usize;
@@ -8785,7 +8815,7 @@ fn spawn_market_data_md_state_liveness_task(process_started: Instant) {
             let mut stalled_since: Option<Instant> = None;
             loop {
                 std::thread::sleep(MARKET_DATA_MD_STATE_STALL_CHECK_INTERVAL);
-                if process_started.elapsed() < STARTUP_GRACE {
+                if market_data_ingest_liveness_in_startup_grace_live(process_started) {
                     last_bursts = market_data_md_state_bursts_completed_value();
                     last_jobs = market_data_geyser_tracking_jobs_processed_value();
                     last_drops = market_data_geyser_tracking_enqueue_dropped_value();
@@ -19832,6 +19862,42 @@ mod pr_b_geyser_tracking_tests {
             "96k snapshot restore must have >=5min wait_ready budget, got {timeout_96k:?}"
         );
         assert_eq!(timeout_96k, Duration::from_secs(360));
+    }
+
+    #[test]
+    fn market_data_ingest_liveness_startup_grace_scales_with_snapshot_size() {
+        assert_eq!(
+            market_data_ingest_liveness_startup_grace_duration(0),
+            Duration::from_secs(120)
+        );
+        let grace_82k = market_data_ingest_liveness_startup_grace_duration(82_652);
+        assert!(
+            grace_82k >= Duration::from_secs(300),
+            "82k snapshot ingest grace must be >=5min, got {grace_82k:?}"
+        );
+        let grace_96k = market_data_ingest_liveness_startup_grace_duration(96_000);
+        assert!(
+            grace_96k >= Duration::from_secs(300),
+            "96k snapshot ingest grace must be >=5min, got {grace_96k:?}"
+        );
+        assert_eq!(grace_96k, Duration::from_secs(360));
+    }
+
+    #[test]
+    fn market_data_ingest_liveness_grace_while_barrier_pending() {
+        let barrier = GeyserConnectBarrier::new();
+        let process_started = Instant::now() - Duration::from_secs(600);
+        assert!(market_data_ingest_liveness_in_startup_grace(
+            process_started,
+            0,
+            Some(&barrier),
+        ));
+        barrier.mark_ready();
+        assert!(!market_data_ingest_liveness_in_startup_grace(
+            process_started,
+            0,
+            Some(&barrier),
+        ));
     }
 
     #[test]
