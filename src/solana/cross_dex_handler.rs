@@ -1347,15 +1347,21 @@ impl CrossDexHandler {
                 .get(&buy_dex)
                 .ok_or_else(|| anyhow!("Unknown buy DEX: {}", buy_dex))?;
 
+            if buy_dex != "pump_amm" && !buy_pool.is_empty() {
+                buy_connector.cache_extra_data("pool_address_hint", &buy_pool);
+            }
+
             if let Some(ref accts) = buy_accounts {
-                if let Err(e) = buy_connector.set_pool_from_accounts(&buy_pool, accts) {
-                    warn!(
-                        pool = %buy_pool,
-                        dex = %buy_dex,
-                        error = %e,
-                        "Failed to set buy pool from intent accounts"
-                    );
-                }
+                buy_connector
+                    .set_pool_from_accounts(&buy_pool, accts)
+                    .map_err(|e| {
+                        anyhow!(
+                            "Failed to set buy pool from intent accounts (pool={}, dex={}): {}",
+                            buy_pool,
+                            buy_dex,
+                            e
+                        )
+                    })?;
             } else if !buy_pool.is_empty() {
                 let pool_pk = Pubkey::from_str(&buy_pool)
                     .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
@@ -1413,6 +1419,10 @@ impl CrossDexHandler {
                 .get(&sell_dex)
                 .ok_or_else(|| anyhow!("Unknown sell DEX: {}", sell_dex))?;
 
+            if sell_dex != "pump_amm" && !sell_pool.is_empty() {
+                sell_connector.cache_extra_data("pool_address_hint", &sell_pool);
+            }
+
             sell_connector.cache_extra_data(
                 &format!("token_program:{}", token_mint),
                 &token_program_sdk.to_string(),
@@ -1425,14 +1435,16 @@ impl CrossDexHandler {
             }
 
             if let Some(ref accts) = sell_accounts {
-                if let Err(e) = sell_connector.set_pool_from_accounts(&sell_pool, accts) {
-                    warn!(
-                        pool = %sell_pool,
-                        dex = %sell_dex,
-                        error = %e,
-                        "Failed to set sell pool from intent accounts"
-                    );
-                }
+                sell_connector
+                    .set_pool_from_accounts(&sell_pool, accts)
+                    .map_err(|e| {
+                        anyhow!(
+                            "Failed to set sell pool from intent accounts (pool={}, dex={}): {}",
+                            sell_pool,
+                            sell_dex,
+                            e
+                        )
+                    })?;
             } else if !sell_pool.is_empty() {
                 let pool_pk = Pubkey::from_str(&sell_pool)
                     .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;

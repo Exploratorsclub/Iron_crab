@@ -17,6 +17,8 @@ pub const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3u
                                                                                         // Whirlpool account size is 653 bytes
 pub const WHIRLPOOL_ACCOUNT_MIN_SIZE: usize = 650; // lower bound
 pub const WHIRLPOOL_ACCOUNT_MAX_SIZE: usize = 653; // exact size
+/// Key used by cross_dex_handler via [`Dex::cache_extra_data`] to pin the active whirlpool.
+pub const POOL_ADDRESS_HINT_KEY: &str = "pool_address_hint";
 
 use super::orca_whirlpool_layout as layout;
 use dashmap::DashMap;
@@ -72,6 +74,8 @@ pub struct Orca {
     cache_misses: Arc<AtomicU64>,
     /// When true (Hot Path): skip get_multiple_accounts tick validation to avoid RPC
     skip_tick_array_rpc_validation: Arc<AtomicBool>,
+    /// Geyser-sourced extras from cross_dex_handler (e.g. pool_address_hint, token programs).
+    cached_data: Arc<DashMap<String, String>>,
 }
 
 impl Orca {
@@ -114,6 +118,7 @@ impl Orca {
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
             skip_tick_array_rpc_validation: Arc::new(AtomicBool::new(false)),
+            cached_data: Arc::new(DashMap::new()),
         }
     }
 
@@ -304,6 +309,43 @@ impl Orca {
             "No Orca pool found for pair"
         );
         None
+    }
+
+    /// Resolve the whirlpool for a swap, preferring an explicit pool hint from cross_dex_handler.
+    fn resolve_pool_for_swap(
+        &self,
+        input: &Pubkey,
+        output: &Pubkey,
+    ) -> Option<(Pubkey, bool, OrcaPool)> {
+        if let Some(hint_entry) = self.cached_data.get(POOL_ADDRESS_HINT_KEY) {
+            if let Ok(pool_pk) = Pubkey::from_str(hint_entry.value()) {
+                if let Some(pool_entry) = self.pools.get(&pool_pk) {
+                    let pool = pool_entry.clone();
+                    let forward = pool.base_mint == *input && pool.quote_mint == *output;
+                    let reverse = pool.base_mint == *output && pool.quote_mint == *input;
+                    if forward || reverse {
+                        tracing::debug!(
+                            pool = %pool_pk,
+                            direction = if forward { "forward" } else { "reverse" },
+                            "Orca pool resolved via pool_address_hint"
+                        );
+                        return Some((pool_pk, forward, pool));
+                    }
+                    tracing::warn!(
+                        pool = %pool_pk,
+                        input = %input,
+                        output = %output,
+                        "pool_address_hint pool mints do not match swap pair; falling back to find_pool"
+                    );
+                } else {
+                    tracing::warn!(
+                        pool = %pool_pk,
+                        "pool_address_hint set but pool not in connector cache; falling back to find_pool"
+                    );
+                }
+            }
+        }
+        self.find_pool(input, output)
     }
 
     /// Cold-path only: verifies the three Whirlpool tick-array PDAs used by
@@ -1028,7 +1070,7 @@ impl Dex for Orca {
         let in_pk = Pubkey::from_str(_input_mint).map_err(|_| anyhow!("bad input mint"))?;
         let out_pk = Pubkey::from_str(_output_mint).map_err(|_| anyhow!("bad output mint"))?;
         let (pool_id, forward, pool) = self
-            .find_pool(&in_pk, &out_pk)
+            .resolve_pool_for_swap(&in_pk, &out_pk)
             .ok_or_else(|| anyhow!("no orca pool for pair"))?;
 
         // Get user authority first (needed for ATAs)
@@ -1288,7 +1330,7 @@ impl Dex for Orca {
         let in_pk = Pubkey::from_str(input_mint).map_err(|_| anyhow!("bad input mint"))?;
         let out_pk = Pubkey::from_str(output_mint).map_err(|_| anyhow!("bad output mint"))?;
         let (pool_id, forward, pool) = self
-            .find_pool(&in_pk, &out_pk)
+            .resolve_pool_for_swap(&in_pk, &out_pk)
             .ok_or_else(|| anyhow!("no orca pool for pair"))?;
 
         let authority = self
@@ -1511,6 +1553,15 @@ impl Dex for Orca {
             accounts,
             data,
         }])
+    }
+
+    fn cache_extra_data(&self, key: &str, value: &str) {
+        tracing::debug!(
+            key = %key,
+            value = %value,
+            "orca: caching extra data"
+        );
+        self.cached_data.insert(key.to_string(), value.to_string());
     }
 
     fn list_pairs(&self) -> Vec<(String, String)> {
@@ -1870,5 +1921,53 @@ mod tests {
         assert_eq!(super::get_tick_array_start_index(338433, 128), 337920);
         assert_eq!(super::get_tick_array_start_index(-337409, 128), -337920);
         assert_ne!(super::get_tick_array_start_index(2354285, 8), 2353573);
+    }
+
+    /// Cross-DEX arb: explicit pool_address_hint + injected pool must build swap IX without mint-pair scan failure.
+    #[tokio::test]
+    async fn test_build_swap_ix_async_uses_pool_address_hint() {
+        use super::POOL_ADDRESS_HINT_KEY;
+        use crate::solana::dex::Dex;
+
+        const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let orca = Orca::new(rpc);
+        orca.set_skip_tick_array_rpc_validation(true);
+        orca.set_user_authority(Pubkey::new_unique());
+
+        let pool_pk = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let vault_a = Pubkey::new_unique();
+        let vault_b = Pubkey::new_unique();
+
+        orca.set_pool_from_accounts(
+            &pool_pk.to_string(),
+            &[
+                pool_pk.to_string(),
+                sol_mint.to_string(),
+                token_mint.to_string(),
+                vault_a.to_string(),
+                vault_b.to_string(),
+                "tick_current_index:0".to_string(),
+                "tick_spacing:64".to_string(),
+            ],
+        )
+        .expect("set_pool_from_accounts");
+
+        orca.cache_extra_data(POOL_ADDRESS_HINT_KEY, &pool_pk.to_string());
+
+        let ixs = orca
+            .build_swap_ix_async(SOL_MINT, &token_mint.to_string(), 1_000_000, 1)
+            .await
+            .expect("build_swap_ix_async with pool_address_hint");
+
+        assert_eq!(ixs.len(), 1);
+        assert_eq!(ixs[0].program_id.to_string(), super::ORCA_WHIRLPOOL_PROGRAM);
+        assert!(
+            ixs[0].accounts.iter().any(|a| a.pubkey == pool_pk),
+            "swap ix must reference hinted whirlpool"
+        );
     }
 }
