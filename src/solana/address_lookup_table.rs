@@ -868,7 +868,8 @@ mod tests {
 
         let without_remap = {
             let alt_account = address_lookup_table_account(&alt, Some(&tip));
-            v0::Message::try_compile(&payer, &[ix.clone()], &[alt_account], blockhash).unwrap()
+            v0::Message::try_compile(&payer, std::slice::from_ref(&ix), &[alt_account], blockhash)
+                .unwrap()
         };
         let mut with_remap = without_remap.clone();
         remap_v0_alt_lookup_indices_to_on_chain(&mut with_remap, &alt, &tip).unwrap();
