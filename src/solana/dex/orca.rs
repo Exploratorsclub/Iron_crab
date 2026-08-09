@@ -1113,93 +1113,19 @@ impl Dex for Orca {
         let token_owner_account_a = derive_ata(&pool.base_mint); // Always token A
         let token_owner_account_b = derive_ata(&pool.quote_mint); // Always token B
 
-        // Tick arrays for the swap range
-        // Orca requires tick arrays covering the price range the swap might traverse
-        // The tick arrays MUST be in the correct sequence relative to current tick
         let spacing = pool.tick_spacing.unwrap_or(64) as i32;
         let tick_now = pool.tick_current_index.unwrap_or(0);
-        let ticks_per_array = spacing * TICK_ARRAY_SIZE;
 
-        // Calculate the start index of the tick array containing current tick
-        let current_array_start = get_tick_array_start_index(tick_now, spacing);
-
-        // Log tick array calculation for debugging
         tracing::debug!(
             pool = %pool_id,
             tick_spacing = spacing,
             tick_current = tick_now,
-            current_array_start = current_array_start,
-            ticks_per_array = ticks_per_array,
             a_to_b = a_to_b,
             "orca: calculating tick arrays for swap"
         );
 
-        // CRITICAL: Tick array sequence depends on swap direction
-        // For a_to_b swaps: price goes DOWN, ticks DECREASE
-        //   - First array must contain current tick
-        //   - Subsequent arrays are at LOWER tick indices
-        // For b_to_a swaps: price goes UP, ticks INCREASE
-        //   - First array must contain current tick
-        //   - Subsequent arrays are at HIGHER tick indices
-        //
-        // IMPORTANT (Error 6023 fix): The cached tick_current_index may be STALE!
-        // If the price moved since the cache was updated, the tick may now be in a
-        // different array. To handle this, we provide arrays on BOTH sides of the
-        // current array, giving us tolerance for small price movements:
-        //
-        //   tick_array_0 = one array BEFORE current (lower ticks)
-        //   tick_array_1 = current array (contains cached tick)
-        //   tick_array_2 = one array AFTER current (higher ticks)
-        //
-        // This way, if the tick moved slightly in either direction, we still have
-        // the correct array in our set. The swap will use whichever arrays it needs.
-        //
-        // Note: For large swaps that traverse multiple arrays in one direction,
-        // this centered approach may not have enough range. But for our typical
-        // arbitrage amounts (0.1 SOL), this is more than sufficient.
-        let s_prev = current_array_start - ticks_per_array; // Previous array (lower ticks)
-        let s_curr = current_array_start; // Current array
-        let s_next = current_array_start + ticks_per_array; // Next array (higher ticks)
-
-        // CRITICAL FIX: Orca Whirlpool requires tick_array_0 to contain the CURRENT tick!
-        // The swap then traverses through tick_array_1 and tick_array_2 in the swap direction.
-        // Previous code incorrectly put the "destination" array first, causing 6023 errors.
-        //
-        // Correct order per Orca SDK:
-        // - tick_array_0: MUST contain current tick (s_curr)
-        // - tick_array_1, tick_array_2: in swap direction
-        //
-        // For a_to_b (price decreases, ticks decrease): curr, prev, prev-1
-        // For b_to_a (price increases, ticks increase): curr, next, next+1
-        let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = if a_to_b {
-            // A->B: price decreases, ticks decrease
-            // tick_array_0 = current (contains current tick)
-            // tick_array_1 = previous (lower ticks - swap direction)
-            // tick_array_2 = previous-1 (even lower ticks - continued swap direction)
-            let s_prev2 = s_prev - ticks_per_array;
-            (
-                derive_tick_array_pda(&pool_id, s_curr), // Current - MUST be first
-                derive_tick_array_pda(&pool_id, s_prev), // Lower ticks (swap direction)
-                derive_tick_array_pda(&pool_id, s_prev2), // Even lower (continued swap)
-                s_curr,
-                s_prev,
-                s_prev2,
-            )
-        } else {
-            // B->A: price increases, ticks increase
-            // tick_array_0 = current (contains current tick)
-            // tick_array_1 = next (higher ticks - swap direction)
-            // tick_array_2 = next+1 (even higher ticks - continued swap direction)
-            let s_next2 = s_next + ticks_per_array;
-            (
-                derive_tick_array_pda(&pool_id, s_curr), // Current - MUST be first
-                derive_tick_array_pda(&pool_id, s_next), // Higher ticks (swap direction)
-                derive_tick_array_pda(&pool_id, s_next2), // Even higher (continued swap)
-                s_curr,
-                s_next,
-                s_next2,
-            )
-        };
+        let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) =
+            whirlpool_swap_tick_array_pdas_for_cached_swap(&pool_id, tick_now, spacing, a_to_b);
 
         tracing::debug!(
             pool = %pool_id,
@@ -1713,53 +1639,30 @@ fn whirlpool_swap_tick_array_pdas_for_cached_swap(
     tick_spacing: i32,
     a_to_b: bool,
 ) -> (Pubkey, Pubkey, Pubkey, i32, i32, i32) {
-    let spacing = tick_spacing;
-    let ticks_per_array = spacing * TICK_ARRAY_SIZE;
-    let current_array_start = get_tick_array_start_index(tick_now, spacing);
-    let position_in_array = (tick_now - current_array_start).abs();
-    let array_boundary_margin = ticks_per_array / 4;
+    let ticks_per_array = tick_spacing * TICK_ARRAY_SIZE;
+    let s0 = get_tick_array_start_index(tick_now, tick_spacing);
 
-    let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) = {
-        let s0 = current_array_start;
-        let s_primary = if a_to_b {
-            s0 - ticks_per_array
-        } else {
-            s0 + ticks_per_array
-        };
-        let s_opposite = if a_to_b {
-            s0 + ticks_per_array
-        } else {
-            s0 - ticks_per_array
-        };
-
-        let near_low_boundary = position_in_array < array_boundary_margin;
-        let near_high_boundary = position_in_array > (ticks_per_array - array_boundary_margin);
-
-        let (s1, s2) = if a_to_b && near_low_boundary {
-            (s_primary, s_primary - ticks_per_array)
-        } else if !a_to_b && near_high_boundary {
-            (s_primary, s_primary + ticks_per_array)
-        } else {
-            (s_primary, s_opposite)
-        };
-
-        (
-            derive_tick_array_pda(pool_id, s0),
-            derive_tick_array_pda(pool_id, s1),
-            derive_tick_array_pda(pool_id, s2),
-            s0,
-            s1,
-            s2,
-        )
+    // Orca Whirlpool swap expects:
+    // - tick_array_0: array containing the current tick
+    // - tick_array_1/2: consecutive arrays in swap direction (never opposite direction)
+    //
+    // a_to_b: price decreases → ticks decrease → curr, prev, prev-1
+    // b_to_a: price increases → ticks increase → curr, next, next+1
+    let (s1, s2) = if a_to_b {
+        let s_prev = s0 - ticks_per_array;
+        (s_prev, s_prev - ticks_per_array)
+    } else {
+        let s_next = s0 + ticks_per_array;
+        (s_next, s_next + ticks_per_array)
     };
 
     (
-        tick_array_0,
-        tick_array_1,
-        tick_array_2,
-        start0,
-        start1,
-        start2,
+        derive_tick_array_pda(pool_id, s0),
+        derive_tick_array_pda(pool_id, s1),
+        derive_tick_array_pda(pool_id, s2),
+        s0,
+        s1,
+        s2,
     )
 }
 
@@ -1894,6 +1797,81 @@ mod tests {
         assert_ne!(b, c);
     }
 
+    /// Mid-array tick: a_to_b must use monotonically decreasing start indices (swap direction).
+    #[test]
+    fn whirlpool_cached_swap_tick_pdas_a_to_b_sequence_monotonic() {
+        let pool = Pubkey::new_unique();
+        let spacing = 64;
+        let tick_now = 2800; // mid-array for spacing=64 (array [0, 5632))
+        let (_, _, _, start0, start1, start2) =
+            super::whirlpool_swap_tick_array_pdas_for_cached_swap(&pool, tick_now, spacing, true);
+        assert!(
+            start0 > start1,
+            "a_to_b: start0 ({start0}) must be > start1 ({start1})"
+        );
+        assert!(
+            start1 > start2,
+            "a_to_b: start1 ({start1}) must be > start2 ({start2})"
+        );
+    }
+
+    /// Mid-array tick: b_to_a must use monotonically increasing start indices (swap direction).
+    #[test]
+    fn whirlpool_cached_swap_tick_pdas_b_to_a_sequence_monotonic() {
+        let pool = Pubkey::new_unique();
+        let spacing = 64;
+        let tick_now = 2800;
+        let (_, _, _, start0, start1, start2) =
+            super::whirlpool_swap_tick_array_pdas_for_cached_swap(&pool, tick_now, spacing, false);
+        assert!(
+            start0 < start1,
+            "b_to_a: start0 ({start0}) must be < start1 ({start1})"
+        );
+        assert!(
+            start1 < start2,
+            "b_to_a: start1 ({start1}) must be < start2 ({start2})"
+        );
+    }
+
+    /// tick_array_0 must always contain the current tick for representative indices.
+    #[test]
+    fn tick_array_0_contains_tick_now() {
+        let pool = Pubkey::new_unique();
+        let cases = [(0, 64), (2800, 64), (740, 8), (-624, 8)];
+        for (tick_now, spacing) in cases {
+            let (_, _, _, start0, _, _) = super::whirlpool_swap_tick_array_pdas_for_cached_swap(
+                &pool, tick_now, spacing, true,
+            );
+            assert!(
+                super::tick_array_contains_tick(start0, tick_now, spacing),
+                "tick_array_0 start {start0} must contain tick {tick_now} (spacing {spacing})"
+            );
+        }
+    }
+
+    /// Regression: never place an array in the opposite swap direction (caused Custom(6038)).
+    #[test]
+    fn whirlpool_cached_swap_tick_pdas_no_opposite_direction_array() {
+        let pool = Pubkey::new_unique();
+        let spacing = 64;
+        let ticks_per_array = spacing * super::TICK_ARRAY_SIZE;
+        let tick_now = 2800;
+        let (_, _, _, start0, start1, start2) =
+            super::whirlpool_swap_tick_array_pdas_for_cached_swap(&pool, tick_now, spacing, true);
+        // a_to_b: all subsequent arrays must be at lower starts than start0
+        assert!(start1 < start0);
+        assert!(start2 < start1);
+        assert_eq!(start1, start0 - ticks_per_array);
+        assert_eq!(start2, start0 - 2 * ticks_per_array);
+
+        let (_, _, _, start0, start1, start2) =
+            super::whirlpool_swap_tick_array_pdas_for_cached_swap(&pool, tick_now, spacing, false);
+        assert!(start1 > start0);
+        assert!(start2 > start1);
+        assert_eq!(start1, start0 + ticks_per_array);
+        assert_eq!(start2, start0 + 2 * ticks_per_array);
+    }
+
     /// Orca on-chain + TS SDK use Anchor seeds with decimal `start_tick_index` ASCII, not i32 LE.
     #[test]
     fn tick_array_pda_uses_anchor_decimal_string_seed() {
@@ -1968,6 +1946,72 @@ mod tests {
         assert!(
             ixs[0].accounts.iter().any(|a| a.pubkey == pool_pk),
             "swap ix must reference hinted whirlpool"
+        );
+    }
+
+    /// Cross-DEX meteora_dlmm → orca SELL leg: token → SOL must use monotonic tick-array sequence.
+    #[tokio::test]
+    async fn test_build_swap_ix_async_token_to_sol_sell_leg_tick_sequence() {
+        use super::POOL_ADDRESS_HINT_KEY;
+        use crate::solana::dex::Dex;
+
+        const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let orca = Orca::new(rpc);
+        orca.set_skip_tick_array_rpc_validation(true);
+        orca.set_user_authority(Pubkey::new_unique());
+
+        let pool_pk = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let vault_a = Pubkey::new_unique();
+        let vault_b = Pubkey::new_unique();
+
+        // token = A, SOL = B → sell token for SOL is b_to_a (ticks increase)
+        orca.set_pool_from_accounts(
+            &pool_pk.to_string(),
+            &[
+                pool_pk.to_string(),
+                token_mint.to_string(),
+                sol_mint.to_string(),
+                vault_a.to_string(),
+                vault_b.to_string(),
+                "tick_current_index:2800".to_string(),
+                "tick_spacing:64".to_string(),
+            ],
+        )
+        .expect("set_pool_from_accounts");
+
+        orca.cache_extra_data(POOL_ADDRESS_HINT_KEY, &pool_pk.to_string());
+
+        let ixs = orca
+            .build_swap_ix_async(&token_mint.to_string(), SOL_MINT, 1_000_000, 1)
+            .await
+            .expect("token→SOL sell leg build");
+
+        assert_eq!(ixs.len(), 1);
+        let tick_accounts: Vec<Pubkey> = ixs[0]
+            .accounts
+            .iter()
+            .skip(7)
+            .take(3)
+            .map(|a| a.pubkey)
+            .collect();
+        assert_eq!(tick_accounts.len(), 3);
+
+        let spacing = 64;
+        let tick_now = 2800;
+        let (expected_0, expected_1, expected_2, start0, start1, start2) =
+            super::whirlpool_swap_tick_array_pdas_for_cached_swap(
+                &pool_pk, tick_now, spacing, true,
+            );
+        assert_eq!(tick_accounts[0], expected_0);
+        assert_eq!(tick_accounts[1], expected_1);
+        assert_eq!(tick_accounts[2], expected_2);
+        assert!(
+            start0 > start1 && start1 > start2,
+            "token→SOL (a_to_b) sell leg must be monotonic decreasing"
         );
     }
 }
