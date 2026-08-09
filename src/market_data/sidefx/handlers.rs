@@ -131,7 +131,11 @@ fn md_sidefx_build_balance_updated_from_cache(
                 .merge_orca_pool_readiness(*pool_pubkey, readiness);
         }
         CachedPoolState::Meteora(s) => {
-            balance_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(s));
+            balance_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(
+                s,
+                host.live_pool_cache()
+                    .meteora_dlmm_has_bitmap_extension(pool_pubkey),
+            ));
             let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
             balance_update.set_dex_readiness_in_metadata(readiness);
             host.live_pool_cache()
@@ -1752,7 +1756,11 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                     pool_update.set_dex_readiness_in_metadata(readiness);
                 }
                 CachedPoolState::Meteora(s) => {
-                    pool_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(s));
+                    pool_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(
+                        s,
+                        host.live_pool_cache()
+                            .meteora_dlmm_has_bitmap_extension(pool_pubkey),
+                    ));
                     let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
                     pool_update.set_dex_readiness_in_metadata(readiness);
                 }
@@ -1938,7 +1946,11 @@ pub fn md_sidefx_process_vault_balance_tick(
                 host.live_pool_cache().get(&vault_view.pool_address)
             {
                 let mut meta = balance_update.metadata.take().unwrap_or_default();
-                for (k, v) in meteora_dlmm_metadata_for_pool_cache_update(s) {
+                for (k, v) in meteora_dlmm_metadata_for_pool_cache_update(
+                    s,
+                    host.live_pool_cache()
+                        .meteora_dlmm_has_bitmap_extension(&vault_view.pool_address),
+                ) {
                     meta.insert(k, v);
                 }
                 balance_update.metadata = Some(meta);

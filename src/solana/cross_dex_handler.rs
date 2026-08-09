@@ -1423,15 +1423,10 @@ impl CrossDexHandler {
 
         if buy_dex == "meteora_dlmm" {
             if let Ok(pool_pk) = Pubkey::from_str(&buy_pool) {
-                let has_bitmap_extension = self.pool_cache.as_ref().and_then(|cache| {
-                    cache.get(&pool_pk).and_then(|state| {
-                        if let CachedPoolState::Meteora(m) = state {
-                            m.has_bitmap_extension
-                        } else {
-                            None
-                        }
-                    })
-                });
+                let has_bitmap_extension = self
+                    .pool_cache
+                    .as_ref()
+                    .and_then(|cache| cache.meteora_dlmm_has_bitmap_extension(&pool_pk));
                 for ix in &mut buy_swap_instructions {
                     MeteoraDlmmSwapBuilder::patch_swap_ix_bitmap_extension(
                         ix,
@@ -1675,10 +1670,10 @@ mod tests {
                 bin_step: 10,
                 reserve_x_balance: Some(50_000_000_000),
                 reserve_y_balance: Some(1_000_000_000_000),
-                has_bitmap_extension: Some(true),
             }),
             100,
         );
+        cache.set_meteora_dlmm_has_bitmap_extension(&buy_pool, true);
         let sell_pool_accounts = pump_amm_v14_pool_accounts(sell_pool, token_mint);
         cache.upsert(
             sell_pool,

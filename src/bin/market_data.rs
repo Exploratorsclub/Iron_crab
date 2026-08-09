@@ -12668,7 +12668,6 @@ mod discovery_tests {
             bin_step: 4,
             reserve_x_balance: None,
             reserve_y_balance: None,
-            has_bitmap_extension: None,
         };
         cache.upsert(p1, CachedPoolState::Meteora(on_x), 0);
         let on_y = MeteoraState {
@@ -12680,7 +12679,6 @@ mod discovery_tests {
             bin_step: 0,
             reserve_x_balance: None,
             reserve_y_balance: None,
-            has_bitmap_extension: None,
         };
         cache.upsert(p2, CachedPoolState::Meteora(on_y), 0);
         cache.upsert(
@@ -12694,7 +12692,6 @@ mod discovery_tests {
                 bin_step: 1,
                 reserve_x_balance: None,
                 reserve_y_balance: None,
-                has_bitmap_extension: None,
             }),
             0,
         );
@@ -12781,7 +12778,6 @@ mod discovery_tests {
             bin_step: 0,
             reserve_x_balance: Some(1_000_000),
             reserve_y_balance: Some(50_000_000_000),
-            has_bitmap_extension: None,
         };
         assert_eq!(
             meteora_dlmm_readiness_for_pool_cache_update(&s),
@@ -12869,7 +12865,6 @@ mod discovery_tests {
                 bin_step: 0,
                 reserve_x_balance: Some(1),
                 reserve_y_balance: Some(2),
-                has_bitmap_extension: None,
             }),
             0,
         );
@@ -19572,7 +19567,6 @@ mod pr_b_geyser_tracking_tests {
                 bin_step: 20,
                 reserve_x_balance: Some(500_000),
                 reserve_y_balance: Some(1_500_000_000),
-                has_bitmap_extension: None,
             }),
             99,
         );
@@ -19628,7 +19622,6 @@ mod pr_b_geyser_tracking_tests {
                 bin_step: 15,
                 reserve_x_balance: Some(1),
                 reserve_y_balance: Some(1),
-                has_bitmap_extension: None,
             }),
             1,
         );
@@ -21810,7 +21803,6 @@ mod pr_b_geyser_tracking_tests {
             bin_step: 15,
             reserve_x_balance: Some(1),
             reserve_y_balance: Some(1),
-            has_bitmap_extension: None,
         })
     }
 

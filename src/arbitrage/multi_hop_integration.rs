@@ -1491,7 +1491,6 @@ mod tests {
                 bin_step,
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(500_000_000),
-                has_bitmap_extension: None,
             }),
             1,
         );

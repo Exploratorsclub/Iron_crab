@@ -10751,7 +10751,6 @@ mod two_hop_price_tests {
                 bin_step: 25,
                 reserve_x_balance: Some(1_000_000),
                 reserve_y_balance: Some(2_000_000_000),
-                has_bitmap_extension: None,
             }),
             10,
         );
@@ -10893,7 +10892,6 @@ mod two_hop_price_tests {
                 bin_step: 20,
                 reserve_x_balance: Some(500_000),
                 reserve_y_balance: Some(1_500_000_000),
-                has_bitmap_extension: None,
             }),
             5,
         );
@@ -10939,7 +10937,6 @@ mod two_hop_price_tests {
                 bin_step: 20,
                 reserve_x_balance: Some(800_000),
                 reserve_y_balance: Some(2_000_000_000),
-                has_bitmap_extension: None,
             }),
             50,
         );
@@ -14182,7 +14179,6 @@ mod pool_accounts_coverage_tests {
                 bin_step: 25,
                 reserve_x_balance: Some(1_000_000_000),
                 reserve_y_balance: Some(2_000_000_000),
-                has_bitmap_extension: None,
             }),
             1,
         );

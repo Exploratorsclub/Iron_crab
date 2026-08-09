@@ -112,7 +112,10 @@ fn meteora_dlmm_onchain_mints_for_pool_cache_update(s: &MeteoraState) -> String 
 }
 
 /// Meteora DLMM: vault pubkeys + static pool fields for JetStream / SLAVE bootstrap.
-pub fn meteora_dlmm_metadata_for_pool_cache_update(s: &MeteoraState) -> HashMap<String, String> {
+pub fn meteora_dlmm_metadata_for_pool_cache_update(
+    s: &MeteoraState,
+    has_bitmap_extension: Option<bool>,
+) -> HashMap<String, String> {
     let mut meta = HashMap::new();
     meta.insert(
         POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY.to_string(),
@@ -130,7 +133,7 @@ pub fn meteora_dlmm_metadata_for_pool_cache_update(s: &MeteoraState) -> HashMap<
         POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY.to_string(),
         s.bin_step.to_string(),
     );
-    if let Some(has) = s.has_bitmap_extension {
+    if let Some(has) = has_bitmap_extension {
         meta.insert(
             POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY.to_string(),
             has.to_string(),
@@ -638,7 +641,6 @@ mod tests {
                 bin_step: 10,
                 reserve_x_balance: Some(1),
                 reserve_y_balance: Some(2),
-                has_bitmap_extension: None,
             })
         };
         let prev = mk(Pubkey::new_unique());
