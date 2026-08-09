@@ -47,7 +47,8 @@ use crate::ipc::DexPoolReadiness;
 use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
 use crate::solana::dex::orca_whirlpool_layout::{self, WhirlpoolParsed};
 use crate::solana::dex::pumpfun_amm::{
-    pump_amm_sell_extended_layout_ready, PumpAmmSellExtendedReadinessParams,
+    pump_amm_normalize_v14_pool_accounts, pump_amm_sell_extended_layout_ready,
+    PumpAmmSellExtendedReadinessParams,
 };
 
 // ============================================================================
@@ -989,7 +990,10 @@ impl LivePoolCache {
     ///
     /// Without this, PumpAmm entries parsed from Geyser have empty pool_accounts,
     /// making them unusable for tx building.
-    pub fn set_pump_amm_pool_accounts(&self, pool: &Pubkey, accounts: Vec<Pubkey>) {
+    pub fn set_pump_amm_pool_accounts(&self, pool: &Pubkey, mut accounts: Vec<Pubkey>) {
+        if accounts.len() >= 14 {
+            pump_amm_normalize_v14_pool_accounts(pool, &mut accounts);
+        }
         if let Some(mut entry) = self.pools.get_mut(pool) {
             if let CachedPoolState::PumpAmm(ref mut s) = entry.value_mut().state {
                 let was_empty = s.pool_accounts.is_empty();
@@ -3509,13 +3513,22 @@ mod tests {
 
         cache.set_pump_amm_pool_accounts(&pool_market, accounts_to_set.clone());
 
+        let canonical_gc = crate::solana::dex::pumpfun_amm::pump_amm_canonical_global_config();
+        let canonical_ea =
+            crate::solana::dex::pumpfun_amm::pump_amm_canonical_event_authority_pub();
+        let mut expected = accounts_to_set.clone();
+        if expected.len() >= 14 {
+            expected[1] = canonical_gc;
+            expected[8] = canonical_ea;
+        }
+
         let result = cache.get_pump_amm_pool_accounts_by_base_mint(&base_mint);
         assert!(result.is_some());
-        assert_eq!(result.unwrap(), accounts_to_set);
+        assert_eq!(result.unwrap(), expected);
 
         let by_pool = cache.get_pump_amm_pool_accounts(&pool_market);
         assert!(by_pool.is_some());
-        assert_eq!(by_pool.unwrap(), accounts_to_set);
+        assert_eq!(by_pool.unwrap(), expected);
     }
 
     /// Discovery Request path must NOT degrade existing reserves/creator.
@@ -3548,6 +3561,15 @@ mod tests {
 
         cache.set_pump_amm_pool_accounts(&pool_market, new_accounts.clone());
 
+        let canonical_gc = crate::solana::dex::pumpfun_amm::pump_amm_canonical_global_config();
+        let canonical_ea =
+            crate::solana::dex::pumpfun_amm::pump_amm_canonical_event_authority_pub();
+        let mut expected = new_accounts.clone();
+        if expected.len() >= 14 {
+            expected[1] = canonical_gc;
+            expected[8] = canonical_ea;
+        }
+
         let (r_base, r_quote, _) = cache
             .get_pump_amm_reserves_by_base_mint(&base_mint)
             .expect("reserves must be preserved");
@@ -3557,7 +3579,7 @@ mod tests {
         let accounts = cache
             .get_pump_amm_pool_accounts_by_base_mint(&base_mint)
             .expect("pool_accounts must be set");
-        assert_eq!(accounts, new_accounts);
+        assert_eq!(accounts, expected);
 
         if let Some(CachedPoolState::PumpAmm(s)) = cache.get(&pool_market) {
             assert_eq!(s.creator, Some(creator));

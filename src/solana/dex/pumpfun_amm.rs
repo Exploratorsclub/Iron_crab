@@ -63,6 +63,62 @@ fn pump_amm_canonical_event_authority(program_id: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"__event_authority"], program_id).0
 }
 
+/// Canonical PumpSwap `global_config` pubkey string (swap ix account #2, v14 `pool_accounts[1]`).
+pub const PUMPFUN_AMM_GLOBAL_CONFIG_STR: &str = PUMPFUN_AMM_GLOBAL_CONFIG;
+
+/// Canonical PumpSwap `global_config` pubkey (same for all pools).
+#[must_use]
+pub fn pump_amm_canonical_global_config() -> Pubkey {
+    Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).expect("PUMPFUN_AMM_GLOBAL_CONFIG is valid")
+}
+
+/// Canonical PumpSwap `event_authority` PDA (v14 `pool_accounts[8]`).
+#[must_use]
+pub fn pump_amm_canonical_event_authority_pub() -> Pubkey {
+    let program_id =
+        Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).expect("PUMPFUN_AMM_PROGRAM_ID is valid");
+    pump_amm_canonical_event_authority(&program_id)
+}
+
+/// Normalize v14 `pool_accounts` globals in-place: `[1]` → canonical `global_config`, `[8]` → canonical
+/// `event_authority`. Does **not** touch `protocol_fee_recipient` (`[6]`/`[7]`) — Bug #35.
+///
+/// Returns `true` if any slot was replaced.
+pub fn pump_amm_normalize_v14_pool_accounts(pool: &Pubkey, accounts: &mut [Pubkey]) -> bool {
+    if accounts.len() < 14 {
+        return false;
+    }
+    let global_config = pump_amm_canonical_global_config();
+    let event_authority = pump_amm_canonical_event_authority_pub();
+    let mut replaced = false;
+
+    if accounts[1] != global_config {
+        warn!(
+            pool = %pool,
+            from = %accounts[1],
+            to = %global_config,
+            slot = 1,
+            "pump_amm: normalized v14 pool_accounts global_config"
+        );
+        crate::metrics::inc_pump_amm_global_config_normalized_total();
+        accounts[1] = global_config;
+        replaced = true;
+    }
+    if accounts[8] != event_authority {
+        warn!(
+            pool = %pool,
+            from = %accounts[8],
+            to = %event_authority,
+            slot = 8,
+            "pump_amm: normalized v14 pool_accounts event_authority"
+        );
+        crate::metrics::inc_pump_amm_event_authority_normalized_total();
+        accounts[8] = event_authority;
+        replaced = true;
+    }
+    replaced
+}
+
 /// Singleton `global_volume_accumulator` PDA — same address for all PumpSwap pools under the AMM program.
 ///
 /// When market-byte heuristics find no AMM-owned candidate and PDA probes fail (e.g. account owner
@@ -7965,6 +8021,38 @@ mod tests {
     }
 
     /// SELL path: instruction account #2 must be the canonical global_config (not pool_accounts[1]).
+    #[test]
+    fn test_pump_amm_normalize_v14_pool_accounts_replaces_globals_only() {
+        let pool = Pubkey::new_unique();
+        let canonical_gc = pump_amm_canonical_global_config();
+        let canonical_ea = pump_amm_canonical_event_authority_pub();
+        let wrong_pfr = Pubkey::new_unique();
+
+        let mut accounts: Vec<Pubkey> = vec![
+            pool,
+            Pubkey::from_str("T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt").unwrap(),
+            Pubkey::new_unique(),
+            Pubkey::from_str(WSOL_MINT).unwrap(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            wrong_pfr,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(), // wrong event_authority
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        assert!(pump_amm_normalize_v14_pool_accounts(&pool, &mut accounts));
+        assert_eq!(accounts[1], canonical_gc);
+        assert_eq!(accounts[8], canonical_ea);
+        assert_eq!(
+            accounts[6], wrong_pfr,
+            "protocol_fee_recipient must not be canonicalized"
+        );
+    }
+
     #[test]
     fn test_pumpswap_sell_global_config_meta_is_canonical() {
         let wsol = Pubkey::from_str(WSOL_MINT).unwrap();

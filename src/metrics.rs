@@ -4921,6 +4921,22 @@ pub static ARB_POOL_ACCOUNTS_BACKFILL_CROSS_MINT: Lazy<AtomicU64> = Lazy::new(||
 /// DexPoolAccounts resolved from the global pool_address → accounts index.
 pub static ARB_POOL_ACCOUNTS_BACKFILL_INDEX: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
+/// PumpSwap v14 `pool_accounts[1]` replaced with canonical `global_config`.
+pub static PUMP_AMM_GLOBAL_CONFIG_NORMALIZED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+/// PumpSwap v14 `pool_accounts[8]` replaced with canonical `event_authority` PDA.
+pub static PUMP_AMM_EVENT_AUTHORITY_NORMALIZED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub fn inc_pump_amm_global_config_normalized_total() {
+    PUMP_AMM_GLOBAL_CONFIG_NORMALIZED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn inc_pump_amm_event_authority_normalized_total() {
+    PUMP_AMM_EVENT_AUTHORITY_NORMALIZED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArbPoolAccountsBackfillSource {
     LiveCache,
