@@ -74,7 +74,8 @@ use ironcrab::ipc::{
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
     dec_execution_intent_rx_queue_depth, inc_execution_intent_rx_queue_depth,
-    inc_execution_pool_cache_messages_processed, record_arb_bundle_tx_too_large,
+    inc_execution_pool_cache_messages_processed,
+    inc_pump_amm_compile_global_config_resolve_mismatch_total, record_arb_bundle_tx_too_large,
     record_execution_engine_interval_tick_duration_ms, record_execution_intent_channel_wait_ms,
     record_execution_intent_jetstream_to_channel_ms, record_execution_process_intent_us,
     record_execution_slot_lag_at_send_slots, record_failed_confirmed_no_fill_accounting_total,
@@ -125,6 +126,7 @@ use ironcrab::position_authority::{
     PositionAuthority, PositionAuthorityChange, PositionAuthorityKvMetricsSink,
     PositionAuthorityKvPublisher,
 };
+use ironcrab::solana::address_lookup_table::audit_pump_amm_global_config_in_versioned_tx;
 use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
 use ironcrab::solana::dex::orca::Orca;
@@ -13622,6 +13624,35 @@ fn log_bundle_tx_size_rejection(
     record_arb_bundle_tx_too_large();
 }
 
+fn log_pump_amm_compile_global_config_mismatch(
+    intent: &TradeIntent,
+    err: &ironcrab::solana::address_lookup_table::PumpAmmGlobalConfigAuditError,
+    rejection_stage: &str,
+) {
+    let buy_dex = intent
+        .metadata
+        .get("buy_dex")
+        .map(|s| s.as_str())
+        .unwrap_or("?");
+    let sell_dex = intent
+        .metadata
+        .get("sell_dex")
+        .map(|s| s.as_str())
+        .unwrap_or("?");
+    warn!(
+        intent_id = %intent.intent_id,
+        ix_index = err.ix_index,
+        meta_pubkey = %err.meta_pubkey,
+        resolved_pubkey = %err.resolved_pubkey,
+        static_contains_bad = ?err.static_contains_bad.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+        buy_dex,
+        sell_dex,
+        rejection_stage,
+        "PumpSwap global_config compile resolve mismatch (pre-sim gate)"
+    );
+    inc_pump_amm_compile_global_config_resolve_mismatch_total();
+}
+
 /// Build + size-gate the unsigned TX used for simulation (same form as send, no RPC yet).
 fn prepare_unsigned_versioned_tx_for_simulation(
     wallet_pubkey: &Pubkey,
@@ -13722,6 +13753,24 @@ async fn simulate_transaction(
             logs_preview: None,
             compute_units_consumed: None,
         };
+    }
+
+    if let (Some(alt), Some(intent)) = (ctx.address_lookup_table.as_ref(), bundle_size_intent) {
+        if let Err(audit_err) =
+            audit_pump_amm_global_config_in_versioned_tx(&tx.message, alt, &plan.instructions)
+        {
+            log_pump_amm_compile_global_config_mismatch(
+                intent,
+                &audit_err,
+                "before_simulation_rpc",
+            );
+            return SimulationResult {
+                success: false,
+                error_code: Some(audit_err.detail()),
+                logs_preview: None,
+                compute_units_consumed: None,
+            };
+        }
     }
 
     let cfg = RpcSimulateTransactionConfig {

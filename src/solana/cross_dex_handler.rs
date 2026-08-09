@@ -1599,17 +1599,18 @@ mod tests {
         TradeSide, TradingRegime,
     };
     use crate::solana::address_lookup_table::{
-        analyze_versioned_message_alt_usage, compile_v0_versioned_message, get_common_accounts,
-        loaded_addresses_from_alt_lookups, resolved_instruction_account_pubkey,
+        analyze_versioned_message_alt_usage, audit_pump_amm_global_config_in_versioned_tx,
+        compile_v0_versioned_message, get_common_accounts, loaded_addresses_from_alt_lookups,
+        prod_on_chain_alt_fixture, resolved_instruction_account_pubkey,
         versioned_message_duplicate_static_keys, AltCompileAnalysis, LoadedAlt,
+        PUMP_AMM_WRONG_LEGACY_GLOBAL_CONFIG,
     };
     use crate::solana::compute_budget_helper;
     use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
     use crate::solana::dex::pumpfun_amm::{
         pump_amm_buy_program_ix_index, pump_amm_canonical_global_config,
         PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR, PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
-        PUMPFUN_AMM_GLOBAL_CONFIG_STR, PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
-        PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
+        PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
     };
     use crate::solana::dex::router::Router;
     use crate::solana::dex::Quote;
@@ -1872,11 +1873,17 @@ mod tests {
         (plan, wallet, token_mint)
     }
 
-    fn compile_cross_dex_bundle_tx_with_alt(
+    fn compile_cross_dex_bundle_tx_with_loaded_alt(
         wallet: &Keypair,
         plan: &CrossDexSwapPlan,
-        alt_accounts: Vec<Pubkey>,
-    ) -> (VersionedTransaction, usize, usize, AltCompileAnalysis) {
+        alt: LoadedAlt,
+    ) -> (
+        VersionedTransaction,
+        usize,
+        usize,
+        AltCompileAnalysis,
+        Vec<Instruction>,
+    ) {
         let tip = Pubkey::from_str(JITO_TIP_ACCOUNT).unwrap();
         let mut ixs = Vec::new();
         ixs.push(compute_budget_helper::set_compute_unit_limit(450_000));
@@ -1894,10 +1901,6 @@ mod tests {
             data: tip_data,
         });
 
-        let alt = LoadedAlt {
-            address: Pubkey::new_unique(),
-            accounts: alt_accounts,
-        };
         let blockhash = Hash::new_unique();
         let message =
             compile_v0_versioned_message(&wallet.pubkey(), &ixs, Some(&alt), Some(&tip), blockhash)
@@ -1905,7 +1908,76 @@ mod tests {
         let tx = VersionedTransaction::try_new(message, &[wallet]).expect("sign tx");
         let analysis = analyze_versioned_message_alt_usage(&tx.message, Some(&alt));
         let size = versioned_tx_serialized_len(&tx);
-        (tx, size, analysis.alt_hit_count, analysis)
+        (tx, size, analysis.alt_hit_count, analysis, ixs)
+    }
+
+    fn compile_cross_dex_bundle_tx_with_alt(
+        wallet: &Keypair,
+        plan: &CrossDexSwapPlan,
+        alt_accounts: Vec<Pubkey>,
+    ) -> (VersionedTransaction, usize, usize, AltCompileAnalysis) {
+        let alt = LoadedAlt {
+            address: Pubkey::new_unique(),
+            accounts: alt_accounts,
+        };
+        let (tx, size, alt_hits, analysis, _) =
+            compile_cross_dex_bundle_tx_with_loaded_alt(wallet, plan, alt);
+        (tx, size, alt_hits, analysis)
+    }
+
+    fn compile_cross_dex_bundle_tx_prod_alt(
+        wallet: &Keypair,
+        plan: &CrossDexSwapPlan,
+    ) -> (
+        VersionedTransaction,
+        usize,
+        usize,
+        AltCompileAnalysis,
+        Vec<Instruction>,
+    ) {
+        compile_cross_dex_bundle_tx_with_loaded_alt(wallet, plan, prod_on_chain_alt_fixture())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_pump_global_config_prod_alt_compile(
+        tx: &VersionedTransaction,
+        plan_ixs: &[Instruction],
+        alt: &LoadedAlt,
+        pump_leg_ix_index: usize,
+        wrong_gc: Pubkey,
+        canonical_gc: Pubkey,
+    ) {
+        audit_pump_amm_global_config_in_versioned_tx(&tx.message, alt, plan_ixs)
+            .expect("compile audit must pass for pump global_config");
+        let dupes = versioned_message_duplicate_static_keys(&tx.message);
+        assert!(
+            dupes.is_empty(),
+            "compiled v0 message must not contain duplicate static keys: {:?}",
+            dupes.iter().map(|p| p.to_string()).collect::<Vec<_>>()
+        );
+        let loaded = loaded_addresses_from_alt_lookups(alt, &tx.message)
+            .expect("loaded addresses from ALT lookups");
+        let resolved_gc =
+            resolved_instruction_account_pubkey(&tx.message, Some(&loaded), pump_leg_ix_index, 2)
+                .expect("resolve pump global_config from compiled v0 message");
+        assert_eq!(
+            resolved_gc, canonical_gc,
+            "compiled v0 message must resolve pump global_config slot to canonical pubkey"
+        );
+        let static_keys = match &tx.message {
+            solana_sdk::message::VersionedMessage::V0(v0) => &v0.account_keys,
+            solana_sdk::message::VersionedMessage::Legacy(l) => &l.account_keys,
+        };
+        assert!(
+            !static_keys.contains(&wrong_gc),
+            "wrong global_config must not be a static key in compiled bundle"
+        );
+        assert!(
+            !static_keys
+                .iter()
+                .any(|p| p.to_string() == PUMP_AMM_WRONG_LEGACY_GLOBAL_CONFIG),
+            "T1pyya must not appear in static keys"
+        );
     }
 
     /// Optimistic ALT: every instruction account is in the table (not prod-realistic).
@@ -2050,7 +2122,7 @@ mod tests {
     /// Prod incident: stale `pool_accounts[1]` (`T1pyya…`) must not leak into compiled SELL ix or static keys.
     #[tokio::test]
     async fn cross_dex_pump_sell_global_config_resolved_after_wrong_pool_accounts_v14() {
-        const WRONG_GLOBAL_CONFIG: &str = "T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt";
+        const WRONG_GLOBAL_CONFIG: &str = PUMP_AMM_WRONG_LEGACY_GLOBAL_CONFIG;
         let canonical_gc = pump_amm_canonical_global_config();
         let wrong_gc = Pubkey::from_str(WRONG_GLOBAL_CONFIG).unwrap();
         assert_ne!(wrong_gc, canonical_gc);
@@ -2063,7 +2135,6 @@ mod tests {
         let cache = Arc::new(LivePoolCache::new());
         seed_prod_like_cross_dex_cache(&cache, buy_pool, sell_pool, token_mint);
 
-        // Inject prod-like wrong global_config into cache v14 row.
         if let Some(CachedPoolState::PumpAmm(state)) = cache.get(&sell_pool) {
             let mut accounts = state.pool_accounts;
             accounts[1] = wrong_gc;
@@ -2077,7 +2148,6 @@ mod tests {
         handler.init_dexes().await.expect("init_dexes");
 
         let mut intent = cross_dex_test_intent(&token_mint, &buy_pool, &sell_pool);
-        // Intent sell_pool_accounts also carry the wrong global_config at v14[1].
         if let Some(start_idx) = intent
             .resources
             .accounts
@@ -2088,7 +2158,7 @@ mod tests {
                 .strip_prefix("sell_pool_accounts_start:")
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(0);
-            let first_account_idx = start_idx + 2; // v14[1] is first_account_idx + 1
+            let first_account_idx = start_idx + 2;
             if count >= 2 && first_account_idx < intent.resources.accounts.len() {
                 intent.resources.accounts[first_account_idx] = WRONG_GLOBAL_CONFIG.to_string();
             }
@@ -2112,58 +2182,139 @@ mod tests {
             PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
             "prod-like pump sell must use 24-account extended layout"
         );
-        assert_eq!(
-            sell_ix.accounts[2].pubkey, canonical_gc,
-            "SELL ix meta #2 must be canonical global_config"
-        );
-        assert_eq!(
-            sell_ix.accounts[2].pubkey.to_string(),
-            PUMPFUN_AMM_GLOBAL_CONFIG_STR
-        );
+        assert_eq!(sell_ix.accounts[2].pubkey, canonical_gc);
 
-        let alt_accounts = get_common_accounts();
-        let (tx, _, _, _) =
-            compile_cross_dex_bundle_tx_with_alt(&wallet, &plan, alt_accounts.clone());
-        let dupes = versioned_message_duplicate_static_keys(&tx.message);
-        assert!(
-            dupes.is_empty(),
-            "wrong pool_accounts[1] must not produce duplicate static keys: {:?}",
-            dupes.iter().map(|p| p.to_string()).collect::<Vec<_>>()
-        );
-
-        let alt_address = match &tx.message {
-            solana_sdk::message::VersionedMessage::V0(v0) => v0
-                .address_table_lookups
-                .first()
-                .map(|l| l.account_key)
-                .unwrap_or_default(),
-            _ => Pubkey::default(),
-        };
-        let alt = LoadedAlt {
-            address: alt_address,
-            accounts: alt_accounts,
-        };
-        let loaded = loaded_addresses_from_alt_lookups(&alt, &tx.message)
-            .expect("loaded addresses from ALT lookups");
+        let alt = prod_on_chain_alt_fixture();
+        let (tx, _, _, _, plan_ixs) = compile_cross_dex_bundle_tx_prod_alt(&wallet, &plan);
         // Bundle: CU limit, CU price, Meteora buy, Pump sell, tip → sell at index 3.
-        let sell_ix_index = 3;
-        let resolved_gc =
-            resolved_instruction_account_pubkey(&tx.message, Some(&loaded), sell_ix_index, 2)
-                .expect("resolve SELL global_config from compiled v0 message");
-        assert_eq!(
-            resolved_gc, canonical_gc,
-            "compiled v0 message must resolve SELL global_config slot to canonical pubkey"
-        );
+        assert_pump_global_config_prod_alt_compile(&tx, &plan_ixs, &alt, 3, wrong_gc, canonical_gc);
+    }
 
-        // Wrong pubkey must not appear as a static key when normalization replaced it.
-        let static_keys = match &tx.message {
-            solana_sdk::message::VersionedMessage::V0(v0) => &v0.account_keys,
-            solana_sdk::message::VersionedMessage::Legacy(l) => &l.account_keys,
-        };
-        assert!(
-            !static_keys.contains(&wrong_gc),
-            "wrong global_config must not be a static key in compiled bundle"
+    /// Prod pattern: pump BUY leg (meteora sell) with wrong v14 `pool_accounts[1]`.
+    #[tokio::test]
+    async fn cross_dex_pump_buy_global_config_resolved_after_wrong_pool_accounts_v14() {
+        const WRONG_GLOBAL_CONFIG: &str = PUMP_AMM_WRONG_LEGACY_GLOBAL_CONFIG;
+        let canonical_gc = pump_amm_canonical_global_config();
+        let wrong_gc = Pubkey::from_str(WRONG_GLOBAL_CONFIG).unwrap();
+
+        let wallet = Keypair::new();
+        let token_mint = Pubkey::new_unique();
+        let buy_pool = Pubkey::new_unique();
+        let sell_pool = Pubkey::from_str("2TD1fMPg2w7Hjt8bASSdxi92YFNQFgvdznqVApe3NGpn").unwrap();
+
+        let cache = Arc::new(LivePoolCache::new());
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let mut buy_pool_accounts = pump_amm_v14_pool_accounts(buy_pool, token_mint);
+        buy_pool_accounts[1] = wrong_gc;
+        cache.upsert(
+            buy_pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: token_mint,
+                quote_mint: sol_mint,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000_000_000_000),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: buy_pool_accounts,
+                creator: None,
+            }),
+            100,
         );
+        let third = Pubkey::from_str("HjQjngTDqoHE6aaGhUqfz9aQ7WZcBRjy5xB8PScLSr8i").unwrap();
+        cache.merge_pump_amm_sell_extended_layout(
+            &buy_pool,
+            true,
+            Some(third),
+            Some(Pubkey::from_str("5CXzL4rxA677oGhKUDBxxapLk6wLpRPLmackZDHGmZCQ").unwrap()),
+            Some(Pubkey::from_str("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD").unwrap()),
+            None,
+            None,
+            false,
+            false,
+            None,
+        );
+        cache.set_pump_amm_sell_layout_ready(&buy_pool, true);
+        cache.upsert(
+            sell_pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: sol_mint,
+                token_y_mint: token_mint,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: -281,
+                bin_step: 10,
+                reserve_x_balance: Some(50_000_000_000),
+                reserve_y_balance: Some(1_000_000_000_000),
+            }),
+            100,
+        );
+        cache.set_meteora_dlmm_has_bitmap_extension(&sell_pool, true);
+
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mut handler = CrossDexHandler::new(rpc.clone(), Some(wallet.pubkey()))
+            .with_rpc_url("http://127.0.0.1:0".to_string())
+            .with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes");
+
+        let mut metadata = HashMap::new();
+        metadata.insert("buy_dex".to_string(), "pump_amm".to_string());
+        metadata.insert("sell_dex".to_string(), "meteora_dlmm".to_string());
+        metadata.insert("buy_pool".to_string(), buy_pool.to_string());
+        metadata.insert("sell_pool".to_string(), sell_pool.to_string());
+
+        let buy_accounts: Vec<String> = pump_amm_v14_pool_accounts(buy_pool, token_mint)
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect();
+        let sell_accounts: Vec<String> = vec![
+            sell_pool.to_string(),
+            SOL_MINT.to_string(),
+            token_mint.to_string(),
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+            "active_id:-281".to_string(),
+            "bin_step:10".to_string(),
+        ];
+        let mut accounts = Vec::new();
+        accounts.push(format!("buy_pool_accounts_start:{}", buy_accounts.len()));
+        accounts.extend(buy_accounts);
+        accounts.push(format!("sell_pool_accounts_start:{}", sell_accounts.len()));
+        accounts.extend(sell_accounts);
+
+        let mut intent = cross_dex_test_intent(&token_mint, &buy_pool, &sell_pool);
+        intent.metadata = metadata;
+        intent.resources.accounts = accounts;
+        if let Some(start_idx) = intent
+            .resources
+            .accounts
+            .iter()
+            .position(|s| s.starts_with("buy_pool_accounts_start:"))
+        {
+            let first_account_idx = start_idx + 2;
+            if first_account_idx < intent.resources.accounts.len() {
+                intent.resources.accounts[first_account_idx] = WRONG_GLOBAL_CONFIG.to_string();
+            }
+        }
+
+        let validation = cross_dex_validation_fixture(&token_mint);
+        let plan = handler
+            .build_swap_plan(
+                &intent,
+                &validation,
+                CrossDexPlanOptions {
+                    skip_token_ata_create: true,
+                },
+            )
+            .await
+            .expect("pump buy cross-dex plan");
+
+        let buy_ix = plan.buy_instructions.first().expect("pump buy leg");
+        assert_eq!(buy_ix.accounts[2].pubkey, canonical_gc);
+
+        let alt = prod_on_chain_alt_fixture();
+        let (tx, _, _, _, plan_ixs) = compile_cross_dex_bundle_tx_prod_alt(&wallet, &plan);
+        // Bundle: CU limit, CU price, Pump buy, Meteora sell, tip → buy at index 2.
+        assert_pump_global_config_prod_alt_compile(&tx, &plan_ixs, &alt, 2, wrong_gc, canonical_gc);
     }
 
     #[tokio::test]

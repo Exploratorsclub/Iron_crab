@@ -35,6 +35,16 @@ pub const PUMPFUN_BONDING_EVENT_AUTHORITY: &str = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7
 /// Former COMMON_ACCOUNTS entry — not PumpSwap global_config; kept for audit diffs only.
 pub const REMOVED_WRONG_PUMPSWAP_GLOBAL_CONFIG: &str =
     "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg";
+/// BPF-loader program account observed as stale `pool_accounts[1]` in prod (not PumpSwap global_config).
+pub const PUMP_AMM_WRONG_LEGACY_GLOBAL_CONFIG: &str = "T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt";
+/// Prod on-chain ALT address (`setup-alt` / EE config).
+pub const PROD_ON_CHAIN_ALT_ADDRESS: &str = "2J74oVKaviWzVr9gaLDvmBf3VAVVpzy88i3YCnyDwvuX";
+
+/// Pubkeys that must not appear as static keys when PumpSwap ix meta #2 is canonical `global_config`.
+pub const PUMP_AMM_KNOWN_BAD_GLOBAL_CONFIG_PUBKEYS: &[&str] = &[
+    PUMP_AMM_WRONG_LEGACY_GLOBAL_CONFIG,
+    REMOVED_WRONG_PUMPSWAP_GLOBAL_CONFIG,
+];
 
 /// Well-known program IDs and accounts that should be in every ALT.
 /// These are used in almost every transaction.
@@ -124,6 +134,57 @@ pub fn address_lookup_table_account(
     }
 }
 
+/// Map filtered-ALT lookup indices (tip excluded from compile LUT) to on-chain ALT indices.
+///
+/// `try_compile` indexes into the `AddressLookupTableAccount::addresses` slice passed at compile
+/// time. When the tip is removed so it stays a static writable key (#373), those indices drift
+/// vs the on-chain LUT that RPC `simulateTransaction` resolves — remap after compile.
+fn filtered_alt_index_to_on_chain_map(alt: &LoadedAlt, exclude_tip: &Pubkey) -> Option<Vec<u8>> {
+    if !alt.contains(exclude_tip) {
+        return None;
+    }
+    let map: Vec<u8> = alt
+        .accounts
+        .iter()
+        .filter(|pk| *pk != exclude_tip)
+        .filter_map(|pk| {
+            let idx = alt.index_of(pk)?;
+            u8::try_from(idx).ok()
+        })
+        .collect();
+    Some(map)
+}
+
+/// Rewrite v0 lookup indices from filtered-ALT positions to on-chain ALT positions.
+pub fn remap_v0_alt_lookup_indices_to_on_chain(
+    message: &mut v0::Message,
+    alt: &LoadedAlt,
+    exclude_tip: &Pubkey,
+) -> Result<(), String> {
+    let Some(index_map) = filtered_alt_index_to_on_chain_map(alt, exclude_tip) else {
+        return Ok(());
+    };
+    for lookup in &mut message.address_table_lookups {
+        if lookup.account_key != alt.address {
+            return Err(format!(
+                "alt_lookup_remap_unexpected_table:{}",
+                lookup.account_key
+            ));
+        }
+        for idx in lookup
+            .writable_indexes
+            .iter_mut()
+            .chain(lookup.readonly_indexes.iter_mut())
+        {
+            let filtered = *idx as usize;
+            *idx = *index_map
+                .get(filtered)
+                .ok_or_else(|| format!("alt_lookup_remap_oob:filtered_index_{filtered}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Compile a v0 `VersionedMessage` with optional ALT and tip filtering.
 pub fn compile_v0_versioned_message(
     payer: &Pubkey,
@@ -134,8 +195,13 @@ pub fn compile_v0_versioned_message(
 ) -> Result<VersionedMessage, String> {
     let message = if let Some(alt) = alt {
         let alt_account = address_lookup_table_account(alt, exclude_tip_from_alt);
-        v0::Message::try_compile(payer, instructions, &[alt_account], recent_blockhash)
-            .map_err(|e| format!("v0_compile_error:{e}"))?
+        let mut message =
+            v0::Message::try_compile(payer, instructions, &[alt_account], recent_blockhash)
+                .map_err(|e| format!("v0_compile_error:{e}"))?;
+        if let Some(tip) = exclude_tip_from_alt {
+            remap_v0_alt_lookup_indices_to_on_chain(&mut message, alt, tip)?;
+        }
+        message
     } else {
         v0::Message::try_compile(payer, instructions, &[], recent_blockhash)
             .map_err(|e| format!("v0_compile_error:{e}"))?
@@ -453,6 +519,138 @@ pub fn partition_globals_vs_pool_specific(
     (globals_missing, pool_specific)
 }
 
+/// Structured failure from pre-sim PumpSwap `global_config` compile audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpAmmGlobalConfigAuditError {
+    pub ix_index: usize,
+    pub meta_pubkey: Pubkey,
+    pub resolved_pubkey: Pubkey,
+    pub static_contains_bad: Vec<Pubkey>,
+}
+
+impl PumpAmmGlobalConfigAuditError {
+    pub fn reason_code(&self) -> &'static str {
+        "pump_amm_compile_global_config_resolve_mismatch"
+    }
+
+    pub fn detail(&self) -> String {
+        format!(
+            "pump_amm_compile_global_config_resolve_mismatch:ix={}:meta={}:resolved={}:static_bad={:?}",
+            self.ix_index,
+            self.meta_pubkey,
+            self.resolved_pubkey,
+            self.static_contains_bad
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+        )
+    }
+}
+
+/// Pre-sim audit: PumpSwap buy/sell ix meta #2 must resolve to the same pubkey in the compiled v0
+/// message when lookups are resolved against the **on-chain** ALT snapshot.
+pub fn audit_pump_amm_global_config_in_versioned_tx(
+    message: &VersionedMessage,
+    alt: &LoadedAlt,
+    plan_instructions: &[Instruction],
+) -> Result<(), PumpAmmGlobalConfigAuditError> {
+    use crate::solana::dex::pumpfun_amm::pump_amm_canonical_global_config;
+
+    let pump_program =
+        Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").expect("pump amm program");
+    let canonical_gc = pump_amm_canonical_global_config();
+    let loaded = loaded_addresses_from_alt_lookups(alt, message);
+    let static_keys: Vec<Pubkey> = match message {
+        VersionedMessage::V0(v0) => v0.account_keys.clone(),
+        VersionedMessage::Legacy(l) => l.account_keys.clone(),
+    };
+    let bad_static: Vec<Pubkey> = PUMP_AMM_KNOWN_BAD_GLOBAL_CONFIG_PUBKEYS
+        .iter()
+        .filter_map(|s| Pubkey::from_str(s).ok())
+        .filter(|pk| static_keys.contains(pk))
+        .collect();
+
+    for (ix_index, plan_ix) in plan_instructions.iter().enumerate() {
+        if plan_ix.program_id != pump_program || plan_ix.accounts.len() <= 2 {
+            continue;
+        }
+        let meta_pk = plan_ix.accounts[2].pubkey;
+        let Some(resolved_pk) =
+            resolved_instruction_account_pubkey(message, loaded.as_ref(), ix_index, 2)
+        else {
+            return Err(PumpAmmGlobalConfigAuditError {
+                ix_index,
+                meta_pubkey: meta_pk,
+                resolved_pubkey: Pubkey::default(),
+                static_contains_bad: bad_static.clone(),
+            });
+        };
+        if meta_pk != resolved_pk {
+            return Err(PumpAmmGlobalConfigAuditError {
+                ix_index,
+                meta_pubkey: meta_pk,
+                resolved_pubkey: resolved_pk,
+                static_contains_bad: bad_static.clone(),
+            });
+        }
+        if meta_pk == canonical_gc && !bad_static.is_empty() {
+            return Err(PumpAmmGlobalConfigAuditError {
+                ix_index,
+                meta_pubkey: meta_pk,
+                resolved_pubkey: resolved_pk,
+                static_contains_bad: bad_static,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Exact 33-entry prod on-chain ALT snapshot (mainnet `2J74oVK…`, 2026-08-09).
+pub fn prod_on_chain_alt_fixture() -> LoadedAlt {
+    const ENTRIES: &[&str] = &[
+        "11111111111111111111111111111111",
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+        "ComputeBudget111111111111111111111111111111",
+        "SysvarRent111111111111111111111111111111111",
+        "SysvarC1ock11111111111111111111111111111111",
+        "So11111111111111111111111111111111111111112",
+        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+        "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+        "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        "D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6",
+        "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+        "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw",
+        REMOVED_WRONG_PUMPSWAP_GLOBAL_CONFIG,
+        "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",
+        "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM",
+        "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h",
+        "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+        "HFqU5x63VTqvQss8hp11i4bVmyBkEr7SrFKerWRx5Qdr",
+        "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+        "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+        "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+        "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+        "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+        "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+        PUMPSWAP_AMM_GLOBAL_CONFIG,
+        "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx",
+        PUMPSWAP_AMM_EVENT_AUTHORITY,
+        PUMPFUN_BONDING_EVENT_AUTHORITY,
+    ];
+    LoadedAlt {
+        address: Pubkey::from_str(PROD_ON_CHAIN_ALT_ADDRESS).expect("prod ALT address"),
+        accounts: ENTRIES
+            .iter()
+            .map(|s| Pubkey::from_str(s).expect("prod ALT entry"))
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +839,117 @@ mod tests {
             "signer payer stays static even when present in ALT"
         );
         assert!(analysis.alt_in_table_but_static.contains(&payer));
+    }
+
+    #[test]
+    fn remap_v0_alt_lookup_indices_fixes_tip_filter_drift() {
+        use solana_sdk::instruction::{AccountMeta, Instruction};
+        use solana_system_program;
+
+        let tip = Pubkey::from_str("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5").unwrap();
+        let global_config = Pubkey::from_str(PUMPSWAP_AMM_GLOBAL_CONFIG).unwrap();
+        let alt = prod_on_chain_alt_fixture();
+        assert_eq!(alt.index_of(&tip), Some(21));
+        assert_eq!(alt.index_of(&global_config), Some(29));
+
+        let payer = Pubkey::new_unique();
+        let blockhash = solana_sdk::hash::Hash::new_unique();
+        let mut data = vec![2, 0, 0, 0];
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let ix = Instruction {
+            program_id: solana_system_program::id(),
+            accounts: vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new_readonly(global_config, false),
+                AccountMeta::new(tip, false),
+            ],
+            data,
+        };
+
+        let without_remap = {
+            let alt_account = address_lookup_table_account(&alt, Some(&tip));
+            v0::Message::try_compile(&payer, &[ix.clone()], &[alt_account], blockhash).unwrap()
+        };
+        let mut with_remap = without_remap.clone();
+        remap_v0_alt_lookup_indices_to_on_chain(&mut with_remap, &alt, &tip).unwrap();
+
+        let loaded_before =
+            loaded_addresses_from_alt_lookups(&alt, &VersionedMessage::V0(without_remap.clone()))
+                .unwrap();
+        let resolved_before = resolved_instruction_account_pubkey(
+            &VersionedMessage::V0(without_remap),
+            Some(&loaded_before),
+            0,
+            1,
+        )
+        .unwrap();
+        assert_ne!(
+            resolved_before, global_config,
+            "unremapped filtered compile must drift vs on-chain ALT"
+        );
+
+        let loaded_after =
+            loaded_addresses_from_alt_lookups(&alt, &VersionedMessage::V0(with_remap.clone()))
+                .unwrap();
+        let resolved_after = resolved_instruction_account_pubkey(
+            &VersionedMessage::V0(with_remap),
+            Some(&loaded_after),
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved_after, global_config,
+            "remapped compile must resolve global_config against on-chain ALT"
+        );
+    }
+
+    #[test]
+    fn compile_v0_with_tip_filter_resolves_globals_against_on_chain_alt() {
+        use solana_sdk::instruction::{AccountMeta, Instruction};
+        use solana_system_program;
+
+        let alt = prod_on_chain_alt_fixture();
+        let tip = Pubkey::from_str("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5").unwrap();
+        let global_config = Pubkey::from_str(PUMPSWAP_AMM_GLOBAL_CONFIG).unwrap();
+        let payer = Pubkey::new_unique();
+        let blockhash = solana_sdk::hash::Hash::new_unique();
+        let mut data = vec![2, 0, 0, 0];
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let ix = Instruction {
+            program_id: solana_system_program::id(),
+            accounts: vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new_readonly(global_config, false),
+                AccountMeta::new(tip, false),
+            ],
+            data,
+        };
+        let message = compile_v0_versioned_message(
+            &payer,
+            std::slice::from_ref(&ix),
+            Some(&alt),
+            Some(&tip),
+            blockhash,
+        )
+        .expect("compile with remap");
+        let loaded = loaded_addresses_from_alt_lookups(&alt, &message).unwrap();
+        let resolved = resolved_instruction_account_pubkey(&message, Some(&loaded), 0, 1).unwrap();
+        assert_eq!(resolved, global_config);
+    }
+
+    #[test]
+    fn prod_on_chain_alt_fixture_layout() {
+        let alt = prod_on_chain_alt_fixture();
+        assert_eq!(alt.accounts.len(), 33);
+        assert_eq!(
+            alt.accounts[17].to_string(),
+            REMOVED_WRONG_PUMPSWAP_GLOBAL_CONFIG
+        );
+        assert_eq!(alt.accounts[29].to_string(), PUMPSWAP_AMM_GLOBAL_CONFIG);
+        assert!(!alt
+            .accounts
+            .iter()
+            .any(|p| p.to_string() == PUMP_AMM_WRONG_LEGACY_GLOBAL_CONFIG));
     }
 }

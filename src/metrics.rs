@@ -4937,6 +4937,14 @@ pub fn inc_pump_amm_event_authority_normalized_total() {
     PUMP_AMM_EVENT_AUTHORITY_NORMALIZED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+/// PumpSwap compiled v0 message: ix meta #2 `global_config` ≠ resolved on-chain ALT pubkey.
+pub static PUMP_AMM_COMPILE_GLOBAL_CONFIG_RESOLVE_MISMATCH_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub fn inc_pump_amm_compile_global_config_resolve_mismatch_total() {
+    PUMP_AMM_COMPILE_GLOBAL_CONFIG_RESOLVE_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArbPoolAccountsBackfillSource {
     LiveCache,
