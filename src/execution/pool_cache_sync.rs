@@ -28,6 +28,7 @@ use crate::ipc::{
     PoolCacheUpdate, PoolCacheUpdateType, NATIVE_SOL_MINT,
     POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY,
     POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY,
     POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY,
     POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY,
     POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY,
@@ -273,6 +274,9 @@ fn build_minimal_pool_state_with_reserves(
                 .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY))
                 .and_then(|s| s.parse::<u16>().ok())
                 .unwrap_or(0);
+            let has_bitmap_extension = meta
+                .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY))
+                .and_then(|s| s.parse::<bool>().ok());
 
             let (token_x_mint, token_y_mint, reserve_x_balance, reserve_y_balance) = meta
                 .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY))
@@ -304,6 +308,7 @@ fn build_minimal_pool_state_with_reserves(
                 bin_step,
                 reserve_x_balance: Some(reserve_x_balance),
                 reserve_y_balance: Some(reserve_y_balance),
+                has_bitmap_extension,
             })
         }
         "meteora_cpmm" => {
@@ -650,6 +655,14 @@ fn apply_pool_cache_update_outcome_inner(
                             {
                                 new_m.bin_step = ex.bin_step;
                             }
+                            if um
+                                .and_then(|m| {
+                                    m.get(POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY)
+                                })
+                                .is_none()
+                            {
+                                new_m.has_bitmap_extension = ex.has_bitmap_extension;
+                            }
                         }
                     }
                 }
@@ -711,6 +724,10 @@ fn apply_pool_cache_update_outcome_inner(
                     cache.merge_meteora_dlmm_pool_readiness(
                         pool_addr,
                         update.effective_dex_readiness(),
+                    );
+                    cache.merge_meteora_dlmm_bitmap_extension_from_metadata(
+                        &pool_addr,
+                        update.metadata.as_ref(),
                     );
                 }
                 // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
@@ -1137,6 +1154,14 @@ fn apply_pool_cache_update_outcome_inner(
                             {
                                 new_m.bin_step = ex.bin_step;
                             }
+                            if um
+                                .and_then(|m| {
+                                    m.get(POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY)
+                                })
+                                .is_none()
+                            {
+                                new_m.has_bitmap_extension = ex.has_bitmap_extension;
+                            }
                         }
                     }
                 }
@@ -1192,6 +1217,10 @@ fn apply_pool_cache_update_outcome_inner(
                 }
                 if update.dex == "meteora_dlmm" {
                     cache.merge_meteora_dlmm_pool_readiness(addr, update.effective_dex_readiness());
+                    cache.merge_meteora_dlmm_bitmap_extension_from_metadata(
+                        &addr,
+                        update.metadata.as_ref(),
+                    );
                 }
                 // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
                 apply_decimals_from_metadata(cache, update);

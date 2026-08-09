@@ -31,6 +31,7 @@ use crate::metrics::{
     record_market_data_pool_mint_map_to_devwallet_ms, MarketDataLatencySegment,
 };
 use crate::nats::jetstream::pool_subject;
+use crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use crate::solana::dex_parser::DexType;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
@@ -1360,6 +1361,33 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
     else {
         return;
     };
+
+    if MeteoraDlmmSwapBuilder::geyser_account_data_looks_like_meteora_bitmap_extension(
+        owner,
+        account_data,
+    ) {
+        if let Some(lb_pair) = MeteoraDlmmSwapBuilder::parse_bitmap_extension_lb_pair(account_data)
+        {
+            host.live_pool_cache()
+                .set_meteora_dlmm_has_bitmap_extension(&lb_pair, true);
+            if host.is_hot_pool(&lb_pair) {
+                if let Some(balance_update) =
+                    md_sidefx_build_balance_updated_from_cache(host, run_id, &lb_pair, *slot)
+                {
+                    let subject = pool_subject(&lb_pair.to_string());
+                    sidefx_host_enqueue_jetstream(
+                        host,
+                        subject,
+                        &balance_update,
+                        "Meteora DLMM bitmap extension observed PoolCacheUpdate",
+                        false,
+                    );
+                }
+            }
+        }
+        return;
+    }
+
     if let Some(mut cached_state) = parse_pool_account(owner, account_data) {
         let prev_state = host.live_pool_cache().get(pool_pubkey);
         let prev_meteora_meta = prev_state.as_ref().and_then(|s| {

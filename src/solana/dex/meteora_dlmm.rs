@@ -969,6 +969,22 @@ impl Dex for MeteoraDlmm {
             );
         }
 
+        let has_bitmap_extension = self
+            .extra_data
+            .get(crate::solana::dex::meteora_swap_builder::METEORA_HAS_BITMAP_EXTENSION_KEY)
+            .and_then(|v| v.parse::<bool>().ok())
+            .or_else(|| {
+                self.live_pool_cache.as_ref().and_then(|cache| {
+                    cache.get(&pool_addr).and_then(|state| {
+                        if let CachedPoolState::Meteora(m) = state {
+                            m.has_bitmap_extension
+                        } else {
+                            None
+                        }
+                    })
+                })
+            });
+
         let ix = swap_builder.build_swap_with_bins_sync_coverage(
             &pool_addr,
             &pool.reserve_x,
@@ -986,6 +1002,7 @@ impl Dex for MeteoraDlmm {
             pool.active_id,
             pool.bin_step,
             bin_array_coverage,
+            has_bitmap_extension,
         )?;
 
         Ok(vec![ix])

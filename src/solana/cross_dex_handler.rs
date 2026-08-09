@@ -35,6 +35,7 @@ use crate::arbitrage::pool_quote::{
 use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache};
 use crate::ipc::TradeIntent;
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
+use crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::pumpfun_amm::{
     pump_amm_buy_program_ix_index, pump_amm_resolve_sell_pre_fee_meta_1_for_build,
@@ -1364,7 +1365,7 @@ impl CrossDexHandler {
         }
 
         // Build buy instructions
-        let buy_swap_instructions = if buy_dex == "pump_amm" {
+        let mut buy_swap_instructions = if buy_dex == "pump_amm" {
             self.build_pump_amm_arb_swap_ixs(
                 SOL_MINT,
                 token_mint,
@@ -1419,6 +1420,27 @@ impl CrossDexHandler {
                 .build_swap_ix_async(SOL_MINT, token_mint, buy_amount_in, buy_min_out)
                 .await?
         };
+
+        if buy_dex == "meteora_dlmm" {
+            if let Ok(pool_pk) = Pubkey::from_str(&buy_pool) {
+                let has_bitmap_extension = self.pool_cache.as_ref().and_then(|cache| {
+                    cache.get(&pool_pk).and_then(|state| {
+                        if let CachedPoolState::Meteora(m) = state {
+                            m.has_bitmap_extension
+                        } else {
+                            None
+                        }
+                    })
+                });
+                for ix in &mut buy_swap_instructions {
+                    MeteoraDlmmSwapBuilder::patch_swap_ix_bitmap_extension(
+                        ix,
+                        &pool_pk,
+                        has_bitmap_extension,
+                    )?;
+                }
+            }
+        }
 
         // Build sell instructions
         let sell_amount_in = buy_quote.amount_out;
@@ -1563,7 +1585,7 @@ mod tests {
     };
     use crate::solana::address_lookup_table::{
         analyze_versioned_message_alt_usage, compile_v0_versioned_message, get_common_accounts,
-        AltCompileAnalysis, LoadedAlt,
+        versioned_message_duplicate_static_keys, AltCompileAnalysis, LoadedAlt,
     };
     use crate::solana::compute_budget_helper;
     use crate::solana::dex::pumpfun_amm::{
@@ -1653,6 +1675,7 @@ mod tests {
                 bin_step: 10,
                 reserve_x_balance: Some(50_000_000_000),
                 reserve_y_balance: Some(1_000_000_000_000),
+                has_bitmap_extension: Some(true),
             }),
             100,
         );
@@ -1992,6 +2015,39 @@ mod tests {
             analysis.static_key_count
         );
         let _ = tx;
+    }
+
+    #[tokio::test]
+    async fn cross_dex_meteora_pump_bundle_has_no_duplicate_static_keys() {
+        let (plan, wallet, _) = build_prod_pattern_cross_dex_plan(true).await;
+        let (tx, _, _, _) = compile_cross_dex_bundle_tx_realistic_alt(&wallet, &plan);
+        let dupes = versioned_message_duplicate_static_keys(&tx.message);
+        assert!(
+            dupes.is_empty(),
+            "compiled v0 message must not contain duplicate static keys (AccountLoadedTwice): {:?}",
+            dupes.iter().map(|p| p.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_dex_meteora_buy_uses_bitmap_extension_pda_when_cache_has_extension() {
+        use crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
+
+        let (plan, _, _) = build_prod_pattern_cross_dex_plan(true).await;
+        let buy_ix = plan
+            .buy_instructions
+            .first()
+            .expect("meteora buy ix present");
+        let pool = Pubkey::from_str("2TD1fMPg2w7Hjt8bASSdxi92YFNQFgvdznqVApe3NGpn").unwrap();
+        let expected =
+            MeteoraDlmmSwapBuilder::derive_bitmap_extension_pda(&pool).expect("derive bitmap pda");
+        assert_eq!(
+            buy_ix.accounts[1].pubkey, expected,
+            "pool with has_bitmap_extension=true must use bitmap-extension PDA at account index 1"
+        );
+        let program_id =
+            Pubkey::from_str(crate::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM).unwrap();
+        assert_ne!(buy_ix.accounts[1].pubkey, program_id);
     }
 
     #[tokio::test]

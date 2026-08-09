@@ -16710,6 +16710,7 @@ mod execution_engine_tests {
             bin_step: 10,
             reserve_x_balance: Some(100),
             reserve_y_balance: Some(200),
+            has_bitmap_extension: None,
         };
         cache.upsert(pool, CachedPoolState::Meteora(initial.clone()), 0);
         cache.merge_meteora_dlmm_pool_readiness(pool, DexPoolReadiness::Partial);

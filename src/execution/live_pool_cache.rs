@@ -192,6 +192,9 @@ pub struct MeteoraState {
     /// Vault reserves
     pub reserve_x_balance: Option<u64>,
     pub reserve_y_balance: Option<u64>,
+    /// Geyser-tracked: pool has initialized `BinArrayBitmapExtension` PDA on-chain.
+    /// `None` = unknown (safe default: use program_id placeholder in swap builder).
+    pub has_bitmap_extension: Option<bool>,
 }
 
 impl From<DlmmPool> for MeteoraState {
@@ -205,6 +208,7 @@ impl From<DlmmPool> for MeteoraState {
             bin_step: p.bin_step,
             reserve_x_balance: None,
             reserve_y_balance: None,
+            has_bitmap_extension: None,
         }
     }
 }
@@ -1140,6 +1144,36 @@ impl LivePoolCache {
                             .insert(*pool, pk);
                     }
                 }
+            }
+        }
+    }
+
+    /// Geyser: mark Meteora DLMM pool as having an on-chain `BinArrayBitmapExtension` account.
+    pub fn set_meteora_dlmm_has_bitmap_extension(&self, pool: &Pubkey, has_extension: bool) {
+        if let Some(mut entry) = self.pools.get_mut(pool) {
+            if let CachedPoolState::Meteora(ref mut s) = entry.value_mut().state {
+                s.has_bitmap_extension = Some(has_extension);
+            }
+        }
+    }
+
+    /// JetStream / Geyser metadata: merge bitmap-extension existence into [`MeteoraState`].
+    pub fn merge_meteora_dlmm_bitmap_extension_from_metadata(
+        &self,
+        pool: &Pubkey,
+        meta: Option<&std::collections::HashMap<String, String>>,
+    ) {
+        use crate::ipc::POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY;
+        let Some(m) = meta else {
+            return;
+        };
+        let Some(v) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY) else {
+            return;
+        };
+        let has_extension = v == "true";
+        if let Some(mut entry) = self.pools.get_mut(pool) {
+            if let CachedPoolState::Meteora(ref mut s) = entry.value_mut().state {
+                s.has_bitmap_extension = Some(has_extension);
             }
         }
     }
@@ -2773,6 +2807,7 @@ mod tests {
                 bin_step: 20,
                 reserve_x_balance: Some(5_000_000_000),
                 reserve_y_balance: Some(10_000_000_000),
+                has_bitmap_extension: None,
             }),
             100,
         );
@@ -4307,6 +4342,7 @@ mod tests {
             bin_step,
             reserve_x_balance,
             reserve_y_balance,
+            has_bitmap_extension: None,
         }
     }
 

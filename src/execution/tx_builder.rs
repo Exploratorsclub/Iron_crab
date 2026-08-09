@@ -2446,6 +2446,7 @@ mod tests {
             bin_step: 0,
             reserve_x_balance: Some(1),
             reserve_y_balance: Some(2),
+            has_bitmap_extension: None,
         };
         assert!(super::meteora_dlmm_cache_state_injectable(&s));
     }
@@ -2461,6 +2462,7 @@ mod tests {
             bin_step: 10,
             reserve_x_balance: Some(1),
             reserve_y_balance: Some(2),
+            has_bitmap_extension: None,
         };
         assert!(!super::meteora_dlmm_cache_state_injectable(&s));
     }
