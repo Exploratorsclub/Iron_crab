@@ -185,10 +185,16 @@ pub const PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS: usize = 23;
 pub fn pump_amm_buy_program_ix_index(account_count: usize) -> Option<usize> {
     match account_count {
         PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS => Some(PUMPFUN_AMM_BUY_PROGRAM_IX),
-        PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS => Some(PUMPFUN_AMM_BUY_PROGRAM_IX_V2),
+        PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS
+        | PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
+        | PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS => Some(PUMPFUN_AMM_BUY_PROGRAM_IX_V2),
         _ => None,
     }
 }
+
+/// FeeConfig / FeeProgram meta indices for extended cashback `buy_exact_quote_in` (24/26 accounts).
+pub const PUMPFUN_AMM_BUY_EXT_FEE_CONFIG_IX: usize = 19;
+pub const PUMPFUN_AMM_BUY_EXT_FEE_PROGRAM_IX: usize = 20;
 
 /// Trailing-meta writability for tier-26 cashback `sell` (mainnet ref `3wNpdTky…`, pool `GrgDaBg4…`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7135,7 +7141,37 @@ impl PumpFunAmmDex {
                     cold_path_prefer_derived_on_mismatch,
                 )?;
                 metas
-            } else if sell_requires_pre_fee_metas || sell_requires_cashback_remaining {
+            } else if sell_requires_cashback_remaining {
+                let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
+                else {
+                    return Err(anyhow!(
+                        "pump_amm BUY: extended layout required but sell_cashback_third_meta missing (Geyser/LivePoolCache observation required)"
+                    ));
+                };
+                let mut metas = buy_base;
+                metas.push(AccountMeta::new_readonly(program_id, false)); // 16
+                metas.push(AccountMeta::new(global_volume_accumulator, false)); // 17
+                metas.push(AccountMeta::new(coin_creator_vault_ata, false)); // 18
+                metas.push(AccountMeta::new_readonly(buy_fee_config, false)); // 19
+                metas.push(AccountMeta::new_readonly(buy_fee_program, false)); // 20
+                Self::push_pump_amm_sell_extended_trailing_metas(
+                    &mut metas,
+                    pool_market,
+                    base_mint,
+                    user,
+                    quote_mint,
+                    quote_tp,
+                    third,
+                    false,
+                    sell_requires_fee_tail,
+                    sell_extended_fee_tail_0,
+                    sell_extended_fee_tail_1,
+                    sell_extended_tail_0,
+                    sell_extended_tail_1,
+                    cold_path_prefer_derived_on_mismatch,
+                )?;
+                metas
+            } else if sell_requires_pre_fee_metas {
                 return Err(anyhow!(
                     "pump_amm BUY: partial extended layout flags (pre_fee={sell_requires_pre_fee_metas}, cashback={sell_requires_cashback_remaining}) — need authoritative v2 layout from LivePoolCache"
                 ));
@@ -9225,6 +9261,185 @@ mod tests {
         assert_eq!(
             ixs[0].accounts[PUMPFUN_AMM_SELL_PRE_FEE_0_IX_V2].pubkey,
             singleton_gva
+        );
+    }
+
+    /// Prod regression: cashback-only extended `buy_exact_quote_in` (pre_fee=false, cashback=true, 26 accounts).
+    #[test]
+    fn pump_amm_build_swap_26_account_buy_cashback_extended_pre_fee_false() {
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let third = Pubkey::new_unique();
+        let tail0 = Pubkey::new_unique();
+        let tail1 = Pubkey::new_unique();
+        let fee0 = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap();
+        let fee1 = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap();
+        let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).unwrap();
+
+        let v14 = vec![
+            pool_market,
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            Pubkey::from_str(WSOL_MINT).unwrap(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            fee0,
+            fee1,
+        ];
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            WSOL_MINT,
+            &base_mint.to_string(),
+            1,
+            1,
+            user,
+            &v14,
+            None,
+            true,
+            Some(third),
+            false,
+            None,
+            Some(tail0),
+            Some(tail1),
+            Some(fee0),
+            Some(fee1),
+            true,
+            false,
+        )
+        .expect("26-account BUY cashback extended");
+
+        assert_eq!(
+            ixs[0].accounts.len(),
+            PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
+        );
+        let program_ix = pump_amm_buy_program_ix_index(ixs[0].accounts.len()).expect("program ix");
+        assert_eq!(ixs[0].accounts[program_ix].pubkey, program_id);
+        assert_eq!(
+            ixs[0].accounts[PUMPFUN_AMM_BUY_EXT_FEE_CONFIG_IX].pubkey,
+            fee0
+        );
+        assert_eq!(
+            ixs[0].accounts[PUMPFUN_AMM_BUY_EXT_FEE_PROGRAM_IX].pubkey,
+            fee1
+        );
+    }
+
+    /// Cashback-only extended `buy_exact_quote_in` without fee tail (24 accounts).
+    #[test]
+    fn pump_amm_build_swap_24_account_buy_cashback_extended_no_fee_tail() {
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let third = Pubkey::new_unique();
+        let tail0 = Pubkey::new_unique();
+        let tail1 = Pubkey::new_unique();
+        let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).unwrap();
+
+        let v14 = vec![
+            pool_market,
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            Pubkey::from_str(WSOL_MINT).unwrap(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+        ];
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            WSOL_MINT,
+            &base_mint.to_string(),
+            1,
+            1,
+            user,
+            &v14,
+            None,
+            true,
+            Some(third),
+            false,
+            None,
+            Some(tail0),
+            Some(tail1),
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("24-account BUY cashback extended");
+
+        assert_eq!(
+            ixs[0].accounts.len(),
+            PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS
+        );
+        let program_ix = pump_amm_buy_program_ix_index(ixs[0].accounts.len()).expect("program ix");
+        assert_eq!(ixs[0].accounts[program_ix].pubkey, program_id);
+    }
+
+    /// Missing third_meta must surface layout-not-ready error, not partial-flag error.
+    #[test]
+    fn pump_amm_build_swap_buy_cashback_extended_errors_without_third_meta() {
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let v14 = vec![
+            pool_market,
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            Pubkey::from_str(WSOL_MINT).unwrap(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+        ];
+
+        let err = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            WSOL_MINT,
+            &base_mint.to_string(),
+            1,
+            1,
+            user,
+            &v14,
+            None,
+            true,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect_err("must fail without third_meta");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sell_cashback_third_meta missing"),
+            "expected third_meta missing error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("partial extended layout flags"),
+            "must not surface misleading partial-flag error: {msg}"
         );
     }
 

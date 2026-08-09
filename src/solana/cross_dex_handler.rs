@@ -39,7 +39,9 @@ use crate::solana::dex::orca::Orca;
 use crate::solana::dex::pumpfun_amm::{
     pump_amm_buy_program_ix_index, pump_amm_resolve_sell_pre_fee_meta_1_for_build,
     pump_amm_sell_ix_uses_global_fee_at, pump_amm_singleton_global_volume_accumulator_pub,
-    PumpFunAmmDex, PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
+    PumpFunAmmDex, PUMPFUN_AMM_BUY_EXT_FEE_CONFIG_IX, PUMPFUN_AMM_BUY_EXT_FEE_PROGRAM_IX,
+    PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
+    PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
     PUMPFUN_AMM_SELL_FEE_CONFIG_IX_V2, PUMPFUN_AMM_SELL_FEE_PROGRAM_IX_V2,
 };
 use crate::solana::dex::raydium::Raydium;
@@ -432,6 +434,17 @@ impl CrossDexHandler {
                 pool_str
             ));
         }
+        if is_buy_leg
+            && sell_requires_cashback_remaining
+            && !sell_requires_pre_fee_metas
+            && !sell_layout_ready
+            && sell_cashback_third_meta.is_none()
+        {
+            return Err(anyhow!(
+                "pump_amm BUY: extended layout required for pool {} but LivePoolCache layout not ready (missing third_meta/tails)",
+                pool_str
+            ));
+        }
 
         let global_volume_accumulator = pool_accounts
             .get(11)
@@ -479,7 +492,7 @@ impl CrossDexHandler {
             sell_extended_tail_1,
             sell_extended_fee_tail_0,
             sell_extended_fee_tail_1,
-            sell_requires_fee_tail && is_sell_leg,
+            sell_requires_fee_tail,
             false,
         )
         .map_err(|e| {
@@ -505,6 +518,13 @@ impl CrossDexHandler {
                 (
                     PUMPFUN_AMM_SELL_FEE_CONFIG_IX_V2,
                     PUMPFUN_AMM_SELL_FEE_PROGRAM_IX_V2,
+                )
+            } else if account_count == PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS
+                || account_count == PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
+            {
+                (
+                    PUMPFUN_AMM_BUY_EXT_FEE_CONFIG_IX,
+                    PUMPFUN_AMM_BUY_EXT_FEE_PROGRAM_IX,
                 )
             } else {
                 (0, 0)
@@ -1547,7 +1567,8 @@ mod tests {
     };
     use crate::solana::compute_budget_helper;
     use crate::solana::dex::pumpfun_amm::{
-        PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR, PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
+        pump_amm_buy_program_ix_index, PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR,
+        PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR, PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
         PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
     };
     use crate::solana::dex::router::Router;
@@ -1983,6 +2004,74 @@ mod tests {
             size_without < size_with,
             "ATA skip should reduce size: with={size_with} without={size_without}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cross_dex_handler_pump_amm_buy_extended_cashback_builds() {
+        let token_mint = Pubkey::new_unique();
+        let buy_pool = Pubkey::new_unique();
+        let cache = Arc::new(LivePoolCache::new());
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let buy_pool_accounts = pump_amm_v14_pool_accounts(buy_pool, token_mint);
+        cache.upsert(
+            buy_pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: token_mint,
+                quote_mint: sol_mint,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000_000_000_000),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: buy_pool_accounts,
+                creator: None,
+            }),
+            100,
+        );
+        let third = Pubkey::new_unique();
+        let tail_0 = Pubkey::new_unique();
+        let tail_1 = Pubkey::new_unique();
+        let fee_0 = Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR).unwrap();
+        let fee_1 = Pubkey::from_str(PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR).unwrap();
+        cache.merge_pump_amm_sell_extended_layout(
+            &buy_pool,
+            true,
+            Some(third),
+            Some(tail_0),
+            Some(tail_1),
+            Some(fee_0),
+            Some(fee_1),
+            false,
+            false,
+            None,
+        );
+        cache.set_pump_amm_sell_layout_ready(&buy_pool, true);
+
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let wallet = Pubkey::new_unique();
+        let mut handler = CrossDexHandler::new(rpc, Some(wallet))
+            .with_rpc_url("http://127.0.0.1:0".to_string())
+            .with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes");
+
+        let ixs = handler
+            .build_pump_amm_arb_swap_ixs(
+                SOL_MINT,
+                &token_mint.to_string(),
+                100_000_000,
+                1,
+                &buy_pool.to_string(),
+                None,
+                None,
+                true,
+            )
+            .expect("pump_amm BUY leg must build with extended cashback layout");
+
+        assert_eq!(
+            ixs[0].accounts.len(),
+            PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
+            "cashback-only BUY must use 26-account extended layout"
+        );
+        assert!(pump_amm_buy_program_ix_index(ixs[0].accounts.len()).is_some());
     }
 
     #[tokio::test]
