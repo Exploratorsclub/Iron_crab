@@ -271,7 +271,10 @@ impl CrossDexHandler {
         info!("Initialized Meteora CPMM connector (for IX building only)");
 
         // Initialize Orca Whirlpool - for build_swap_ix() only
-        let orca = Orca::new_with_cache(Arc::clone(&self.rpc), None, self.pool_cache.clone()); // Hot Path default (cache miss → static reserves, no RPC)
+        // Arb Cross-DEX = Hot Path: derive tick arrays from LivePoolCache, no RPC validation (I-7).
+        // Parity with tx_builder: set_skip_tick_array_rpc_validation(!allow_rpc_fallback) where allow_rpc=false.
+        let orca = Orca::new_with_cache(Arc::clone(&self.rpc), None, self.pool_cache.clone());
+        orca.set_skip_tick_array_rpc_validation(true);
         if let Some(pk) = self.wallet_pubkey {
             orca.set_user_authority(pk);
         }
@@ -1555,7 +1558,7 @@ impl CrossDexHandler {
 mod tests {
     use super::*;
     use crate::execution::live_pool_cache::{
-        CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState,
+        CachedPoolState, LivePoolCache, MeteoraState, OrcaWhirlpoolState, PumpAmmState,
     };
     use crate::ipc::{
         ExplicitAmount, IntentOrigin, IntentTier, RecordHeader, TradeIntent, TradeResources,
@@ -1566,6 +1569,7 @@ mod tests {
         AltCompileAnalysis, LoadedAlt,
     };
     use crate::solana::compute_budget_helper;
+    use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
     use crate::solana::dex::pumpfun_amm::{
         pump_amm_buy_program_ix_index, PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR,
         PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR, PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
@@ -2108,5 +2112,149 @@ mod tests {
     #[test]
     fn test_is_cross_dex_arb_intent() {
         // Would need mock TradeIntent for proper testing
+    }
+
+    fn seed_orca_meteora_cross_dex_cache(
+        cache: &LivePoolCache,
+        buy_pool: Pubkey,
+        sell_pool: Pubkey,
+        token_mint: Pubkey,
+    ) {
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        cache.upsert(
+            buy_pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: token_mint,
+                token_mint_b: sol_mint,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: -624,
+                sqrt_price: 1u128 << 64,
+                liquidity: 5_000_000_000,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 8,
+                vault_a_balance: Some(1_000_000_000_000),
+                vault_b_balance: Some(50_000_000_000),
+                token_a_program: None,
+                token_b_program: None,
+            }),
+            100,
+        );
+        cache.upsert(
+            sell_pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: token_mint,
+                token_y_mint: sol_mint,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: -281,
+                bin_step: 10,
+                reserve_x_balance: Some(1_000_000_000_000),
+                reserve_y_balance: Some(50_000_000_000),
+            }),
+            100,
+        );
+    }
+
+    fn orca_meteora_cross_dex_intent(
+        token_mint: &Pubkey,
+        buy_pool: &Pubkey,
+        sell_pool: &Pubkey,
+    ) -> TradeIntent {
+        let mut metadata = HashMap::new();
+        metadata.insert("buy_dex".to_string(), "orca".to_string());
+        metadata.insert("sell_dex".to_string(), "meteora_dlmm".to_string());
+        metadata.insert("buy_pool".to_string(), buy_pool.to_string());
+        metadata.insert("sell_pool".to_string(), sell_pool.to_string());
+        metadata.insert("spread_bps".to_string(), "50".to_string());
+        metadata.insert(
+            "estimated_profit_lamports".to_string(),
+            "500000".to_string(),
+        );
+
+        TradeIntent {
+            header: RecordHeader {
+                schema_version: 1,
+                ts_unix_ms: 1,
+                component: "test".to_string(),
+                build: "test".to_string(),
+                run_id: "run".to_string(),
+            },
+            intent_id: "arb-orca-meteora".to_string(),
+            source: "arb-strategy".to_string(),
+            tier: IntentTier::Arb,
+            origin_type: IntentOrigin::StrategyA,
+            deadline_slot: None,
+            ttl_ms: Some(30_000),
+            required_capital: ExplicitAmount {
+                raw: 100_000_000,
+                decimals: 9,
+                ui: None,
+            },
+            resources: TradeResources {
+                input_mint: SOL_MINT.to_string(),
+                output_mint: token_mint.to_string(),
+                pools: vec![buy_pool.to_string(), sell_pool.to_string()],
+                accounts: vec![],
+                token_program: Some(spl_token::id().to_string()),
+            },
+            expected_roi_bps: 50,
+            max_slippage_bps: 500,
+            side: TradeSide::Buy,
+            regime: TradingRegime::NotApplicable,
+            trigger_event_id: None,
+            require_bundle: Some(true),
+            bundle_tip_lamports: Some(10_000),
+            hint_compute_units: None,
+            hint_priority_fee_micro_lamports: None,
+            hint_urgency: None,
+            metadata,
+            execution: None,
+            swap_path: None,
+        }
+    }
+
+    /// Prod pattern `orca → meteora_dlmm`: Orca buy leg must build without RPC tick-array validation.
+    /// Without `set_skip_tick_array_rpc_validation(true)` in `init_dexes`, dummy RPC returns missing
+    /// tick arrays → `orca tick array accounts missing` (Pre-Sim UNSUPPORTED_INTENT).
+    #[tokio::test]
+    async fn cross_dex_orca_buy_leg_builds_without_tick_array_rpc_validation() {
+        let wallet = Keypair::new();
+        let token_mint = Pubkey::new_unique();
+        let buy_pool = Pubkey::new_unique();
+        let sell_pool = Pubkey::new_unique();
+
+        let cache = Arc::new(LivePoolCache::new());
+        seed_orca_meteora_cross_dex_cache(&cache, buy_pool, sell_pool, token_mint);
+
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mut handler = CrossDexHandler::new(rpc, Some(wallet.pubkey())).with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes");
+
+        let intent = orca_meteora_cross_dex_intent(&token_mint, &buy_pool, &sell_pool);
+        let validation = cross_dex_validation_fixture(&token_mint);
+        let plan = handler
+            .build_swap_plan(
+                &intent,
+                &validation,
+                CrossDexPlanOptions {
+                    skip_token_ata_create: true,
+                },
+            )
+            .await
+            .expect("orca buy leg must not fail tick-array RPC validation in hot path");
+
+        assert_eq!(plan.buy_dex, "orca");
+        assert_eq!(plan.sell_dex, "meteora_dlmm");
+        let buy_ix = plan
+            .buy_instructions
+            .first()
+            .expect("orca buy swap ix present");
+        assert_eq!(buy_ix.program_id.to_string(), ORCA_WHIRLPOOL_PROGRAM);
+        assert!(
+            buy_ix.accounts.iter().any(|a| a.pubkey == buy_pool),
+            "orca swap ix must reference buy whirlpool from cache injection"
+        );
     }
 }
