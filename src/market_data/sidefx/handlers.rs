@@ -31,6 +31,7 @@ use crate::metrics::{
     record_market_data_pool_mint_map_to_devwallet_ms, MarketDataLatencySegment,
 };
 use crate::nats::jetstream::pool_subject;
+use crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use crate::solana::dex_parser::DexType;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
@@ -130,7 +131,11 @@ fn md_sidefx_build_balance_updated_from_cache(
                 .merge_orca_pool_readiness(*pool_pubkey, readiness);
         }
         CachedPoolState::Meteora(s) => {
-            balance_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(s));
+            balance_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(
+                s,
+                host.live_pool_cache()
+                    .meteora_dlmm_has_bitmap_extension(pool_pubkey),
+            ));
             let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
             balance_update.set_dex_readiness_in_metadata(readiness);
             host.live_pool_cache()
@@ -1360,6 +1365,33 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
     else {
         return;
     };
+
+    if MeteoraDlmmSwapBuilder::geyser_account_data_looks_like_meteora_bitmap_extension(
+        owner,
+        account_data,
+    ) {
+        if let Some(lb_pair) = MeteoraDlmmSwapBuilder::parse_bitmap_extension_lb_pair(account_data)
+        {
+            host.live_pool_cache()
+                .set_meteora_dlmm_has_bitmap_extension(&lb_pair, true);
+            if host.is_hot_pool(&lb_pair) {
+                if let Some(balance_update) =
+                    md_sidefx_build_balance_updated_from_cache(host, run_id, &lb_pair, *slot)
+                {
+                    let subject = pool_subject(&lb_pair.to_string());
+                    sidefx_host_enqueue_jetstream(
+                        host,
+                        subject,
+                        &balance_update,
+                        "Meteora DLMM bitmap extension observed PoolCacheUpdate",
+                        false,
+                    );
+                }
+            }
+        }
+        return;
+    }
+
     if let Some(mut cached_state) = parse_pool_account(owner, account_data) {
         let prev_state = host.live_pool_cache().get(pool_pubkey);
         let prev_meteora_meta = prev_state.as_ref().and_then(|s| {
@@ -1724,7 +1756,11 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                     pool_update.set_dex_readiness_in_metadata(readiness);
                 }
                 CachedPoolState::Meteora(s) => {
-                    pool_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(s));
+                    pool_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(
+                        s,
+                        host.live_pool_cache()
+                            .meteora_dlmm_has_bitmap_extension(pool_pubkey),
+                    ));
                     let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
                     pool_update.set_dex_readiness_in_metadata(readiness);
                 }
@@ -1910,7 +1946,11 @@ pub fn md_sidefx_process_vault_balance_tick(
                 host.live_pool_cache().get(&vault_view.pool_address)
             {
                 let mut meta = balance_update.metadata.take().unwrap_or_default();
-                for (k, v) in meteora_dlmm_metadata_for_pool_cache_update(s) {
+                for (k, v) in meteora_dlmm_metadata_for_pool_cache_update(
+                    s,
+                    host.live_pool_cache()
+                        .meteora_dlmm_has_bitmap_extension(&vault_view.pool_address),
+                ) {
                     meta.insert(k, v);
                 }
                 balance_update.metadata = Some(meta);

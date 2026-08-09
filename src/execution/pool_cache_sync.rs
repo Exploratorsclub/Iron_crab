@@ -712,6 +712,10 @@ fn apply_pool_cache_update_outcome_inner(
                         pool_addr,
                         update.effective_dex_readiness(),
                     );
+                    cache.merge_meteora_dlmm_bitmap_extension_from_metadata(
+                        &pool_addr,
+                        update.metadata.as_ref(),
+                    );
                 }
                 // P3 #13: Propagate base_decimals and quote_decimals to SLAVE cache
                 apply_decimals_from_metadata(cache, update);
@@ -1192,6 +1196,10 @@ fn apply_pool_cache_update_outcome_inner(
                 }
                 if update.dex == "meteora_dlmm" {
                     cache.merge_meteora_dlmm_pool_readiness(addr, update.effective_dex_readiness());
+                    cache.merge_meteora_dlmm_bitmap_extension_from_metadata(
+                        &addr,
+                        update.metadata.as_ref(),
+                    );
                 }
                 // P3 #13: Apply decimals from metadata when present (e.g. BalanceUpdated with metadata)
                 apply_decimals_from_metadata(cache, update);

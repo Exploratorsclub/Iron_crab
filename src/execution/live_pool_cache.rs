@@ -453,6 +453,10 @@ pub struct LivePoolCache {
     /// Meteora DLMM pool address → explicit [`DexPoolReadiness`] from JetStream / MASTER (Bug #36).
     meteora_dlmm_readiness_by_pool: DashMap<Pubkey, DexPoolReadiness>,
 
+    /// Meteora DLMM pool → Geyser-tracked `BinArrayBitmapExtension` existence.
+    /// Side map (not in [`MeteoraState`]) so Level-5 eval struct literals stay stable.
+    meteora_dlmm_has_bitmap_extension_by_pool: DashMap<Pubkey, bool>,
+
     /// PumpSwap pool-market → extended `sell` layout observed on-chain (Scope 46).
     /// **Not** part of [`PumpAmmState`] so external crates (Level-5 eval) keep stable struct literals.
     /// Monotonic flag: once true, never cleared.
@@ -515,6 +519,7 @@ impl LivePoolCache {
             meteora_cpmm_readiness_by_pool: DashMap::new(),
             orca_readiness_by_pool: DashMap::new(),
             meteora_dlmm_readiness_by_pool: DashMap::new(),
+            meteora_dlmm_has_bitmap_extension_by_pool: DashMap::new(),
             pump_amm_sell_extended_flag_by_market: DashMap::new(),
             pump_amm_sell_extended_third_meta_by_market: DashMap::new(),
             pump_amm_sell_extended_tail_0_by_market: DashMap::new(),
@@ -1141,6 +1146,37 @@ impl LivePoolCache {
                     }
                 }
             }
+        }
+    }
+
+    /// Geyser: mark Meteora DLMM pool as having an on-chain `BinArrayBitmapExtension` account.
+    pub fn set_meteora_dlmm_has_bitmap_extension(&self, pool: &Pubkey, has_extension: bool) {
+        self.meteora_dlmm_has_bitmap_extension_by_pool
+            .insert(*pool, has_extension);
+    }
+
+    /// Geyser / JetStream: whether pool has on-chain bitmap extension (`None` = unknown).
+    pub fn meteora_dlmm_has_bitmap_extension(&self, pool: &Pubkey) -> Option<bool> {
+        self.meteora_dlmm_has_bitmap_extension_by_pool
+            .get(pool)
+            .map(|v| *v)
+    }
+
+    /// JetStream / Geyser metadata: merge bitmap-extension existence into side map.
+    pub fn merge_meteora_dlmm_bitmap_extension_from_metadata(
+        &self,
+        pool: &Pubkey,
+        meta: Option<&std::collections::HashMap<String, String>>,
+    ) {
+        use crate::ipc::POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY;
+        let Some(m) = meta else {
+            return;
+        };
+        let Some(v) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY) else {
+            return;
+        };
+        if let Ok(has_extension) = v.parse::<bool>() {
+            self.set_meteora_dlmm_has_bitmap_extension(pool, has_extension);
         }
     }
 

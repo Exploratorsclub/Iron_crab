@@ -2962,6 +2962,10 @@ pub const POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY: &str = "meteora_dlmm_act
 /// Meteora DLMM: bin step from pool account (decimal string, u16).
 pub const POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY: &str = "meteora_dlmm_bin_step";
 
+/// Meteora DLMM: whether `BinArrayBitmapExtension` PDA exists on-chain (`"true"` / `"false"`).
+pub const POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY: &str =
+    "meteora_dlmm_has_bitmap_extension";
+
 /// Pool cache update type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

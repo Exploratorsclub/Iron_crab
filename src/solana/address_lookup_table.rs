@@ -324,6 +324,24 @@ pub fn analyze_versioned_message_alt_usage(
     }
 }
 
+/// Returns duplicate pubkeys in a v0/legacy message static account key list (`AccountLoadedTwice` risk).
+pub fn versioned_message_duplicate_static_keys(message: &VersionedMessage) -> Vec<Pubkey> {
+    let keys = match message {
+        VersionedMessage::V0(v0) => &v0.account_keys,
+        VersionedMessage::Legacy(legacy) => &legacy.account_keys,
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut dupes = Vec::new();
+    for pk in keys {
+        if !seen.insert(*pk) {
+            dupes.push(*pk);
+        }
+    }
+    dupes.sort();
+    dupes.dedup();
+    dupes
+}
+
 /// Parse common accounts from the constant list.
 pub fn get_common_accounts() -> Vec<Pubkey> {
     COMMON_ACCOUNTS

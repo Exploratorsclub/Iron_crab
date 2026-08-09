@@ -6,13 +6,14 @@ use crate::execution::live_pool_cache::{
 };
 use crate::ipc::{
     DexPoolReadiness, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY,
-    POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY,
-    POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY, POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY,
-    POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY, POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY,
-    POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY,
-    POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY, POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY,
-    POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY,
-    POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY,
+    POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY,
+    POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY,
+    POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY, POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY,
+    POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY, POOL_CACHE_UPDATE_ORCA_TOKEN_A_PROGRAM_KEY,
+    POOL_CACHE_UPDATE_ORCA_TOKEN_B_PROGRAM_KEY, POOL_CACHE_UPDATE_ORCA_WHIRLPOOL_VAULTS_KEY,
 };
 use crate::solana::dex::pumpfun_amm::{
     pump_amm_sell_extended_layout_ready, PumpAmmSellExtendedReadinessParams,
@@ -111,7 +112,10 @@ fn meteora_dlmm_onchain_mints_for_pool_cache_update(s: &MeteoraState) -> String 
 }
 
 /// Meteora DLMM: vault pubkeys + static pool fields for JetStream / SLAVE bootstrap.
-pub fn meteora_dlmm_metadata_for_pool_cache_update(s: &MeteoraState) -> HashMap<String, String> {
+pub fn meteora_dlmm_metadata_for_pool_cache_update(
+    s: &MeteoraState,
+    has_bitmap_extension: Option<bool>,
+) -> HashMap<String, String> {
     let mut meta = HashMap::new();
     meta.insert(
         POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY.to_string(),
@@ -129,6 +133,12 @@ pub fn meteora_dlmm_metadata_for_pool_cache_update(s: &MeteoraState) -> HashMap<
         POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY.to_string(),
         s.bin_step.to_string(),
     );
+    if let Some(has) = has_bitmap_extension {
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY.to_string(),
+            has.to_string(),
+        );
+    }
     meta
 }
 
