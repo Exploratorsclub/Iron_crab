@@ -38,7 +38,8 @@ use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::pumpfun_amm::{
-    pump_amm_buy_program_ix_index, pump_amm_resolve_sell_pre_fee_meta_1_for_build,
+    pump_amm_buy_program_ix_index, pump_amm_canonical_global_config,
+    pump_amm_normalize_v14_pool_accounts, pump_amm_resolve_sell_pre_fee_meta_1_for_build,
     pump_amm_sell_ix_uses_global_fee_at, pump_amm_singleton_global_volume_accumulator_pub,
     PumpFunAmmDex, PUMPFUN_AMM_BUY_EXT_FEE_CONFIG_IX, PUMPFUN_AMM_BUY_EXT_FEE_PROGRAM_IX,
     PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
@@ -346,6 +347,7 @@ impl CrossDexHandler {
                         parsed[0]
                     ));
                 }
+                pump_amm_normalize_v14_pool_accounts(&pool_pk, &mut parsed);
                 return Ok(parsed);
             }
         }
@@ -353,7 +355,9 @@ impl CrossDexHandler {
         if let Some(ref cache) = self.pool_cache {
             if let Some(CachedPoolState::PumpAmm(amm_state)) = cache.get(&pool_pk) {
                 if amm_state.pool_accounts.len() >= 14 {
-                    return Ok(amm_state.pool_accounts[..14].to_vec());
+                    let mut accounts = amm_state.pool_accounts[..14].to_vec();
+                    pump_amm_normalize_v14_pool_accounts(&pool_pk, &mut accounts);
+                    return Ok(accounts);
                 }
             }
         }
@@ -509,6 +513,19 @@ impl CrossDexHandler {
 
         if let Some(ix) = ixs.first() {
             let account_count = ix.accounts.len();
+            let canonical_gc = pump_amm_canonical_global_config();
+            if ix.accounts.len() <= 2 || ix.accounts[2].pubkey != canonical_gc {
+                return Err(anyhow!(
+                    "pump_amm {} leg: global_config meta #2 mismatch for pool {}: got {}, expected {}",
+                    if is_buy_leg { "BUY" } else { "SELL" },
+                    pool_str,
+                    ix.accounts
+                        .get(2)
+                        .map(|m| m.pubkey.to_string())
+                        .unwrap_or_else(|| "<missing>".to_string()),
+                    canonical_gc
+                ));
+            }
             let program_slot = if is_buy_leg {
                 pump_amm_buy_program_ix_index(account_count)
             } else {
@@ -1583,13 +1600,15 @@ mod tests {
     };
     use crate::solana::address_lookup_table::{
         analyze_versioned_message_alt_usage, compile_v0_versioned_message, get_common_accounts,
+        loaded_addresses_from_alt_lookups, resolved_instruction_account_pubkey,
         versioned_message_duplicate_static_keys, AltCompileAnalysis, LoadedAlt,
     };
     use crate::solana::compute_budget_helper;
     use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
     use crate::solana::dex::pumpfun_amm::{
-        pump_amm_buy_program_ix_index, PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR,
-        PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR, PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
+        pump_amm_buy_program_ix_index, pump_amm_canonical_global_config,
+        PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR, PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
+        PUMPFUN_AMM_GLOBAL_CONFIG_STR, PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
         PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
     };
     use crate::solana::dex::router::Router;
@@ -2025,6 +2044,125 @@ mod tests {
             dupes.is_empty(),
             "compiled v0 message must not contain duplicate static keys (AccountLoadedTwice): {:?}",
             dupes.iter().map(|p| p.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Prod incident: stale `pool_accounts[1]` (`T1pyya…`) must not leak into compiled SELL ix or static keys.
+    #[tokio::test]
+    async fn cross_dex_pump_sell_global_config_resolved_after_wrong_pool_accounts_v14() {
+        const WRONG_GLOBAL_CONFIG: &str = "T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt";
+        let canonical_gc = pump_amm_canonical_global_config();
+        let wrong_gc = Pubkey::from_str(WRONG_GLOBAL_CONFIG).unwrap();
+        assert_ne!(wrong_gc, canonical_gc);
+
+        let wallet = Keypair::new();
+        let token_mint = Pubkey::new_unique();
+        let buy_pool = Pubkey::from_str("2TD1fMPg2w7Hjt8bASSdxi92YFNQFgvdznqVApe3NGpn").unwrap();
+        let sell_pool = Pubkey::new_unique();
+
+        let cache = Arc::new(LivePoolCache::new());
+        seed_prod_like_cross_dex_cache(&cache, buy_pool, sell_pool, token_mint);
+
+        // Inject prod-like wrong global_config into cache v14 row.
+        if let Some(CachedPoolState::PumpAmm(state)) = cache.get(&sell_pool) {
+            let mut accounts = state.pool_accounts;
+            accounts[1] = wrong_gc;
+            cache.set_pump_amm_pool_accounts(&sell_pool, accounts);
+        }
+
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mut handler = CrossDexHandler::new(rpc.clone(), Some(wallet.pubkey()))
+            .with_rpc_url("http://127.0.0.1:0".to_string())
+            .with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes");
+
+        let mut intent = cross_dex_test_intent(&token_mint, &buy_pool, &sell_pool);
+        // Intent sell_pool_accounts also carry the wrong global_config at v14[1].
+        if let Some(start_idx) = intent
+            .resources
+            .accounts
+            .iter()
+            .position(|s| s.starts_with("sell_pool_accounts_start:"))
+        {
+            let count: usize = intent.resources.accounts[start_idx]
+                .strip_prefix("sell_pool_accounts_start:")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            let first_account_idx = start_idx + 2; // v14[1] is first_account_idx + 1
+            if count >= 2 && first_account_idx < intent.resources.accounts.len() {
+                intent.resources.accounts[first_account_idx] = WRONG_GLOBAL_CONFIG.to_string();
+            }
+        }
+
+        let validation = cross_dex_validation_fixture(&token_mint);
+        let plan = handler
+            .build_swap_plan(
+                &intent,
+                &validation,
+                CrossDexPlanOptions {
+                    skip_token_ata_create: true,
+                },
+            )
+            .await
+            .expect("build_swap_plan with wrong pool_accounts[1] must succeed after normalization");
+
+        let sell_ix = plan.sell_instructions.first().expect("sell leg");
+        assert_eq!(
+            sell_ix.accounts.len(),
+            PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
+            "prod-like pump sell must use 24-account extended layout"
+        );
+        assert_eq!(
+            sell_ix.accounts[2].pubkey, canonical_gc,
+            "SELL ix meta #2 must be canonical global_config"
+        );
+        assert_eq!(
+            sell_ix.accounts[2].pubkey.to_string(),
+            PUMPFUN_AMM_GLOBAL_CONFIG_STR
+        );
+
+        let alt_accounts = get_common_accounts();
+        let (tx, _, _, _) =
+            compile_cross_dex_bundle_tx_with_alt(&wallet, &plan, alt_accounts.clone());
+        let dupes = versioned_message_duplicate_static_keys(&tx.message);
+        assert!(
+            dupes.is_empty(),
+            "wrong pool_accounts[1] must not produce duplicate static keys: {:?}",
+            dupes.iter().map(|p| p.to_string()).collect::<Vec<_>>()
+        );
+
+        let alt_address = match &tx.message {
+            solana_sdk::message::VersionedMessage::V0(v0) => v0
+                .address_table_lookups
+                .first()
+                .map(|l| l.account_key)
+                .unwrap_or_default(),
+            _ => Pubkey::default(),
+        };
+        let alt = LoadedAlt {
+            address: alt_address,
+            accounts: alt_accounts,
+        };
+        let loaded = loaded_addresses_from_alt_lookups(&alt, &tx.message)
+            .expect("loaded addresses from ALT lookups");
+        // Bundle: CU limit, CU price, Meteora buy, Pump sell, tip → sell at index 3.
+        let sell_ix_index = 3;
+        let resolved_gc =
+            resolved_instruction_account_pubkey(&tx.message, Some(&loaded), sell_ix_index, 2)
+                .expect("resolve SELL global_config from compiled v0 message");
+        assert_eq!(
+            resolved_gc, canonical_gc,
+            "compiled v0 message must resolve SELL global_config slot to canonical pubkey"
+        );
+
+        // Wrong pubkey must not appear as a static key when normalization replaced it.
+        let static_keys = match &tx.message {
+            solana_sdk::message::VersionedMessage::V0(v0) => &v0.account_keys,
+            solana_sdk::message::VersionedMessage::Legacy(l) => &l.account_keys,
+        };
+        assert!(
+            !static_keys.contains(&wrong_gc),
+            "wrong global_config must not be a static key in compiled bundle"
         );
     }
 

@@ -17,7 +17,9 @@ use solana_address_lookup_table_interface::{
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
-use solana_message::{v0, AddressLookupTableAccount, VersionedMessage};
+use solana_message::{
+    v0, v0::LoadedAddresses, AccountKeys, AddressLookupTableAccount, VersionedMessage,
+};
 use solana_sdk::{
     instruction::Instruction, pubkey::Pubkey, signature::Signer, transaction::VersionedTransaction,
 };
@@ -340,6 +342,61 @@ pub fn versioned_message_duplicate_static_keys(message: &VersionedMessage) -> Ve
     dupes.sort();
     dupes.dedup();
     dupes
+}
+
+/// Reconstruct loaded ALT addresses from a compiled v0 message and a known on-chain ALT snapshot.
+///
+/// Used for tests / diagnostics when verifying resolved instruction account pubkeys match ix metas.
+pub fn loaded_addresses_from_alt_lookups(
+    alt: &LoadedAlt,
+    message: &VersionedMessage,
+) -> Option<LoadedAddresses> {
+    let VersionedMessage::V0(v0) = message else {
+        return None;
+    };
+    if v0.address_table_lookups.is_empty() {
+        return Some(LoadedAddresses::default());
+    }
+    let mut writable = Vec::new();
+    let mut readonly = Vec::new();
+    for lookup in &v0.address_table_lookups {
+        if lookup.account_key != alt.address {
+            continue;
+        }
+        for &idx in &lookup.writable_indexes {
+            if let Some(pk) = alt.accounts.get(idx as usize) {
+                writable.push(*pk);
+            }
+        }
+        for &idx in &lookup.readonly_indexes {
+            if let Some(pk) = alt.accounts.get(idx as usize) {
+                readonly.push(*pk);
+            }
+        }
+    }
+    Some(LoadedAddresses { writable, readonly })
+}
+
+/// Resolve the pubkey at `meta_index` within compiled instruction `ix_index` of a versioned message.
+pub fn resolved_instruction_account_pubkey(
+    message: &VersionedMessage,
+    loaded_addresses: Option<&LoadedAddresses>,
+    ix_index: usize,
+    meta_index: usize,
+) -> Option<Pubkey> {
+    match message {
+        VersionedMessage::V0(v0) => {
+            let ix = v0.instructions.get(ix_index)?;
+            let key_index = *ix.accounts.get(meta_index)? as usize;
+            let keys = AccountKeys::new(&v0.account_keys, loaded_addresses);
+            keys.get(key_index).copied()
+        }
+        VersionedMessage::Legacy(legacy) => {
+            let ix = legacy.instructions.get(ix_index)?;
+            let key_index = *ix.accounts.get(meta_index)? as usize;
+            legacy.account_keys.get(key_index).copied()
+        }
+    }
 }
 
 /// Parse common accounts from the constant list.
