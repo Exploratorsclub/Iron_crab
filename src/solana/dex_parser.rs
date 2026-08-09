@@ -8,8 +8,8 @@
 
 use crate::solana::dex::pumpfun::{BondingCurveState, PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR};
 use crate::solana::dex::pumpfun_amm::{
-    pump_amm_sell_extended_fields_from_ix_accounts, pump_amm_sell_ix_account_len_supported,
-    pump_amm_sell_ix_discriminator,
+    pump_amm_normalize_v14_pool_accounts, pump_amm_sell_extended_fields_from_ix_accounts,
+    pump_amm_sell_ix_account_len_supported, pump_amm_sell_ix_discriminator,
 };
 use crate::solana::geyser_listener::{GeyserAccountUpdate, GeyserTransactionUpdate};
 use rust_decimal::Decimal;
@@ -1451,22 +1451,26 @@ fn parse_pumpfun_amm_transaction(update: &GeyserTransactionUpdate) -> Option<Par
 
     // Pool static accounts in v1 format (14 accounts, includes global_volume_accumulator)
     // See docs/MOMENTUM_V2_SPEC.md section 9.2 and pumpfun_amm.rs build_swap_ix_from_pool_accounts
-    let pool_accounts = vec![
-        pool_market,                  // [0]
-        global_config,                // [1]
-        base_mint,                    // [2]
-        quote_mint,                   // [3]
-        pool_base_vault,              // [4]
-        pool_quote_vault,             // [5]
-        protocol_fee_recipient,       // [6]
-        protocol_fee_recipient_ta,    // [7]
-        event_authority,              // [8]
-        coin_creator_vault_ata,       // [9]
-        coin_creator_vault_authority, // [10]
-        global_volume_accumulator,    // [11] - singleton PDA for SELL; observed for BUY
-        fee_config,                   // [12]
-        fee_program,                  // [13]
-    ];
+    let pool_accounts = {
+        let mut accounts = vec![
+            pool_market,                  // [0]
+            global_config,                // [1]
+            base_mint,                    // [2]
+            quote_mint,                   // [3]
+            pool_base_vault,              // [4]
+            pool_quote_vault,             // [5]
+            protocol_fee_recipient,       // [6]
+            protocol_fee_recipient_ta,    // [7]
+            event_authority,              // [8]
+            coin_creator_vault_ata,       // [9]
+            coin_creator_vault_authority, // [10]
+            global_volume_accumulator,    // [11]
+            fee_config,                   // [12]
+            fee_program,                  // [13]
+        ];
+        pump_amm_normalize_v14_pool_accounts(&pool_market, &mut accounts);
+        accounts
+    };
 
     debug!(
         pool = %pool_market,
