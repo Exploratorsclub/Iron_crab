@@ -136,7 +136,9 @@ use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::router::Router;
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::dex_parser::SOL_MINT;
-use ironcrab::solana::jito::{BundleStatusValue, JitoClient, JitoRegion};
+use ironcrab::solana::jito::{
+    BundleStatusValue, JitoClient, JitoRegion, JitoSubmitThrottle, JITO_SUBMIT_MIN_GAP_MS_DEFAULT,
+};
 use ironcrab::solana::rpc::SolanaRpc;
 use ironcrab::solana::token_utils::get_token_decimals_or_default;
 use ironcrab::solana::tx_sender::TxSender;
@@ -1531,6 +1533,9 @@ struct ExecutionConfig {
     /// Timeout for cross-DEX arb bundle confirmation (seconds; longer than default)
     jito_arb_timeout_secs: u64,
 
+    /// Minimum gap between Jito bundle submissions (ms). Default 1100 (Jito limit: 1 req/s).
+    jito_submit_min_gap_ms: u64,
+
     // === P1: Fee/Compute Policies ===
     /// Centralized fee policy (engine owns compute budget and priority fees)
     fee_policy: FeePolicy,
@@ -1610,6 +1615,7 @@ impl Default for ExecutionConfig {
             jito_region: "frankfurt".to_string(),
             jito_timeout_secs: 30,
             jito_arb_timeout_secs: 45,
+            jito_submit_min_gap_ms: JITO_SUBMIT_MIN_GAP_MS_DEFAULT,
             // P1: Fee/Compute Policy
             fee_policy: FeePolicy::default(),
             liquidation_priority_fee_micro_lamports: None,
@@ -2499,6 +2505,8 @@ struct ExecutionContext {
     // === P1: Jito Bundle Support ===
     /// Jito client for atomic bundle execution (None if disabled)
     jito_client: Option<JitoClient>,
+    /// Global spacing for Jito sendBundle to avoid -32097 rate limits.
+    jito_submit_throttle: Arc<JitoSubmitThrottle>,
     /// Bundle submissions counter
     #[allow(dead_code)]
     bundles_submitted: std::sync::atomic::AtomicU64,
@@ -2809,6 +2817,7 @@ impl ExecutionContext {
             kill_switch_context: parking_lot::RwLock::new(None),
             burn_in_progress: AtomicBool::new(false),
             jito_client: None,
+            jito_submit_throttle: Arc::new(JitoSubmitThrottle::default()),
             bundles_submitted: std::sync::atomic::AtomicU64::new(0),
             bundles_confirmed: std::sync::atomic::AtomicU64::new(0),
             cross_dex_handler: None,
@@ -8246,6 +8255,8 @@ async fn main() -> Result<()> {
 
     // P1: Setup Jito client for atomic bundle execution
     // CRITICAL: Use ALL regions in parallel for lowest latency and highest success rate
+    let jito_submit_throttle =
+        Arc::new(JitoSubmitThrottle::new(exec_config.jito_submit_min_gap_ms));
     let jito_client = if exec_config.jito_enabled && !args.dry_run {
         // Use all 5 Jito regions in parallel - bundles are deduplicated by signature
         let regions = JitoRegion::all();
@@ -8599,6 +8610,7 @@ async fn main() -> Result<()> {
         burn_in_progress: AtomicBool::new(false),
         // P1: Jito bundle support
         jito_client,
+        jito_submit_throttle,
         bundles_submitted: std::sync::atomic::AtomicU64::new(0),
         bundles_confirmed: std::sync::atomic::AtomicU64::new(0),
         // Cross-DEX handler (initialized below)
@@ -9985,6 +9997,7 @@ async fn build_replay_context(
         kill_switch_context: parking_lot::RwLock::new(None),
         burn_in_progress: AtomicBool::new(false),
         jito_client: None,
+        jito_submit_throttle: Arc::new(JitoSubmitThrottle::default()),
         bundles_submitted: std::sync::atomic::AtomicU64::new(0),
         bundles_confirmed: std::sync::atomic::AtomicU64::new(0),
         cross_dex_handler: None,
@@ -10419,8 +10432,10 @@ fn simulation_result_on_rpc_timeout() -> SimulationResult {
 const BUNDLE_TIP_MIN_LAMPORTS: u64 = 100_000;
 /// Maximum Jito bundle tip for cross-DEX arb (lamports).
 const BUNDLE_TIP_MAX_LAMPORTS: u64 = 2_000_000;
-/// Default tip share of estimated arb profit when metadata has no explicit bps.
-const BUNDLE_TIP_DEFAULT_BPS: u64 = 750;
+/// Default tip share of estimated arb profit when metadata has no explicit bps (10%).
+const BUNDLE_TIP_DEFAULT_BPS: u64 = 1000;
+/// Maximum total auction spend (tip + priority fee) as share of estimated profit.
+const BUNDLE_AUCTION_MAX_SPEND_BPS: u64 = 1500;
 
 fn is_cross_dex_arb_bundle(intent: &TradeIntent) -> bool {
     CrossDexHandler::is_cross_dex_arb_intent(intent)
@@ -10430,8 +10445,19 @@ fn is_cross_dex_arb_bundle(intent: &TradeIntent) -> bool {
             .is_some_and(|v| v == "true")
 }
 
+fn estimate_priority_fee_lamports(micro_lamports_per_cu: u64, compute_units: u32) -> u64 {
+    (micro_lamports_per_cu as u128 * compute_units as u128 / 1_000_000) as u64
+}
+
 /// Dynamic bundle tip: scale from `estimated_profit_lamports` for cross-DEX arb when metadata present.
-fn effective_bundle_tip_lamports(intent: &TradeIntent, config: &ExecutionConfig) -> u64 {
+fn effective_bundle_tip_lamports(
+    intent: &TradeIntent,
+    config: &ExecutionConfig,
+    priority_fee_micro_lamports: u64,
+    compute_units: u32,
+) -> u64 {
+    let priority_cost = estimate_priority_fee_lamports(priority_fee_micro_lamports, compute_units);
+
     if is_cross_dex_arb_bundle(intent) {
         if let Some(profit) = intent
             .metadata
@@ -10443,8 +10469,18 @@ fn effective_bundle_tip_lamports(intent: &TradeIntent, config: &ExecutionConfig)
                 .get("bundle_tip_bps")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(BUNDLE_TIP_DEFAULT_BPS);
-            let scaled = (profit as u128 * tip_bps as u128 / 10_000) as u64;
-            return scaled.clamp(BUNDLE_TIP_MIN_LAMPORTS, BUNDLE_TIP_MAX_LAMPORTS);
+            let profit_tip = (profit as u128 * tip_bps as u128 / 10_000) as u64;
+            let max_auction_spend =
+                (profit as u128 * BUNDLE_AUCTION_MAX_SPEND_BPS as u128 / 10_000) as u64;
+            let max_tip = max_auction_spend.saturating_sub(priority_cost);
+            let tip = profit_tip.min(max_tip);
+            let upper = BUNDLE_TIP_MAX_LAMPORTS.min(profit);
+            let lower = if max_tip >= BUNDLE_TIP_MIN_LAMPORTS {
+                BUNDLE_TIP_MIN_LAMPORTS
+            } else {
+                0
+            };
+            return tip.clamp(lower, upper);
         }
     }
     intent
@@ -11576,7 +11612,12 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         let mut bundle_tip_ix: Option<solana_sdk::instruction::Instruction> = None;
         let mut bundle_tip_lamports: Option<u64> = None;
         if requires_bundle && config.send_enabled {
-            let tip_lamports = effective_bundle_tip_lamports(&intent, &config);
+            let tip_lamports = effective_bundle_tip_lamports(
+                &intent,
+                &config,
+                priority_fee_selection.fee_micro_lamports,
+                compute_units,
+            );
             info!(
                 intent_id = %intent.intent_id,
                 tip_lamports = %tip_lamports,
@@ -12324,7 +12365,9 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                 "Submitting size-checked bundle transaction to Jito"
             );
 
-            let send_result = jito_client.send_versioned_bundle(&[versioned_tx]).await;
+            let send_result = jito_client
+                .send_versioned_bundle_throttled(&ctx.jito_submit_throttle, &[versioned_tx])
+                .await;
 
             if let Some(tip_lamports) = bundle_tip_lamports {
                 JITO_TIP_LAMPORTS_TOTAL.fetch_add(tip_lamports, Ordering::Relaxed);
@@ -12352,13 +12395,20 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     record_execution_slot_lag_at_send_if_applicable(ctx, &intent);
                     slot_at_send = Some(bundle_send_slot);
                     record_tx_priority_fee_source(priority_fee_selection.source);
+                    let tip_lamports_logged =
+                        bundle_tip_lamports.unwrap_or(config.jito_tip_lamports);
+                    let priority_cost_lamports = estimate_priority_fee_lamports(
+                        priority_fee_selection.fee_micro_lamports,
+                        compute_units,
+                    );
+                    let total_auction_spend_lamports =
+                        tip_lamports_logged.saturating_add(priority_cost_lamports);
                     checks.push(CheckResult {
                         check_name: "send".to_string(),
                         passed: true,
                         reason_code: None,
                         details: Some(format!(
-                            "bundle_id={bid} tip_lamports={}",
-                            bundle_tip_lamports.unwrap_or(config.jito_tip_lamports)
+                            "bundle_id={bid} tip_lamports={tip_lamports_logged} priority_fee_lamports={priority_cost_lamports} total_auction_spend_lamports={total_auction_spend_lamports}"
                         )),
                     });
                     info!(
@@ -12531,6 +12581,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     } else {
         DecisionOutcome::Rejected
     };
+    let mut primary_reject_reason: Option<String> = None;
     // Slot of the confirmed transaction when known (bundle status, Geyser confirm, or RPC status).
     let mut tx_landing_slot: Option<u64> = None;
 
@@ -12592,7 +12643,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                                 reason_code: Some(RejectReason::BundleTimeout.to_string()),
                                 details: Some(details),
                             });
-                            final_outcome = DecisionOutcome::Sent;
+                            final_outcome = DecisionOutcome::Rejected;
+                            primary_reject_reason = Some(RejectReason::BundleTimeout.to_string());
                         }
                         Err(error_msg) => {
                             JITO_BUNDLES_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -12720,7 +12772,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
             origin_type: intent.origin_type,
             regime: intent.regime,
             checks,
-            primary_reject_reason: None,
+            primary_reject_reason,
             kill_switch: None,
             plan_hash,
             simulate: Some(sim_result),
@@ -14128,6 +14180,18 @@ enum ConfirmOutcome {
     },
 }
 
+/// Map bundle confirm result to decision outcome. Bundle timeout is Rejected, not Sent.
+#[cfg_attr(not(test), allow(dead_code))]
+fn map_bundle_confirm_outcome(confirm: &ConfirmOutcome) -> (DecisionOutcome, Option<RejectReason>) {
+    match confirm {
+        ConfirmOutcome::Confirmed { .. } => (DecisionOutcome::Confirmed, None),
+        ConfirmOutcome::FailedConfirmed { .. } => (DecisionOutcome::FailedConfirmed, None),
+        ConfirmOutcome::TimeoutSent { .. } => {
+            (DecisionOutcome::Rejected, Some(RejectReason::BundleTimeout))
+        }
+    }
+}
+
 /// Derive ATA metadata (PDA, no RPC) so market-data can pre-track wallet token accounts.
 fn enrich_execution_result_ata_metadata(
     exec: &mut ExecutionResult,
@@ -14781,11 +14845,12 @@ mod execution_engine_tests {
     use super::{
         apply_scope48_confirmed_sell_execution_metadata, build_signed_versioned_tx,
         build_unsigned_versioned_tx, cold_path_dex_sim_failure_triggers_discovery_recovery,
-        compute_pre_send_capital_lock_ttl, effective_intent_ttl_ms, intent_is_expired,
-        is_cold_path_recovery_sell, is_pump_amm_structural_sim_error,
-        is_pumpfun_bonding_curve_structural_sim_error, is_regular_momentum_hot_path_sell,
-        known_sell_token_balance_raw, liquidation_lockmanager_seed_decision,
-        liquidation_pumpfun_sell_preference, liquidation_store_multi_pool_fallback_metadata,
+        compute_pre_send_capital_lock_ttl, create_test_intent, effective_bundle_tip_lamports,
+        effective_intent_ttl_ms, intent_is_expired, is_cold_path_recovery_sell,
+        is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_structural_sim_error,
+        is_regular_momentum_hot_path_sell, known_sell_token_balance_raw,
+        liquidation_lockmanager_seed_decision, liquidation_pumpfun_sell_preference,
+        liquidation_store_multi_pool_fallback_metadata, map_bundle_confirm_outcome,
         max_open_positions_buy_gate, prepare_unsigned_versioned_tx_for_simulation,
         pump_amm_hint_pool_cache_usable_for_tx_plan_builder,
         pump_amm_hot_path_quote_not_ready_detail, pump_amm_liquidation_discovery_force_refresh,
@@ -14799,9 +14864,9 @@ mod execution_engine_tests {
         wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
-        ComputedIntentFills, DiscoveryRequestOutcome, ExecutionConfig, LiquidationSeedDecision,
-        PumpAmmHotPathRefreshDecision, RouteCandidate, PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN,
-        WSOL_MINT,
+        ComputedIntentFills, ConfirmOutcome, DiscoveryRequestOutcome, ExecutionConfig,
+        LiquidationSeedDecision, PumpAmmHotPathRefreshDecision, RouteCandidate,
+        PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN, WSOL_MINT,
     };
     use ironcrab::execution::live_pool_cache::{
         CachedPoolState, LivePoolCache, MeteoraState, PumpAmmState, PumpFunState,
@@ -16820,6 +16885,42 @@ mod execution_engine_tests {
         assert!(!should_apply_success_fill_accounting(
             DecisionOutcome::SimFailed
         ));
+    }
+
+    #[test]
+    fn effective_bundle_tip_scales_from_profit_with_min_clamp() {
+        let config = ExecutionConfig::default();
+        let mut intent = create_test_intent("tip-test");
+        intent
+            .metadata
+            .insert("cross_dex_arb".to_string(), "true".to_string());
+        intent.metadata.insert(
+            "estimated_profit_lamports".to_string(),
+            "452000".to_string(),
+        );
+
+        // 10% of 452k = 45.2k; 15% auction cap (67.8k) below min tip → cap wins
+        let tip = effective_bundle_tip_lamports(&intent, &config, 0, 400_000);
+        assert_eq!(tip, 45_200);
+
+        intent.metadata.insert(
+            "estimated_profit_lamports".to_string(),
+            "1775491".to_string(),
+        );
+        // 10% of 1.775M ≈ 177_549
+        let tip = effective_bundle_tip_lamports(&intent, &config, 0, 400_000);
+        assert_eq!(tip, 177_549);
+    }
+
+    #[test]
+    fn bundle_timeout_confirm_maps_to_rejected_not_sent() {
+        let confirm = ConfirmOutcome::TimeoutSent {
+            details: "bundle_id=abc timeout_secs=45".to_string(),
+        };
+        let (outcome, reason) = map_bundle_confirm_outcome(&confirm);
+        assert_eq!(outcome, DecisionOutcome::Rejected);
+        assert_ne!(outcome, DecisionOutcome::Sent);
+        assert_eq!(reason, Some(RejectReason::BundleTimeout));
     }
 
     /// Production Scope 48 failure: `close_token_ata=true` + complete fills + probe-only sold amount

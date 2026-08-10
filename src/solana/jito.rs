@@ -49,8 +49,67 @@ fn build_system_transfer(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instructi
         },
     }
 }
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+use crate::metrics::{JITO_RATE_LIMIT_RETRIES_TOTAL, JITO_SUBMIT_THROTTLED_TOTAL};
+
+/// Default minimum gap between Jito bundle submissions (ms). Jito limit: 1 req/s.
+pub const JITO_SUBMIT_MIN_GAP_MS_DEFAULT: u64 = 1100;
+
+/// Backoff before retrying a rate-limited Jito submit (ms).
+const JITO_RATE_LIMIT_RETRY_BACKOFF_MS: u64 = 1200;
+
+/// Process-wide throttle for Jito `sendBundle` calls to stay under the 1 req/s rate limit.
+#[derive(Debug)]
+pub struct JitoSubmitThrottle {
+    min_gap: Duration,
+    last_submit: Mutex<Option<Instant>>,
+}
+
+impl JitoSubmitThrottle {
+    pub fn new(min_gap_ms: u64) -> Self {
+        let gap_ms = min_gap_ms.max(1);
+        Self {
+            min_gap: Duration::from_millis(gap_ms),
+            last_submit: Mutex::new(None),
+        }
+    }
+
+    /// Block until at least `min_gap` has elapsed since the previous submit slot was taken.
+    pub async fn acquire_submit_slot(&self) {
+        loop {
+            let mut guard = self.last_submit.lock().await;
+            let now = Instant::now();
+            if let Some(prev) = *guard {
+                let elapsed = now.duration_since(prev);
+                if elapsed < self.min_gap {
+                    let wait = self.min_gap - elapsed;
+                    drop(guard);
+                    JITO_SUBMIT_THROTTLED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            }
+            *guard = Some(now);
+            return;
+        }
+    }
+}
+
+impl Default for JitoSubmitThrottle {
+    fn default() -> Self {
+        Self::new(JITO_SUBMIT_MIN_GAP_MS_DEFAULT)
+    }
+}
+
+/// Returns true when a Jito RPC error indicates per-second rate limiting (-32097).
+pub fn is_jito_rate_limit_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("-32097") || msg.contains("Rate limit")
+}
 
 /// Jito tip accounts - one of these must receive the tip
 const JITO_TIP_ACCOUNTS: &[&str] = &[
@@ -395,6 +454,25 @@ impl JitoClient {
             .await
     }
 
+    /// Submit a versioned bundle after global throttle spacing, with one retry on rate limit.
+    pub async fn send_versioned_bundle_throttled(
+        &self,
+        throttle: &JitoSubmitThrottle,
+        transactions: &[VersionedTransaction],
+    ) -> Result<String> {
+        throttle.acquire_submit_slot().await;
+        match self.send_versioned_bundle(transactions).await {
+            Ok(bundle_id) => Ok(bundle_id),
+            Err(e) if is_jito_rate_limit_error(&e) => {
+                JITO_RATE_LIMIT_RETRIES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(JITO_RATE_LIMIT_RETRY_BACKOFF_MS)).await;
+                throttle.acquire_submit_slot().await;
+                self.send_versioned_bundle(transactions).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Check bundle status
     pub async fn get_bundle_status(&self, bundle_ids: &[String]) -> Result<Vec<BundleStatusValue>> {
         let request = JsonRpcRequest {
@@ -522,6 +600,29 @@ impl BundleBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_is_jito_rate_limit_error() {
+        let err = anyhow::anyhow!("Jito error -32097: Rate limit exceeded. Limit: 1 per second");
+        assert!(is_jito_rate_limit_error(&err));
+        let other = anyhow::anyhow!("Jito error -32600: Invalid request");
+        assert!(!is_jito_rate_limit_error(&other));
+    }
+
+    #[tokio::test]
+    async fn test_jito_submit_throttle_enforces_min_gap() {
+        let throttle = Arc::new(JitoSubmitThrottle::new(200));
+        let t0 = Instant::now();
+        throttle.acquire_submit_slot().await;
+        throttle.acquire_submit_slot().await;
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "expected >=200ms gap between submits, got {:?}",
+            elapsed
+        );
+    }
 
     #[test]
     fn test_jito_region_parsing() {
