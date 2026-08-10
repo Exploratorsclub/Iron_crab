@@ -696,7 +696,7 @@ impl Default for FeePolicy {
             // Compute budget
             default_compute_units: 200_000,
             max_compute_units: 1_400_000, // Solana max is 1.4M
-            arb_compute_units: 400_000,   // Multi-hop arb needs more
+            arb_compute_units: 600_000,   // Multi-hop arb needs more (meteora→orca ~700k plan CU)
 
             // Priority fees (micro-lamports per CU)
             default_priority_fee_micro_lamports: 1_000, // 0.001 lamports/CU

@@ -635,7 +635,7 @@ fn test_fee_policy_computation() {
     // Default values
     assert_eq!(policy.default_compute_units, 200_000);
     assert_eq!(policy.max_compute_units, 1_400_000);
-    assert_eq!(policy.arb_compute_units, 400_000);
+    assert_eq!(policy.arb_compute_units, 600_000);
     assert_eq!(policy.default_priority_fee_micro_lamports, 1_000);
 
     // Test intent with no hints (uses defaults)
@@ -664,7 +664,7 @@ fn test_fee_policy_computation() {
     // Test intent with bundle requirement (uses arb CU)
     let intent_bundle = intent_normal.clone().with_bundle(Some(10_000));
     let cu_bundle = policy.compute_units_for_intent(&intent_bundle);
-    assert_eq!(cu_bundle, 400_000, "Bundle intent should use arb CU");
+    assert_eq!(cu_bundle, 600_000, "Bundle intent should use arb CU");
 
     // Test Tier0 intent (higher priority fee)
     let intent_tier0 = TradeIntent::new(

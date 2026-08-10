@@ -239,6 +239,79 @@ fn is_orca_structural_sim_error(error_code: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Effective CU limit for cross-DEX arb: plan estimate wins when higher than fee policy.
+#[inline]
+fn cross_dex_effective_compute_units(plan_cu: u32, policy_cu: u32) -> u32 {
+    plan_cu.max(policy_cu)
+}
+
+/// Effective CU for fee gates: cross-DEX uses route estimate when higher than policy.
+fn effective_compute_units_for_intent(intent: &TradeIntent, policy: &FeePolicy) -> u32 {
+    let policy_cu = policy.compute_units_for_intent(intent);
+    if !is_cross_dex_arb_bundle(intent) {
+        return policy_cu;
+    }
+    let buy_dex = intent
+        .metadata
+        .get("buy_dex")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let sell_dex = intent
+        .metadata
+        .get("sell_dex")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let plan_cu = if buy_dex.is_empty() || sell_dex.is_empty() {
+        policy_cu
+    } else {
+        CrossDexHandler::estimate_cross_dex_compute_units(buy_dex, sell_dex)
+    };
+    cross_dex_effective_compute_units(plan_cu, policy_cu).min(policy.max_compute_units)
+}
+
+fn estimate_tx_cost_with_compute_units(
+    policy: &FeePolicy,
+    intent: &TradeIntent,
+    compute_units: u32,
+) -> (u64, u64, u64) {
+    let priority_fee_per_cu = policy.priority_fee_for_intent(intent);
+    let base_fee = 5_000u64;
+    let priority_fee = estimate_priority_fee_lamports(priority_fee_per_cu, compute_units);
+    (base_fee, priority_fee, base_fee + priority_fee)
+}
+
+fn is_profitable_after_fees_with_compute_units(
+    policy: &FeePolicy,
+    intent: &TradeIntent,
+    compute_units: u32,
+) -> (bool, i32) {
+    let (_, _, total_cost) = estimate_tx_cost_with_compute_units(policy, intent, compute_units);
+    let capital = intent.required_capital.raw;
+    if capital == 0 {
+        return (false, 0);
+    }
+    let cost_bps = ((total_cost as u128 * 10_000) / capital as u128) as i32;
+    let profit_after_fees = intent.expected_roi_bps - cost_bps;
+    (
+        profit_after_fees >= policy.min_profit_after_fees_bps,
+        profit_after_fees,
+    )
+}
+
+/// Gate for one-shot Orca Whirlpool recovery on cross-DEX arb when the SELL leg is Orca.
+#[inline]
+fn cross_dex_orca_recovery_eligible(
+    orca_recovery_attempted: bool,
+    is_cross_dex_arb: bool,
+    sell_dex: Option<&str>,
+    sim_error_code: Option<&str>,
+) -> bool {
+    !orca_recovery_attempted
+        && is_cross_dex_arb
+        && sell_dex == Some("orca")
+        && is_orca_structural_sim_error(sim_error_code)
+}
+
 /// Cold Path only: DEX structural sim recovery (e.g. PumpFun bonding-curve, Orca Whirlpool) is
 /// allowed for kill-switch/liquidation sells **and** explicit manual sell-all tooling
 /// (`sell_all=true`).
@@ -10937,7 +11010,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     }
 
     // Check: Compute units within limit
-    let compute_units = effective_fee_policy.compute_units_for_intent(&intent);
+    let compute_units = effective_compute_units_for_intent(&intent, &effective_fee_policy);
     if compute_units > effective_fee_policy.max_compute_units {
         let reason = RejectReason::FeeComputeExceedsLimit;
         checks.push(CheckResult {
@@ -10986,7 +11059,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
 
     // Check: Total transaction cost within limit
     let (base_fee, priority_fee_lamports, total_cost) =
-        effective_fee_policy.estimate_tx_cost(&intent);
+        estimate_tx_cost_with_compute_units(&effective_fee_policy, &intent, compute_units);
     if total_cost > effective_fee_policy.max_tx_cost_lamports {
         let reason = RejectReason::FeeExceedsMaxCost;
         checks.push(CheckResult {
@@ -11019,8 +11092,11 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     // For SELL exits (incl. liquidations), skip - exits aren't expected to be profitable-after-fees.
     let is_arb_intent = intent.source == "arb-strategy";
     if intent.side == TradeSide::Buy && is_arb_intent {
-        let (is_profitable, profit_after_fees_bps) =
-            effective_fee_policy.is_profitable_after_fees(&intent);
+        let (is_profitable, profit_after_fees_bps) = is_profitable_after_fees_with_compute_units(
+            &effective_fee_policy,
+            &intent,
+            compute_units,
+        );
         if !is_profitable {
             let reason = RejectReason::FeeUnprofitable;
             checks.push(CheckResult {
@@ -11376,7 +11452,11 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
 
                 // Use the same fee policy estimates that will be used for the actual send path.
                 let (_base_fee, _priority_fee_lamports, total_cost_lamports) =
-                    effective_fee_policy.estimate_tx_cost(&intent);
+                    estimate_tx_cost_with_compute_units(
+                        &effective_fee_policy,
+                        &intent,
+                        compute_units,
+                    );
 
                 // Cross-DEX arb must be revalidated with live quotes before plan is built.
                 let validation = match handler
@@ -11454,7 +11534,10 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
 
                 // Include compute budget ixs so simulation matches send (and CU limit is sufficient).
                 // P2: Use dynamic priority fees if available from Geyser
-                let compute_units = effective_fee_policy.compute_units_for_intent(&intent);
+                let policy_cu = effective_fee_policy.compute_units_for_intent(&intent);
+                let compute_units =
+                    cross_dex_effective_compute_units(plan.total_compute_units, policy_cu)
+                        .min(effective_fee_policy.max_compute_units);
                 let micro_lamports_per_cu = ctx
                     .get_priority_fee_for_intent(&intent, &effective_fee_policy)
                     .fee_micro_lamports;
@@ -11480,11 +11563,14 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     passed: true,
                     reason_code: None,
                     details: Some(format!(
-                        "ix_count={} plan_hash={} buy_dex={} sell_dex={}",
+                        "ix_count={} plan_hash={} buy_dex={} sell_dex={} compute_units={} plan_cu={} policy_cu={}",
                         tx_plan.instructions.len(),
                         plan_hash_str,
                         plan.buy_dex,
-                        plan.sell_dex
+                        plan.sell_dex,
+                        compute_units,
+                        plan.total_compute_units,
+                        policy_cu
                     )),
                 });
 
@@ -12105,6 +12191,127 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                     }
                 }
             }
+        }
+
+        // Cross-DEX Orca SELL: stale tick arrays → structural sim fail (6023/6024/0x1787).
+        // I-24d: one EnsureOrcaWhirlpoolPoolState + bounded JetStream wait + one rebuild retry.
+        if cross_dex_orca_recovery_eligible(
+            orca_recovery_attempted,
+            is_cross_dex_arb,
+            intent.metadata.get("sell_dex").map(|s| s.as_str()),
+            sim_result.error_code.as_deref(),
+        ) {
+            let sell_pool_str = intent
+                .metadata
+                .get("sell_pool")
+                .cloned()
+                .or_else(|| intent.resources.pools.get(1).cloned());
+            let Some(sell_pool_str) = sell_pool_str else {
+                checks.push(CheckResult {
+                    check_name: "orca_cross_dex_recovery".to_string(),
+                    passed: false,
+                    reason_code: Some("missing_sell_pool".to_string()),
+                    details: sim_result.error_code.clone(),
+                });
+                break (
+                    tx_plan,
+                    plan_hash_str,
+                    sim_result,
+                    requires_bundle,
+                    bundle_tip_ix,
+                    wallet_pubkey,
+                    bundle_tip_lamports,
+                );
+            };
+            let pool_pk = match Pubkey::from_str(sell_pool_str.as_str()) {
+                Ok(p) => p,
+                Err(_) => {
+                    checks.push(CheckResult {
+                        check_name: "orca_cross_dex_recovery".to_string(),
+                        passed: false,
+                        reason_code: Some("invalid_sell_pool".to_string()),
+                        details: Some(sell_pool_str),
+                    });
+                    break (
+                        tx_plan,
+                        plan_hash_str,
+                        sim_result,
+                        requires_bundle,
+                        bundle_tip_ix,
+                        wallet_pubkey,
+                        bundle_tip_lamports,
+                    );
+                }
+            };
+            let token_mint = &intent.resources.output_mint;
+            let before_evidence = ctx
+                .live_pool_cache
+                .as_ref()
+                .and_then(|c| c.get(&pool_pk))
+                .and_then(|st| match st {
+                    CachedPoolState::Orca(s) => Some((
+                        s.tick_current_index,
+                        s.sqrt_price,
+                        s.liquidity,
+                        s.vault_a_balance.unwrap_or(0),
+                        s.vault_b_balance.unwrap_or(0),
+                    )),
+                    _ => None,
+                });
+            warn!(
+                intent_id = %intent.intent_id,
+                mint = %token_mint,
+                pool = %pool_pk,
+                sim_error = ?sim_result.error_code,
+                before_evidence = ?before_evidence,
+                "Cross-DEX Orca SELL: structural sim failed — requesting EnsureOrcaWhirlpoolPoolState from market-data (bounded wait + one tx rebuild retry)"
+            );
+            if let DiscoveryRequestOutcome::Ok = ctx
+                .request_orca_whirlpool_recovery_and_wait(token_mint, Some(&sell_pool_str))
+                .await
+            {
+                if let Some(cache) = ctx.live_pool_cache.as_ref() {
+                    if wait_for_orca_whirlpool_slave_after_recovery(
+                        cache,
+                        &pool_pk,
+                        before_evidence,
+                        DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                        DISCOVERY_CACHE_POLL_INTERVAL_MS,
+                    )
+                    .await
+                    {
+                        orca_recovery_attempted = true;
+                        checks.push(CheckResult {
+                            check_name: "orca_cross_dex_recovery".to_string(),
+                            passed: true,
+                            reason_code: None,
+                            details: Some(format!(
+                                "pool={} sim_error={:?}",
+                                pool_pk, sim_result.error_code
+                            )),
+                        });
+                        warn!(
+                            intent_id = %intent.intent_id,
+                            mint = %token_mint,
+                            pool = %pool_pk,
+                            "Cross-DEX Orca SELL: SLAVE shows fresh explicit Ready after recovery — rebuilding tx (one retry)"
+                        );
+                        continue;
+                    }
+                    warn!(
+                        intent_id = %intent.intent_id,
+                        pool = %pool_pk,
+                        timeout_ms = DISCOVERY_CACHE_WAIT_TIMEOUT_MS,
+                        "Cross-DEX Orca SELL: ControlResponse ok but bounded wait for SLAVE explicit Ready + fresh evidence timed out"
+                    );
+                }
+            }
+            checks.push(CheckResult {
+                check_name: "orca_cross_dex_recovery".to_string(),
+                passed: false,
+                reason_code: Some("recovery_no_fresh_slave".to_string()),
+                details: sim_result.error_code.clone(),
+            });
         }
 
         // Orca Whirlpool SELL (cold-path recovery slice via `is_cold_path_recovery_sell`): stale tick or vault evidence →
@@ -14920,8 +15127,9 @@ mod execution_engine_tests {
     use super::{
         apply_scope48_confirmed_sell_execution_metadata, build_signed_versioned_tx,
         build_unsigned_versioned_tx, cold_path_dex_sim_failure_triggers_discovery_recovery,
-        compute_pre_send_capital_lock_ttl, create_test_intent, effective_bundle_tip_lamports,
-        effective_intent_ttl_ms, intent_is_expired, is_cold_path_recovery_sell,
+        compute_pre_send_capital_lock_ttl, create_test_intent, cross_dex_effective_compute_units,
+        cross_dex_orca_recovery_eligible, effective_bundle_tip_lamports, effective_intent_ttl_ms,
+        intent_is_expired, is_cold_path_recovery_sell, is_orca_structural_sim_error,
         is_pump_amm_structural_sim_error, is_pumpfun_bonding_curve_structural_sim_error,
         is_regular_momentum_hot_path_sell, known_sell_token_balance_raw,
         liquidation_lockmanager_seed_decision, liquidation_pumpfun_sell_preference,
@@ -15902,6 +16110,65 @@ mod execution_engine_tests {
         assert!(is_pump_amm_structural_sim_error(Some("0x177D")));
         assert!(!is_pump_amm_structural_sim_error(Some("Custom(6005)")));
         assert!(!is_pump_amm_structural_sim_error(None));
+    }
+
+    #[test]
+    fn cross_dex_compute_units_uses_plan_when_higher_than_policy() {
+        assert_eq!(
+            cross_dex_effective_compute_units(700_000, 600_000),
+            700_000,
+            "plan CU must win when higher than policy"
+        );
+        assert_eq!(
+            cross_dex_effective_compute_units(450_000, 600_000),
+            600_000,
+            "policy CU must win when higher than plan"
+        );
+    }
+
+    #[test]
+    fn is_orca_structural_sim_error_matches_6023() {
+        assert!(is_orca_structural_sim_error(Some(
+            "Simulation failed: Custom(6023) InvalidTickArraySequence"
+        )));
+        assert!(is_orca_structural_sim_error(Some("Custom(6024)")));
+        assert!(is_orca_structural_sim_error(Some("0x1787")));
+        assert!(!is_orca_structural_sim_error(Some("Custom(6005)")));
+        assert!(!is_orca_structural_sim_error(None));
+    }
+
+    #[test]
+    fn cross_dex_orca_recovery_gate_only_for_structural_errors() {
+        assert!(cross_dex_orca_recovery_eligible(
+            false,
+            true,
+            Some("orca"),
+            Some("Custom(6023)")
+        ));
+        assert!(!cross_dex_orca_recovery_eligible(
+            true,
+            true,
+            Some("orca"),
+            Some("Custom(6023)")
+        ));
+        assert!(!cross_dex_orca_recovery_eligible(
+            false,
+            false,
+            Some("orca"),
+            Some("Custom(6023)")
+        ));
+        assert!(!cross_dex_orca_recovery_eligible(
+            false,
+            true,
+            Some("meteora_dlmm"),
+            Some("Custom(6023)")
+        ));
+        assert!(!cross_dex_orca_recovery_eligible(
+            false,
+            true,
+            Some("orca"),
+            Some("Custom(6005)")
+        ));
     }
 
     #[test]
