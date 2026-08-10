@@ -10474,9 +10474,13 @@ fn effective_bundle_tip_lamports(
                 (profit as u128 * BUNDLE_AUCTION_MAX_SPEND_BPS as u128 / 10_000) as u64;
             let max_tip = max_auction_spend.saturating_sub(priority_cost);
             let tip = profit_tip.min(max_tip);
-            return tip
-                .clamp(BUNDLE_TIP_MIN_LAMPORTS, BUNDLE_TIP_MAX_LAMPORTS)
-                .min(profit);
+            let upper = BUNDLE_TIP_MAX_LAMPORTS.min(profit);
+            let lower = if max_tip >= BUNDLE_TIP_MIN_LAMPORTS {
+                BUNDLE_TIP_MIN_LAMPORTS
+            } else {
+                0
+            };
+            return tip.clamp(lower, upper);
         }
     }
     intent
@@ -16895,9 +16899,9 @@ mod execution_engine_tests {
             "452000".to_string(),
         );
 
-        // 10% of 452k = 45.2k → min clamp 100k
+        // 10% of 452k = 45.2k; 15% auction cap (67.8k) below min tip → cap wins
         let tip = effective_bundle_tip_lamports(&intent, &config, 0, 400_000);
-        assert_eq!(tip, 100_000);
+        assert_eq!(tip, 45_200);
 
         intent.metadata.insert(
             "estimated_profit_lamports".to_string(),
