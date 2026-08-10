@@ -92,12 +92,12 @@ use ironcrab::metrics::{
     CAPITAL_LOCK_EXPIRED_RELEASED_TOTAL, CONCURRENT_INTENTS_GAUGE, INTENTS_EXECUTED_TOTAL,
     INTENTS_EXPIRED_TOTAL, INTENTS_RECEIVED_TOTAL, INTENTS_REJECTED_TOTAL,
     IN_FLIGHT_CAPITAL_RESERVATIONS, JITO_BUNDLES_LANDED_TOTAL, JITO_BUNDLES_REJECTED_TOTAL,
-    JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL, JITO_TIP_LAMPORTS_TOTAL,
-    KILL_SWITCH_ACTIVE, NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE,
-    POSITION_AUTHORITY_DRIFT_EE_VS_KV, POSITION_AUTHORITY_DRIFT_LOCKMANAGER,
-    POSITION_AUTHORITY_KV_OPEN_POSITIONS, POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE,
-    POSITION_AUTHORITY_OPEN_GAUGE, POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE,
-    PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
+    JITO_BUNDLES_SUBMITTED_TOTAL, JITO_BUNDLES_TIMEOUT_TOTAL,
+    JITO_BUNDLE_AUCTION_BUDGET_REJECTED_TOTAL, JITO_TIP_LAMPORTS_TOTAL, KILL_SWITCH_ACTIVE,
+    NATS_MESSAGES_RECEIVED_TOTAL, OPEN_POSITIONS_GAUGE, POSITION_AUTHORITY_DRIFT_EE_VS_KV,
+    POSITION_AUTHORITY_DRIFT_LOCKMANAGER, POSITION_AUTHORITY_KV_OPEN_POSITIONS,
+    POSITION_AUTHORITY_LOCKMANAGER_OPEN_GAUGE, POSITION_AUTHORITY_OPEN_GAUGE,
+    POSITION_AUTHORITY_RECONCILE_NEEDED_GAUGE, PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_FAIL_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_ASYNC_PUBLISH_SUCCESS_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_COOLDOWN_SUPPRESSED_TOTAL,
     PUMPSWAP_HOT_PATH_HEALING_SKIPPED_NO_NATS_TOTAL, PUMPSWAP_HOT_PATH_HEALING_TRIGGER_TOTAL,
@@ -10436,6 +10436,20 @@ const BUNDLE_TIP_MAX_LAMPORTS: u64 = 2_000_000;
 const BUNDLE_TIP_DEFAULT_BPS: u64 = 1000;
 /// Maximum total auction spend (tip + priority fee) as share of estimated profit.
 const BUNDLE_AUCTION_MAX_SPEND_BPS: u64 = 1500;
+/// Jito protocol minimum tip (bundles with tip=0 are rejected with -32602).
+const JITO_BUNDLE_TIP_FLOOR_LAMPORTS: u64 = 1_000;
+
+/// Result of dynamic bundle tip computation for cross-DEX arb auction budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EffectiveBundleTip {
+    Ok(u64),
+    AuctionBudgetInsufficient {
+        estimated_profit: u64,
+        priority_cost: u64,
+        max_auction_spend: u64,
+        computed_tip: u64,
+    },
+}
 
 fn is_cross_dex_arb_bundle(intent: &TradeIntent) -> bool {
     CrossDexHandler::is_cross_dex_arb_intent(intent)
@@ -10450,12 +10464,13 @@ fn estimate_priority_fee_lamports(micro_lamports_per_cu: u64, compute_units: u32
 }
 
 /// Dynamic bundle tip: scale from `estimated_profit_lamports` for cross-DEX arb when metadata present.
+/// Returns `None` equivalent (`AuctionBudgetInsufficient`) when tip would be below Jito floor.
 fn effective_bundle_tip_lamports(
     intent: &TradeIntent,
     config: &ExecutionConfig,
     priority_fee_micro_lamports: u64,
     compute_units: u32,
-) -> u64 {
+) -> EffectiveBundleTip {
     let priority_cost = estimate_priority_fee_lamports(priority_fee_micro_lamports, compute_units);
 
     if is_cross_dex_arb_bundle(intent) {
@@ -10473,19 +10488,48 @@ fn effective_bundle_tip_lamports(
             let max_auction_spend =
                 (profit as u128 * BUNDLE_AUCTION_MAX_SPEND_BPS as u128 / 10_000) as u64;
             let max_tip = max_auction_spend.saturating_sub(priority_cost);
-            let tip = profit_tip.min(max_tip);
+            let raw_tip = profit_tip.min(max_tip);
             let upper = BUNDLE_TIP_MAX_LAMPORTS.min(profit);
             let lower = if max_tip >= BUNDLE_TIP_MIN_LAMPORTS {
                 BUNDLE_TIP_MIN_LAMPORTS
+            } else if max_tip >= JITO_BUNDLE_TIP_FLOOR_LAMPORTS {
+                JITO_BUNDLE_TIP_FLOOR_LAMPORTS
             } else {
-                0
+                return EffectiveBundleTip::AuctionBudgetInsufficient {
+                    estimated_profit: profit,
+                    priority_cost,
+                    max_auction_spend,
+                    computed_tip: raw_tip,
+                };
             };
-            return tip.clamp(lower, upper);
+            let tip = raw_tip.clamp(lower, upper);
+            if tip < JITO_BUNDLE_TIP_FLOOR_LAMPORTS {
+                return EffectiveBundleTip::AuctionBudgetInsufficient {
+                    estimated_profit: profit,
+                    priority_cost,
+                    max_auction_spend,
+                    computed_tip: tip,
+                };
+            }
+            return EffectiveBundleTip::Ok(tip);
         }
     }
-    intent
+    let tip = intent
         .bundle_tip_lamports
-        .unwrap_or(config.jito_tip_lamports)
+        .unwrap_or(config.jito_tip_lamports);
+    if tip < JITO_BUNDLE_TIP_FLOOR_LAMPORTS {
+        return EffectiveBundleTip::AuctionBudgetInsufficient {
+            estimated_profit: intent
+                .metadata
+                .get("estimated_profit_lamports")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0),
+            priority_cost,
+            max_auction_spend: 0,
+            computed_tip: tip,
+        };
+    }
+    EffectiveBundleTip::Ok(tip)
 }
 
 fn bundle_confirm_timeout_secs(intent: &TradeIntent, config: &ExecutionConfig) -> u64 {
@@ -11612,42 +11656,73 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         let mut bundle_tip_ix: Option<solana_sdk::instruction::Instruction> = None;
         let mut bundle_tip_lamports: Option<u64> = None;
         if requires_bundle && config.send_enabled {
-            let tip_lamports = effective_bundle_tip_lamports(
+            match effective_bundle_tip_lamports(
                 &intent,
                 &config,
                 priority_fee_selection.fee_micro_lamports,
                 compute_units,
-            );
-            info!(
-                intent_id = %intent.intent_id,
-                tip_lamports = %tip_lamports,
-                cross_dex_arb = is_cross_dex_arb_bundle(&intent),
-                estimated_profit = intent.metadata.get("estimated_profit_lamports"),
-                "Building Jito tip instruction for bundle"
-            );
-            let jito_client = ctx
-                .jito_client
-                .as_ref()
-                .expect("bundle_config gate ensures jito_client is present");
-
-            match jito_client.build_tip_instruction(&wallet_pubkey, tip_lamports) {
-                Ok(ix) => {
+            ) {
+                EffectiveBundleTip::Ok(tip_lamports) => {
                     info!(
                         intent_id = %intent.intent_id,
                         tip_lamports = %tip_lamports,
-                        tip_account = %ix.accounts[1].pubkey,
-                        "✅ Tip instruction built successfully"
+                        cross_dex_arb = is_cross_dex_arb_bundle(&intent),
+                        estimated_profit = intent.metadata.get("estimated_profit_lamports"),
+                        "Building Jito tip instruction for bundle"
                     );
-                    bundle_tip_ix = Some(ix);
-                    bundle_tip_lamports = Some(tip_lamports);
+                    let jito_client = ctx
+                        .jito_client
+                        .as_ref()
+                        .expect("bundle_config gate ensures jito_client is present");
+
+                    match jito_client.build_tip_instruction(&wallet_pubkey, tip_lamports) {
+                        Ok(ix) => {
+                            info!(
+                                intent_id = %intent.intent_id,
+                                tip_lamports = %tip_lamports,
+                                tip_account = %ix.accounts[1].pubkey,
+                                "✅ Tip instruction built successfully"
+                            );
+                            bundle_tip_ix = Some(ix);
+                            bundle_tip_lamports = Some(tip_lamports);
+                        }
+                        Err(e) => {
+                            let reason = RejectReason::InternalError;
+                            checks.push(CheckResult {
+                                check_name: "bundle_tip_ix".to_string(),
+                                passed: false,
+                                reason_code: Some(reason.to_string()),
+                                details: Some(format!("failed to build tip instruction: {e}")),
+                            });
+                            ctx.lock_manager.release_locks(&intent.intent_id);
+                            return emit_rejected_decision(
+                                ctx,
+                                decision_id,
+                                &intent,
+                                checks,
+                                reason,
+                            )
+                            .await;
+                        }
+                    }
                 }
-                Err(e) => {
-                    let reason = RejectReason::InternalError;
+                EffectiveBundleTip::AuctionBudgetInsufficient {
+                    estimated_profit,
+                    priority_cost,
+                    max_auction_spend,
+                    computed_tip,
+                } => {
+                    JITO_BUNDLE_AUCTION_BUDGET_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    let reason = RejectReason::FeeUnprofitable;
                     checks.push(CheckResult {
-                        check_name: "bundle_tip_ix".to_string(),
+                        check_name: "bundle_auction_budget".to_string(),
                         passed: false,
                         reason_code: Some(reason.to_string()),
-                        details: Some(format!("failed to build tip instruction: {e}")),
+                        details: Some(format!(
+                            "estimated_profit={estimated_profit} priority_cost={priority_cost} \
+                             max_auction_spend={max_auction_spend} computed_tip={computed_tip} \
+                             jito_min_tip={JITO_BUNDLE_TIP_FLOOR_LAMPORTS}"
+                        )),
                     });
                     ctx.lock_manager.release_locks(&intent.intent_id);
                     return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
@@ -14864,8 +14939,8 @@ mod execution_engine_tests {
         wait_for_meteora_dlmm_slave_after_recovery,
         wait_for_pump_amm_pool_hint_ready_for_tx_plan_builder,
         wait_for_pump_amm_slave_after_recovery, wait_for_pumpfun_bonding_cache_refresh,
-        ComputedIntentFills, ConfirmOutcome, DiscoveryRequestOutcome, ExecutionConfig,
-        LiquidationSeedDecision, PumpAmmHotPathRefreshDecision, RouteCandidate,
+        ComputedIntentFills, ConfirmOutcome, DiscoveryRequestOutcome, EffectiveBundleTip,
+        ExecutionConfig, LiquidationSeedDecision, PumpAmmHotPathRefreshDecision, RouteCandidate,
         PUMP_AMM_HOT_PATH_REFRESH_COOLDOWN, WSOL_MINT,
     };
     use ironcrab::execution::live_pool_cache::{
@@ -16899,8 +16974,11 @@ mod execution_engine_tests {
             "452000".to_string(),
         );
 
-        // 10% of 452k = 45.2k; 15% auction cap (67.8k) below min tip → cap wins
-        let tip = effective_bundle_tip_lamports(&intent, &config, 0, 400_000);
+        // 10% of 452k = 45.2k; 15% auction cap (67.8k) below competitive min tip → cap wins
+        let tip = match effective_bundle_tip_lamports(&intent, &config, 0, 400_000) {
+            EffectiveBundleTip::Ok(t) => t,
+            other => panic!("expected Ok tip, got {other:?}"),
+        };
         assert_eq!(tip, 45_200);
 
         intent.metadata.insert(
@@ -16908,8 +16986,81 @@ mod execution_engine_tests {
             "1775491".to_string(),
         );
         // 10% of 1.775M ≈ 177_549
-        let tip = effective_bundle_tip_lamports(&intent, &config, 0, 400_000);
+        let tip = match effective_bundle_tip_lamports(&intent, &config, 0, 400_000) {
+            EffectiveBundleTip::Ok(t) => t,
+            other => panic!("expected Ok tip, got {other:?}"),
+        };
         assert_eq!(tip, 177_549);
+    }
+
+    #[test]
+    fn effective_bundle_tip_never_zero_when_budget_allows_jito_floor() {
+        let config = ExecutionConfig::default();
+        let mut intent = create_test_intent("tip-never-zero");
+        intent
+            .metadata
+            .insert("cross_dex_arb".to_string(), "true".to_string());
+        intent.metadata.insert(
+            "estimated_profit_lamports".to_string(),
+            "605000".to_string(),
+        );
+
+        // Prod edge case: profit=605k, priority=137k µ/CU, cu=400k
+        let tip = match effective_bundle_tip_lamports(&intent, &config, 137_000, 400_000) {
+            EffectiveBundleTip::Ok(t) => t,
+            other => panic!("expected Ok tip for prod edge case, got {other:?}"),
+        };
+        assert!(tip >= 1_000, "tip must meet Jito floor, got {tip}");
+        // max_auction=90750, priority≈54800, max_tip≈35950
+        assert_eq!(tip, 35_950);
+    }
+
+    #[test]
+    fn effective_bundle_tip_rejects_when_priority_eats_auction_budget() {
+        let config = ExecutionConfig::default();
+        let mut intent = create_test_intent("tip-budget-eaten");
+        intent
+            .metadata
+            .insert("cross_dex_arb".to_string(), "true".to_string());
+        intent.metadata.insert(
+            "estimated_profit_lamports".to_string(),
+            "605000".to_string(),
+        );
+
+        // priority_cost = 137k * 1M / 1M = 137k > max_auction_spend 90750 → max_tip=0
+        let result = effective_bundle_tip_lamports(&intent, &config, 137_000, 1_000_000);
+        assert!(matches!(
+            result,
+            EffectiveBundleTip::AuctionBudgetInsufficient {
+                estimated_profit: 605_000,
+                priority_cost: 137_000,
+                max_auction_spend: 90_750,
+                computed_tip: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn effective_bundle_tip_none_when_max_tip_below_jito_floor() {
+        let config = ExecutionConfig::default();
+        let mut intent = create_test_intent("tip-below-floor");
+        intent
+            .metadata
+            .insert("cross_dex_arb".to_string(), "true".to_string());
+        intent
+            .metadata
+            .insert("estimated_profit_lamports".to_string(), "50000".to_string());
+
+        // max_auction=7500, priority=5000 → max_tip=2500 (above floor) → Ok(2500)
+        let ok = effective_bundle_tip_lamports(&intent, &config, 5_000, 1_000_000);
+        assert!(matches!(ok, EffectiveBundleTip::Ok(2_500)));
+
+        // max_auction=7500, priority=7000 → max_tip=500 (< jito floor 1000)
+        let reject = effective_bundle_tip_lamports(&intent, &config, 7_000, 1_000_000);
+        assert!(matches!(
+            reject,
+            EffectiveBundleTip::AuctionBudgetInsufficient { .. }
+        ));
     }
 
     #[test]
