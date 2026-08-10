@@ -593,6 +593,20 @@ impl CrossDexHandler {
         Ok(ixs)
     }
 
+    /// Route-aware CU estimate for atomic two-leg cross-DEX bundles.
+    ///
+    /// Prod evidence (meteora_dlmm → orca): Orca SELL leg alone can consume ~352k CU after
+    /// ~48k prefix; 400k TX limit caused `ProgramFailedToComplete` / CU meter exhaustion.
+    pub fn estimate_cross_dex_compute_units(buy_dex: &str, sell_dex: &str) -> u32 {
+        let mut total_cu = 450_000_u32;
+        if buy_dex.contains("meteora") && sell_dex.contains("orca") {
+            total_cu = 700_000;
+        } else if buy_dex.contains("orca") || sell_dex.contains("orca") {
+            total_cu = 550_000;
+        }
+        total_cu
+    }
+
     /// Check if this intent is a cross-DEX arbitrage intent (old 2-hop style)
     ///
     /// Returns false for multi-hop intents (which have swap_path populated),
@@ -1526,11 +1540,7 @@ impl CrossDexHandler {
         let mut combined_buy_instructions = ata_creation_instructions;
         combined_buy_instructions.extend(buy_swap_instructions);
 
-        // Estimate compute units:
-        // - 1x Token ATA create ~20k (often no-op ~2k)
-        // - 2x swap ~200k each = 400k
-        // Total ~420k, round up to 450k for safety
-        let total_cu = 450_000_u32;
+        let total_cu = Self::estimate_cross_dex_compute_units(&buy_dex, &sell_dex);
 
         Ok(CrossDexSwapPlan {
             buy_instructions: combined_buy_instructions,
@@ -2596,5 +2606,29 @@ mod tests {
             buy_ix.accounts.iter().any(|a| a.pubkey == buy_pool),
             "orca swap ix must reference buy whirlpool from cache injection"
         );
+    }
+
+    #[test]
+    fn cross_dex_meteora_orca_cu_estimate_at_least_650k() {
+        let cu = CrossDexHandler::estimate_cross_dex_compute_units("meteora_dlmm", "orca");
+        assert!(
+            cu >= 650_000,
+            "meteora_dlmm→orca must reserve enough CU for Orca SELL leg (got {cu})"
+        );
+        assert_eq!(cu, 700_000);
+    }
+
+    #[test]
+    fn cross_dex_orca_route_cu_estimate_above_default() {
+        let cu = CrossDexHandler::estimate_cross_dex_compute_units("raydium", "orca");
+        assert_eq!(cu, 550_000);
+        let cu_buy = CrossDexHandler::estimate_cross_dex_compute_units("orca", "raydium");
+        assert_eq!(cu_buy, 550_000);
+    }
+
+    #[test]
+    fn cross_dex_non_orca_route_uses_baseline_cu() {
+        let cu = CrossDexHandler::estimate_cross_dex_compute_units("meteora_dlmm", "pump_amm");
+        assert_eq!(cu, 450_000);
     }
 }

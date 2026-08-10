@@ -390,7 +390,7 @@ fn default_max_compute_units() -> u32 {
     1_400_000
 }
 fn default_arb_compute_units() -> u32 {
-    400_000
+    600_000
 }
 fn default_priority_fee() -> u64 {
     1_000
