@@ -7758,6 +7758,8 @@ pub static JITO_TIP_LAMPORTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::ne
 pub static JITO_FALLBACK_RPC_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static JITO_SUBMIT_THROTTLED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static JITO_RATE_LIMIT_RETRIES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static JITO_BUNDLE_AUCTION_BUDGET_REJECTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 // Re-quote metrics
 pub static REQUOTE_EVENTS_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static REQUOTE_IMPROVED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -12080,6 +12082,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "jito_rate_limit_retries_total",
         JITO_RATE_LIMIT_RETRIES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "jito_bundle_auction_budget_rejected_total",
+        JITO_BUNDLE_AUCTION_BUDGET_REJECTED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "requote_events_total",
