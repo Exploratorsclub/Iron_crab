@@ -53,6 +53,9 @@ use uuid::Uuid;
 
 use ironcrab::config::Config as AppConfig;
 // cache_geyser removed - execution-engine now subscribes to PoolCacheUpdates from market-data via NATS
+use ironcrab::execution::bundle_auction::{
+    estimate_priority_fee_lamports, max_auction_spend_lamports, BundleAuctionParams,
+};
 use ironcrab::execution::error_detection::is_6005_bonding_curve_complete;
 use ironcrab::execution::live_pool_cache::{
     create_shared_cache, CachedPoolState, LivePoolCache, PumpAmmState, SharedLivePoolCache,
@@ -1612,6 +1615,8 @@ struct ExecutionConfig {
     // === P1: Fee/Compute Policies ===
     /// Centralized fee policy (engine owns compute budget and priority fees)
     fee_policy: FeePolicy,
+    /// Shared Jito bundle auction parameters (from [execution_engine.fee_policy] + jito tip).
+    bundle_auction: BundleAuctionParams,
     /// Optional liquidation-specific fee overrides (kill switch / liquidation sells)
     liquidation_priority_fee_micro_lamports: Option<u64>,
     liquidation_max_priority_fee_micro_lamports: Option<u64>,
@@ -1691,6 +1696,7 @@ impl Default for ExecutionConfig {
             jito_submit_min_gap_ms: JITO_SUBMIT_MIN_GAP_MS_DEFAULT,
             // P1: Fee/Compute Policy
             fee_policy: FeePolicy::default(),
+            bundle_auction: BundleAuctionParams::default(),
             liquidation_priority_fee_micro_lamports: None,
             liquidation_max_priority_fee_micro_lamports: None,
             liquidation_max_tx_cost_lamports: None,
@@ -8218,16 +8224,20 @@ async fn main() -> Result<()> {
     );
 
     // Setup config - read Jito settings: prefer [execution_engine] section, fallback to [sniper]
+    let jito_tip_lamports = exec_eng_cfg
+        .and_then(|e| e.jito_tip_lamports)
+        .or_else(|| sniper_cfg.and_then(|s| s.jito_tip_lamports))
+        .unwrap_or(10_000);
+    let bundle_auction =
+        BundleAuctionParams::from_fee_policy_cfg(fee_policy_cfg, jito_tip_lamports);
+
     let exec_config = ExecutionConfig {
         send_enabled: !args.simulate_only && !args.dry_run && has_keys,
         jito_enabled: exec_eng_cfg
             .and_then(|e| e.jito_enabled)
             .or_else(|| sniper_cfg.and_then(|s| s.jito_enabled))
             .unwrap_or(false),
-        jito_tip_lamports: exec_eng_cfg
-            .and_then(|e| e.jito_tip_lamports)
-            .or_else(|| sniper_cfg.and_then(|s| s.jito_tip_lamports))
-            .unwrap_or(10_000),
+        jito_tip_lamports,
         jito_region: exec_eng_cfg
             .and_then(|e| e.jito_region.clone())
             .or_else(|| sniper_cfg.and_then(|s| s.jito_region.clone()))
@@ -8268,6 +8278,7 @@ async fn main() -> Result<()> {
         janitor_dry_run: janitor_cfg.map(|c| c.dry_run).unwrap_or(false) || args.dry_run,
         // Fee Policy
         fee_policy,
+        bundle_auction,
         liquidation_priority_fee_micro_lamports: fee_policy_cfg
             .and_then(|fp| fp.liquidation_priority_fee_micro_lamports),
         liquidation_max_priority_fee_micro_lamports: fee_policy_cfg
@@ -10501,17 +10512,6 @@ fn simulation_result_on_rpc_timeout() -> SimulationResult {
     }
 }
 
-/// Minimum Jito bundle tip for cross-DEX arb (lamports).
-const BUNDLE_TIP_MIN_LAMPORTS: u64 = 100_000;
-/// Maximum Jito bundle tip for cross-DEX arb (lamports).
-const BUNDLE_TIP_MAX_LAMPORTS: u64 = 2_000_000;
-/// Default tip share of estimated arb profit when metadata has no explicit bps (10%).
-const BUNDLE_TIP_DEFAULT_BPS: u64 = 1000;
-/// Maximum total auction spend (tip + priority fee) as share of estimated profit.
-const BUNDLE_AUCTION_MAX_SPEND_BPS: u64 = 1500;
-/// Jito protocol minimum tip (bundles with tip=0 are rejected with -32602).
-const JITO_BUNDLE_TIP_FLOOR_LAMPORTS: u64 = 1_000;
-
 /// Result of dynamic bundle tip computation for cross-DEX arb auction budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EffectiveBundleTip {
@@ -10532,10 +10532,6 @@ fn is_cross_dex_arb_bundle(intent: &TradeIntent) -> bool {
             .is_some_and(|v| v == "true")
 }
 
-fn estimate_priority_fee_lamports(micro_lamports_per_cu: u64, compute_units: u32) -> u64 {
-    (micro_lamports_per_cu as u128 * compute_units as u128 / 1_000_000) as u64
-}
-
 /// Dynamic bundle tip: scale from `estimated_profit_lamports` for cross-DEX arb when metadata present.
 /// Returns `None` equivalent (`AuctionBudgetInsufficient`) when tip would be below Jito floor.
 fn effective_bundle_tip_lamports(
@@ -10544,6 +10540,7 @@ fn effective_bundle_tip_lamports(
     priority_fee_micro_lamports: u64,
     compute_units: u32,
 ) -> EffectiveBundleTip {
+    let auction = &config.bundle_auction;
     let priority_cost = estimate_priority_fee_lamports(priority_fee_micro_lamports, compute_units);
 
     if is_cross_dex_arb_bundle(intent) {
@@ -10556,17 +10553,17 @@ fn effective_bundle_tip_lamports(
                 .metadata
                 .get("bundle_tip_bps")
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(BUNDLE_TIP_DEFAULT_BPS);
+                .unwrap_or(auction.tip_default_bps);
             let profit_tip = (profit as u128 * tip_bps as u128 / 10_000) as u64;
             let max_auction_spend =
-                (profit as u128 * BUNDLE_AUCTION_MAX_SPEND_BPS as u128 / 10_000) as u64;
+                max_auction_spend_lamports(profit, auction.auction_max_spend_bps);
             let max_tip = max_auction_spend.saturating_sub(priority_cost);
             let raw_tip = profit_tip.min(max_tip);
-            let upper = BUNDLE_TIP_MAX_LAMPORTS.min(profit);
-            let lower = if max_tip >= BUNDLE_TIP_MIN_LAMPORTS {
-                BUNDLE_TIP_MIN_LAMPORTS
-            } else if max_tip >= JITO_BUNDLE_TIP_FLOOR_LAMPORTS {
-                JITO_BUNDLE_TIP_FLOOR_LAMPORTS
+            let upper = auction.tip_max_lamports.min(profit);
+            let lower = if max_tip >= auction.tip_min_lamports {
+                auction.tip_min_lamports
+            } else if max_tip >= auction.jito_tip_floor_lamports {
+                auction.jito_tip_floor_lamports
             } else {
                 return EffectiveBundleTip::AuctionBudgetInsufficient {
                     estimated_profit: profit,
@@ -10576,7 +10573,7 @@ fn effective_bundle_tip_lamports(
                 };
             };
             let tip = raw_tip.clamp(lower, upper);
-            if tip < JITO_BUNDLE_TIP_FLOOR_LAMPORTS {
+            if tip < auction.jito_tip_floor_lamports {
                 return EffectiveBundleTip::AuctionBudgetInsufficient {
                     estimated_profit: profit,
                     priority_cost,
@@ -10590,7 +10587,7 @@ fn effective_bundle_tip_lamports(
     let tip = intent
         .bundle_tip_lamports
         .unwrap_or(config.jito_tip_lamports);
-    if tip < JITO_BUNDLE_TIP_FLOOR_LAMPORTS {
+    if tip < auction.jito_tip_floor_lamports {
         return EffectiveBundleTip::AuctionBudgetInsufficient {
             estimated_profit: intent
                 .metadata
@@ -11807,7 +11804,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         details: Some(format!(
                             "estimated_profit={estimated_profit} priority_cost={priority_cost} \
                              max_auction_spend={max_auction_spend} computed_tip={computed_tip} \
-                             jito_min_tip={JITO_BUNDLE_TIP_FLOOR_LAMPORTS}"
+                             jito_min_tip={}",
+                            config.bundle_auction.jito_tip_floor_lamports
                         )),
                     });
                     ctx.lock_manager.release_locks(&intent.intent_id);

@@ -4993,6 +4993,13 @@ pub fn record_arb_bundle_tx_too_large() {
     ARB_BUNDLE_TX_TOO_LARGE.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Cross-DEX bundle opportunities skipped: estimated profit below auction budget minimum.
+pub static ARB_BUNDLE_PROFIT_INSUFFICIENT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub fn record_arb_bundle_profit_insufficient() {
+    ARB_BUNDLE_PROFIT_INSUFFICIENT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Cross-DEX arb bundle omitted token ATA CreateIdempotent (wallet snapshot proved ATA exists).
 pub static ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -10849,6 +10856,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_bundle_tx_too_large_total",
         ARB_BUNDLE_TX_TOO_LARGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_bundle_profit_insufficient_total",
+        ARB_BUNDLE_PROFIT_INSUFFICIENT.load(Ordering::Relaxed)
     );
     line!(
         ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA_LINE,

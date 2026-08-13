@@ -44,6 +44,7 @@ use ironcrab::arbitrage::{
     DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
+use ironcrab::execution::bundle_auction::BundleAuctionParams;
 use ironcrab::execution::live_pool_cache::{
     create_shared_cache, CachedPoolState, LivePoolCache, SharedLivePoolCache,
 };
@@ -87,8 +88,8 @@ use ironcrab::metrics::{
     inc_arb_v2_sell_stale_recovery_outcome_total, inc_arb_vault_balance_applied_total,
     inc_arb_vault_live_snapshot_refreshed_total, inc_arb_vault_live_snapshot_seeded_total,
     inc_arb_vault_rescreen_scheduled_total, inc_arb_vault_seed_from_cache_miss_total,
-    inc_arb_vault_seed_from_cache_ok_total, record_arb_heartbeat_phase,
-    record_arb_intent_suppressed_implausible_token_out,
+    inc_arb_vault_seed_from_cache_ok_total, record_arb_bundle_profit_insufficient,
+    record_arb_heartbeat_phase, record_arb_intent_suppressed_implausible_token_out,
     record_arb_intent_suppressed_unsupported_route, record_arb_price_freshness_stale_age_ms,
     record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
     record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
@@ -240,6 +241,8 @@ struct ArbConfig {
     arb_quote_state_ttl_ms: u64,
     /// Max allowed |buy.as_of_slot - sell.as_of_slot| for v2 round-trip (0 = gate off). Default: 2.
     arb_max_leg_slot_delta: u64,
+    /// Jito bundle auction parameters (from [execution_engine.fee_policy] + jito tip).
+    bundle_auction: BundleAuctionParams,
 }
 
 impl Default for ArbConfig {
@@ -262,6 +265,7 @@ impl Default for ArbConfig {
             arb_quote_trade_ttl_ms: 30_000,
             arb_quote_state_ttl_ms: 120_000,
             arb_max_leg_slot_delta: 2,
+            bundle_auction: BundleAuctionParams::default(),
         };
         sync_arb_probe_to_max_position(&mut cfg);
         cfg
@@ -305,6 +309,18 @@ fn load_initial_arb_config(config_path: &Path) -> ArbConfig {
         cfg.max_slippage_bps = exec.max_slippage_bps;
         cfg.max_position_lamports = exec.max_position_lamports;
     }
+
+    let jito_tip_lamports = app_cfg
+        .execution_engine
+        .as_ref()
+        .and_then(|e| e.jito_tip_lamports)
+        .unwrap_or(10_000);
+    let fee_policy_cfg = app_cfg
+        .execution_engine
+        .as_ref()
+        .and_then(|e| e.fee_policy.as_ref());
+    cfg.bundle_auction =
+        BundleAuctionParams::from_fee_policy_cfg(fee_policy_cfg, jito_tip_lamports);
 
     // Map min_profit_bps -> min_profit_lamports by interpreting it as net profit bps
     // relative to max_position_lamports.
@@ -7399,6 +7415,20 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
         return None;
     }
 
+    let min_bundle_profit = config.bundle_auction.min_profit_for_landing();
+    if opp.estimated_profit_lamports < min_bundle_profit {
+        trace!(
+            mint = %opp.base_mint,
+            spread_bps = opp.spread_bps,
+            profit_lamports = opp.estimated_profit_lamports,
+            min_bundle_profit_lamports = min_bundle_profit,
+            reason = "BUNDLE_PROFIT_INSUFFICIENT",
+            "Skipping arb intent: estimated profit below bundle auction minimum"
+        );
+        record_arb_bundle_profit_insufficient();
+        return None;
+    }
+
     // Both pools have accounts - safe to proceed
     let buy_accts = buy_accounts.unwrap();
     let sell_accts = sell_accounts.unwrap();
@@ -7541,11 +7571,11 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     // Require atomic bundle execution
     intent = intent.with_bundle(Some(100_000)); // 0.0001 SOL tip
 
-    // Add fee hints
+    // Add fee hints (priority hint omitted — EE selects dynamic priority fee)
     intent = intent.with_fee_hints(
-        Some(400_000), // Cross-DEX arb needs more CU
-        Some(100_000), // priority fee micro-lamports
-        Some(1),       // elevated urgency
+        Some(config.bundle_auction.arb_compute_units),
+        None,
+        Some(1), // elevated urgency
     );
 
     // Set TTL
@@ -14256,6 +14286,58 @@ mod pool_accounts_coverage_tests {
             ARB_REJECTED_MISSING_ACCOUNTS.load(Ordering::Relaxed),
             before_missing,
             "missing-accounts reject must not fire when cache backfill succeeded"
+        );
+    }
+
+    #[test]
+    fn arb_skips_publish_when_profit_below_bundle_minimum() {
+        let meteora_pool = Pubkey::new_unique();
+        let orca_pool = Pubkey::new_unique();
+        let cache = usdc_meteora_orca_cache(meteora_pool, orca_pool);
+        let ctx = test_arb_context(cache);
+
+        {
+            let mut config = ctx.config.write();
+            config.bundle_auction = BundleAuctionParams {
+                tip_min_lamports: 100_000,
+                tip_max_lamports: 2_000_000,
+                tip_default_bps: 1000,
+                auction_max_spend_bps: 1500,
+                jito_tip_floor_lamports: 1_000,
+                bundle_min_profit_override: 0,
+                arb_compute_units: 400_000,
+                default_priority_fee_micro_lamports: 100_000,
+                config_jito_tip_lamports: 100_000,
+            };
+        }
+
+        let mut tracker = TokenArbTracker::new(USDC_MINT);
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(pool_state("meteora_dlmm", &meteora_pool.to_string()));
+        tracker.upsert_pool(pool_state("orca", &orca_pool.to_string()));
+        ctx.trackers.write().insert(USDC_MINT.to_string(), tracker);
+
+        let opp = ArbOpportunity {
+            base_mint: USDC_MINT.to_string(),
+            buy_dex: "meteora_dlmm".to_string(),
+            buy_pool: meteora_pool.to_string(),
+            buy_price: Decimal::ONE,
+            sell_dex: "orca".to_string(),
+            sell_pool: orca_pool.to_string(),
+            sell_price: Decimal::ONE,
+            spread_bps: 47,
+            trade_amount_lamports: 100_000_000,
+            estimated_profit_lamports: 423_802,
+        };
+
+        let before = ironcrab::metrics::ARB_BUNDLE_PROFIT_INSUFFICIENT.load(Ordering::Relaxed);
+        assert!(
+            create_arb_intent(&ctx, &opp).is_none(),
+            "prod-case profit must fail bundle auction pre-filter"
+        );
+        assert_eq!(
+            ironcrab::metrics::ARB_BUNDLE_PROFIT_INSUFFICIENT.load(Ordering::Relaxed),
+            before + 1
         );
     }
 

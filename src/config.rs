@@ -381,6 +381,24 @@ pub struct FeePolicyCfg {
     /// Tier1 dynamic fee multiplier. Default: 1.2
     #[serde(default = "default_tier1_fee_multiplier")]
     pub tier1_fee_multiplier: f64,
+    /// Max total Jito auction spend (tip + priority) as bps of estimated arb profit. Default: 1500 (15%)
+    #[serde(default = "default_bundle_auction_max_spend_bps")]
+    pub bundle_auction_max_spend_bps: u64,
+    /// Minimum bundle tip for cross-DEX arb (lamports). Default: 100000
+    #[serde(default = "default_bundle_tip_min_lamports")]
+    pub bundle_tip_min_lamports: u64,
+    /// Default tip share of estimated arb profit when intent metadata has no bundle_tip_bps. Default: 1000 (10%)
+    #[serde(default = "default_bundle_tip_default_bps")]
+    pub bundle_tip_default_bps: u64,
+    /// Maximum bundle tip for cross-DEX arb (lamports). Default: 2000000
+    #[serde(default = "default_bundle_tip_max_lamports")]
+    pub bundle_tip_max_lamports: u64,
+    /// Jito protocol minimum tip (lamports). Default: 1000
+    #[serde(default = "default_jito_bundle_tip_floor_lamports")]
+    pub jito_bundle_tip_floor_lamports: u64,
+    /// Override minimum profit for arb bundle pre-filter; 0 = auto from auction formula. Default: 0
+    #[serde(default = "default_bundle_min_profit_lamports")]
+    pub bundle_min_profit_lamports: u64,
 }
 
 fn default_compute_units() -> u32 {
@@ -413,6 +431,24 @@ fn default_tier1_fee_percentile() -> u8 {
 fn default_tier1_fee_multiplier() -> f64 {
     1.2
 }
+fn default_bundle_auction_max_spend_bps() -> u64 {
+    1500
+}
+fn default_bundle_tip_min_lamports() -> u64 {
+    100_000
+}
+fn default_bundle_tip_default_bps() -> u64 {
+    1000
+}
+fn default_bundle_tip_max_lamports() -> u64 {
+    2_000_000
+}
+fn default_jito_bundle_tip_floor_lamports() -> u64 {
+    1_000
+}
+fn default_bundle_min_profit_lamports() -> u64 {
+    0
+}
 
 impl Default for FeePolicyCfg {
     fn default() -> Self {
@@ -430,6 +466,12 @@ impl Default for FeePolicyCfg {
             liquidation_max_tx_cost_lamports: None,
             tier1_fee_percentile: default_tier1_fee_percentile(),
             tier1_fee_multiplier: default_tier1_fee_multiplier(),
+            bundle_auction_max_spend_bps: default_bundle_auction_max_spend_bps(),
+            bundle_tip_min_lamports: default_bundle_tip_min_lamports(),
+            bundle_tip_default_bps: default_bundle_tip_default_bps(),
+            bundle_tip_max_lamports: default_bundle_tip_max_lamports(),
+            jito_bundle_tip_floor_lamports: default_jito_bundle_tip_floor_lamports(),
+            bundle_min_profit_lamports: default_bundle_min_profit_lamports(),
         }
     }
 }
