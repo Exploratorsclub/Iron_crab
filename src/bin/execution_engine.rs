@@ -34,6 +34,7 @@ use solana_client::rpc_config::{
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_message::VersionedMessage;
+use solana_rpc_client_api::response::RpcSimulateTransactionResult;
 use solana_sdk::bs58;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -76,8 +77,8 @@ use ironcrab::ipc::{
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
-    dec_execution_intent_rx_queue_depth, inc_execution_intent_rx_queue_depth,
-    inc_execution_pool_cache_messages_processed,
+    dec_execution_intent_rx_queue_depth, inc_arb_post_sim_pnl_rejected_total,
+    inc_execution_intent_rx_queue_depth, inc_execution_pool_cache_messages_processed,
     inc_pump_amm_compile_global_config_resolve_mismatch_total, record_arb_bundle_tx_too_large,
     record_execution_engine_interval_tick_duration_ms, record_execution_intent_channel_wait_ms,
     record_execution_intent_jetstream_to_channel_ms, record_execution_process_intent_us,
@@ -244,6 +245,149 @@ fn is_orca_structural_sim_error(error_code: Option<&str>) -> bool {
 
 /// Effective CU limit for cross-DEX arb: plan estimate wins when higher than fee policy.
 #[inline]
+fn cross_dex_post_sim_min_profit_lamports(intent: &TradeIntent, config: &ExecutionConfig) -> i128 {
+    let bundle_min = config.bundle_auction.min_profit_for_landing();
+    let est_min = intent
+        .metadata
+        .get("estimated_profit_lamports")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|p| (p as u128 * 80 / 100) as i128);
+    match est_min {
+        Some(e) => e.max(bundle_min as i128),
+        None => bundle_min as i128,
+    }
+}
+
+fn message_account_keys_from_sim(
+    tx: &VersionedTransaction,
+    sim: &RpcSimulateTransactionResult,
+) -> Vec<Pubkey> {
+    let static_keys: Vec<Pubkey> = match &tx.message {
+        VersionedMessage::Legacy(m) => m.account_keys.clone(),
+        VersionedMessage::V0(m) => m.account_keys.clone(),
+    };
+    let mut keys = static_keys;
+    if let Some(loaded) = sim.loaded_addresses.as_ref() {
+        for s in &loaded.writable {
+            if let Ok(pk) = Pubkey::from_str(s) {
+                keys.push(pk);
+            }
+        }
+        for s in &loaded.readonly {
+            if let Ok(pk) = Pubkey::from_str(s) {
+                keys.push(pk);
+            }
+        }
+    }
+    keys
+}
+
+fn extract_sim_owner_mint_delta_raw(
+    sim: &RpcSimulateTransactionResult,
+    owner: &Pubkey,
+    mint: &str,
+) -> Option<i128> {
+    let pre_balances = sim.pre_token_balances.as_ref()?;
+    let post_balances = sim.post_token_balances.as_ref()?;
+    let owner_str = owner.to_string();
+
+    let mut pre_sum: u128 = 0;
+    let mut post_sum: u128 = 0;
+    for b in pre_balances.iter() {
+        let b_owner = Option::<String>::from(b.owner.clone());
+        if b.mint == mint && b_owner.as_deref() == Some(&owner_str) {
+            if let Ok(v) = u128::from_str(&b.ui_token_amount.amount) {
+                pre_sum = pre_sum.saturating_add(v);
+            }
+        }
+    }
+    for b in post_balances.iter() {
+        let b_owner = Option::<String>::from(b.owner.clone());
+        if b.mint == mint && b_owner.as_deref() == Some(&owner_str) {
+            if let Ok(v) = u128::from_str(&b.ui_token_amount.amount) {
+                post_sum = post_sum.saturating_add(v);
+            }
+        }
+    }
+    if pre_sum == 0 && post_sum == 0 {
+        return None;
+    }
+    Some(post_sum as i128 - pre_sum as i128)
+}
+
+fn compute_sim_wallet_sol_delta_lamports(
+    tx: &VersionedTransaction,
+    sim: &RpcSimulateTransactionResult,
+    wallet: &Pubkey,
+) -> Option<i128> {
+    let account_keys = message_account_keys_from_sim(tx, sim);
+    let wallet_idx = account_keys.iter().position(|k| k == wallet);
+
+    let lamport_delta = wallet_idx.and_then(|idx| {
+        let pre = sim.pre_balances.as_ref()?;
+        let post = sim.post_balances.as_ref()?;
+        let pre_i = pre.get(idx)?;
+        let post_i = post.get(idx)?;
+        Some(*post_i as i128 - *pre_i as i128)
+    });
+
+    let wsol_delta = extract_sim_owner_mint_delta_raw(sim, wallet, SOL_MINT);
+
+    match (lamport_delta, wsol_delta) {
+        (Some(l), Some(w)) => Some(l + w),
+        (Some(l), None) => Some(l),
+        (None, Some(w)) => Some(w),
+        (None, None) => None,
+    }
+}
+
+struct SimulateTransactionOutcome {
+    result: SimulationResult,
+    wallet_sol_delta_lamports: Option<i128>,
+}
+
+async fn publish_arb_terminal_execution_result_on_reject(
+    ctx: &ExecutionContext,
+    decision_id: &str,
+    intent: &TradeIntent,
+    error_message: &str,
+) {
+    if intent.source != "arb-strategy" {
+        return;
+    }
+    let token_mint = Some(intent.resources.output_mint.clone());
+    let mut exec = ExecutionResult::new_sent(
+        "execution-engine",
+        BUILD_VERSION,
+        &ctx.run_id,
+        ctx.next_execution_id(),
+        decision_id.to_string(),
+        intent.intent_id.clone(),
+        intent.source.clone(),
+        token_mint,
+        None,
+        None,
+    )
+    .with_metadata(intent.metadata.clone());
+    exec.status = ExecutionStatus::Failed;
+    exec.error_message = Some(error_message.to_string());
+    if ctx.execution_writer.write(&exec).is_err() {
+        warn!(
+            intent_id = %intent.intent_id,
+            "Failed to write rejected arb ExecutionResult to JSONL"
+        );
+    }
+    if let Some(ref nats) = ctx.nats {
+        if let Err(e) = nats.jetstream_publish(TOPIC_EXECUTION_RESULTS, &exec).await {
+            warn!(
+                error = %e,
+                intent_id = %intent.intent_id,
+                "Failed to publish rejected arb ExecutionResult"
+            );
+        }
+    }
+}
+
 fn cross_dex_effective_compute_units(plan_cu: u32, policy_cu: u32) -> u32 {
     plan_cu.max(policy_cu)
 }
@@ -5607,7 +5751,7 @@ impl ExecutionContext {
                     instructions: vec![close_ix],
                 };
                 let sim = simulate_transaction(ctx, wallet, &plan, None, None).await;
-                if sim.success {
+                if sim.result.success {
                     let config = ctx.get_config();
                     if config.send_enabled {
                         match send_transaction_rpc(
@@ -5634,7 +5778,7 @@ impl ExecutionContext {
                         info!(wallet = %wallet, wsol_ata = %wsol_ata, "send_enabled=false; would unwrap WSOL by closing ATA");
                     }
                 } else {
-                    warn!(wallet = %wallet, wsol_ata = %wsol_ata, error = ?sim.error_code, "WSOL unwrap simulation failed; not sending");
+                    warn!(wallet = %wallet, wsol_ata = %wsol_ata, error = ?sim.result.error_code, "WSOL unwrap simulation failed; not sending");
                 }
             }
         } else if ctx.lock_manager.wsol_balance() > 0
@@ -5745,8 +5889,8 @@ impl ExecutionContext {
             };
 
             let sim = simulate_transaction(ctx, wallet, &plan, None, None).await;
-            if !sim.success {
-                warn!(token_account = %token_account, mint = %mint, token_program = %token_program, error = ?sim.error_code, "Close empty token account simulation failed; not sending");
+            if !sim.result.success {
+                warn!(token_account = %token_account, mint = %mint, token_program = %token_program, error = ?sim.result.error_code, "Close empty token account simulation failed; not sending");
                 continue;
             }
 
@@ -6189,8 +6333,8 @@ impl ExecutionContext {
 
             let plan = tx_builder::TxPlan { instructions: ixs };
             let sim = simulate_transaction(&ctx, wallet, &plan, None, None).await;
-            if !sim.success {
-                warn!(request_id = %request_id, token_account = %token_account_pk, mint = %mint, error = ?sim.error_code, "Burn simulation failed; not sending");
+            if !sim.result.success {
+                warn!(request_id = %request_id, token_account = %token_account_pk, mint = %mint, error = ?sim.result.error_code, "Burn simulation failed; not sending");
                 let rec = BurnOpRecord {
                     header: RecordHeader::new("execution-engine", BUILD_VERSION, &ctx.run_id),
                     request_id: request_id.clone(),
@@ -6202,7 +6346,7 @@ impl ExecutionContext {
                     close_accounts,
                     outcome: "sim_failed".to_string(),
                     signature: None,
-                    error: sim.error_code,
+                    error: sim.result.error_code,
                     reason: reason.clone(),
                 };
                 let _ = ctx.burn_writer.write(&rec);
@@ -11397,6 +11541,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
     let mut pumpfun_bonding_recovery_attempted = false;
     let mut orca_recovery_attempted = false;
     let mut multi_pool_tx_plan_fallback_attempted = false;
+    #[allow(unused_assignments)]
+    let mut sim_wallet_delta_lamports: Option<i128> = None;
     let (
         tx_plan,
         plan_hash_str,
@@ -11874,7 +12020,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
         info!(intent_id = %intent.intent_id, "Running simulation");
 
         let bundle_tip_exclude = bundle_tip_ix.as_ref().map(|ix| ix.accounts[1].pubkey);
-        let sim_result = simulate_transaction(
+        let sim_outcome = simulate_transaction(
             ctx,
             wallet_pubkey,
             &tx_plan_for_sim,
@@ -11882,6 +12028,8 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
             Some(&intent),
         )
         .await;
+        sim_wallet_delta_lamports = sim_outcome.wallet_sol_delta_lamports;
+        let sim_result = sim_outcome.result;
 
         if sim_result.success {
             break (
@@ -12451,6 +12599,53 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                 sim_result.compute_units_consumed
             )),
         });
+    }
+
+    if is_cross_dex_arb_bundle(&intent) && config.send_enabled {
+        if let Some(sim_delta) = sim_wallet_delta_lamports {
+            let min_required = cross_dex_post_sim_min_profit_lamports(&intent, &config);
+            if sim_delta < min_required {
+                inc_arb_post_sim_pnl_rejected_total();
+                let reason = RejectReason::FeeUnprofitable;
+                let estimated_profit = intent
+                    .metadata
+                    .get("estimated_profit_lamports")
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                checks.push(CheckResult {
+                    check_name: "post_sim_pnl".to_string(),
+                    passed: false,
+                    reason_code: Some(reason.to_string()),
+                    details: Some(format!(
+                        "sim_wallet_delta={} min_profit={} estimated_profit={}",
+                        sim_delta, min_required, estimated_profit
+                    )),
+                });
+                ctx.lock_manager.release_locks(&intent.intent_id);
+                publish_arb_terminal_execution_result_on_reject(
+                    ctx,
+                    &decision_id,
+                    &intent,
+                    "post_sim_pnl_unprofitable",
+                )
+                .await;
+                return emit_rejected_decision(ctx, decision_id, &intent, checks, reason).await;
+            }
+            checks.push(CheckResult {
+                check_name: "post_sim_pnl".to_string(),
+                passed: true,
+                reason_code: None,
+                details: Some(format!(
+                    "sim_wallet_delta={} min_profit={}",
+                    sim_delta, min_required
+                )),
+            });
+        } else {
+            warn!(
+                intent_id = %intent.intent_id,
+                "Cross-DEX arb: simulated wallet SOL delta unavailable; post-sim PnL gate skipped"
+            );
+        }
     }
 
     // Track bundle result for decision record
@@ -14011,15 +14206,18 @@ async fn simulate_transaction(
     plan: &tx_builder::TxPlan,
     exclude_tip_from_alt: Option<Pubkey>,
     bundle_size_intent: Option<&TradeIntent>,
-) -> SimulationResult {
+) -> SimulateTransactionOutcome {
     let blockhash = match ctx.get_latest_blockhash().await {
         Ok(hash) => hash,
         Err(e) => {
-            return SimulationResult {
-                success: false,
-                error_code: Some(format!("blockhash_error:{e}")),
-                logs_preview: None,
-                compute_units_consumed: None,
+            return SimulateTransactionOutcome {
+                result: SimulationResult {
+                    success: false,
+                    error_code: Some(format!("blockhash_error:{e}")),
+                    logs_preview: None,
+                    compute_units_consumed: None,
+                },
+                wallet_sol_delta_lamports: None,
             };
         }
     };
@@ -14035,11 +14233,14 @@ async fn simulate_transaction(
         ) {
             Ok(tx) => tx,
             Err(e) => {
-                return SimulationResult {
-                    success: false,
-                    error_code: Some(e),
-                    logs_preview: None,
-                    compute_units_consumed: None,
+                return SimulateTransactionOutcome {
+                    result: SimulationResult {
+                        success: false,
+                        error_code: Some(e),
+                        logs_preview: None,
+                        compute_units_consumed: None,
+                    },
+                    wallet_sol_delta_lamports: None,
                 };
             }
         }
@@ -14053,11 +14254,14 @@ async fn simulate_transaction(
         ) {
             Ok(tx) => tx,
             Err(e) => {
-                return SimulationResult {
-                    success: false,
-                    error_code: Some(e),
-                    logs_preview: None,
-                    compute_units_consumed: None,
+                return SimulateTransactionOutcome {
+                    result: SimulationResult {
+                        success: false,
+                        error_code: Some(e),
+                        logs_preview: None,
+                        compute_units_consumed: None,
+                    },
+                    wallet_sol_delta_lamports: None,
                 };
             }
         }
@@ -14079,11 +14283,14 @@ async fn simulate_transaction(
                 "before_simulation_rpc",
             );
         }
-        return SimulationResult {
-            success: false,
-            error_code: Some(size_err),
-            logs_preview: None,
-            compute_units_consumed: None,
+        return SimulateTransactionOutcome {
+            result: SimulationResult {
+                success: false,
+                error_code: Some(size_err),
+                logs_preview: None,
+                compute_units_consumed: None,
+            },
+            wallet_sol_delta_lamports: None,
         };
     }
 
@@ -14096,11 +14303,14 @@ async fn simulate_transaction(
                 &audit_err,
                 "before_simulation_rpc",
             );
-            return SimulationResult {
-                success: false,
-                error_code: Some(audit_err.detail()),
-                logs_preview: None,
-                compute_units_consumed: None,
+            return SimulateTransactionOutcome {
+                result: SimulationResult {
+                    success: false,
+                    error_code: Some(audit_err.detail()),
+                    logs_preview: None,
+                    compute_units_consumed: None,
+                },
+                wallet_sol_delta_lamports: None,
             };
         }
     }
@@ -14108,6 +14318,7 @@ async fn simulate_transaction(
     let cfg = RpcSimulateTransactionConfig {
         sig_verify: false,
         replace_recent_blockhash: true,
+        inner_instructions: true,
         commitment: Some(CommitmentConfig::processed()),
         ..RpcSimulateTransactionConfig::default()
     };
@@ -14128,30 +14339,48 @@ async fn simulate_transaction(
                 s
             });
 
+            let wallet_sol_delta_lamports = if value.err.is_none() {
+                compute_sim_wallet_sol_delta_lamports(&tx, &value, &wallet_pubkey)
+            } else {
+                None
+            };
+
             match value.err {
-                None => SimulationResult {
-                    success: true,
-                    error_code: None,
-                    logs_preview,
-                    compute_units_consumed: value.units_consumed,
+                None => SimulateTransactionOutcome {
+                    result: SimulationResult {
+                        success: true,
+                        error_code: None,
+                        logs_preview,
+                        compute_units_consumed: value.units_consumed,
+                    },
+                    wallet_sol_delta_lamports,
                 },
-                Some(err) => SimulationResult {
-                    success: false,
-                    error_code: Some(format!("{err:?}")),
-                    logs_preview,
-                    compute_units_consumed: value.units_consumed,
+                Some(err) => SimulateTransactionOutcome {
+                    result: SimulationResult {
+                        success: false,
+                        error_code: Some(format!("{err:?}")),
+                        logs_preview,
+                        compute_units_consumed: value.units_consumed,
+                    },
+                    wallet_sol_delta_lamports: None,
                 },
             }
         }
-        Ok(Err(e)) => SimulationResult {
-            success: false,
-            error_code: Some(format!("rpc_error:{e}")),
-            logs_preview: None,
-            compute_units_consumed: None,
+        Ok(Err(e)) => SimulateTransactionOutcome {
+            result: SimulationResult {
+                success: false,
+                error_code: Some(format!("rpc_error:{e}")),
+                logs_preview: None,
+                compute_units_consumed: None,
+            },
+            wallet_sol_delta_lamports: None,
         },
         Err(_elapsed) => {
             SIM_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
-            simulation_result_on_rpc_timeout()
+            SimulateTransactionOutcome {
+                result: simulation_result_on_rpc_timeout(),
+                wallet_sol_delta_lamports: None,
+            }
         }
     }
 }

@@ -29,6 +29,7 @@
 
 pub mod arb_slave_sync;
 pub mod cycle_finder;
+pub mod in_flight;
 pub mod multi_hop_integration;
 pub mod pool_graph;
 pub mod pool_quote;

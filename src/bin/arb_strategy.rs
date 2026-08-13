@@ -29,6 +29,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
+use ironcrab::arbitrage::in_flight::{
+    in_flight_key_from_intent_metadata, InFlightArbKey, InFlightArbRegistry,
+};
 use ironcrab::arbitrage::{
     arb_track_removal_reason, classify_cross_dex_sell_failure, dlmm_marginal_price_plausible,
     dlmm_sol_output_from_bins, dlmm_token_output_from_bins, freshness_age_bucket,
@@ -49,6 +52,7 @@ use ironcrab::execution::live_pool_cache::{
     create_shared_cache, CachedPoolState, LivePoolCache, SharedLivePoolCache,
 };
 use ironcrab::execution::pool_cache_sync::bootstrap_pool_cache_from_jetstream;
+use ironcrab::ipc::ExecutionResult;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
     IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate, PoolCacheUpdateType, TradeIntent,
@@ -81,8 +85,9 @@ use ironcrab::metrics::{
     arb_two_hop_v2_state_stale_age_bucket_inc, arb_vault_live_snapshot_cache_age_bucket_inc,
     arb_vault_live_snapshot_cache_age_pin_bucket_inc, inc_arb_dlmm_bin_array_update_applied_total,
     inc_arb_dlmm_bin_array_update_received_total, inc_arb_dlmm_bin_rescreen_scheduled_total,
-    inc_arb_pinned_meteora_pool_bin_cache_miss_total, inc_arb_pool_accounts_backfill,
-    inc_arb_v2_screen_meteora_sell_bin_hit_total, inc_arb_v2_screen_meteora_sell_bin_miss_total,
+    inc_arb_in_flight_dedup_blocked_total, inc_arb_pinned_meteora_pool_bin_cache_miss_total,
+    inc_arb_pool_accounts_backfill, inc_arb_v2_screen_meteora_sell_bin_hit_total,
+    inc_arb_v2_screen_meteora_sell_bin_miss_total,
     inc_arb_v2_screen_sell_stale_recovery_scheduled_total,
     inc_arb_v2_screen_sell_stale_then_fresh_after_pin_total,
     inc_arb_v2_sell_stale_recovery_outcome_total, inc_arb_vault_balance_applied_total,
@@ -120,9 +125,11 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
-    config_subject, split_arb_track_requests_update, trim_reconcile_update_to_budget,
-    ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRemovedEntry,
-    ArbTrackRequestsUpdate, ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, STREAM_NAME,
+    config_subject, ensure_execution_results_stream, execution_results_consumer_config,
+    split_arb_track_requests_update, trim_reconcile_update_to_budget, ArbTrackActiveEntry,
+    ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRemovedEntry, ArbTrackRequestsUpdate,
+    ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME,
+    STREAM_NAME, TOPIC_EXECUTION_RESULTS,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
@@ -4725,6 +4732,14 @@ async fn publish_arb_intent(ctx: &ArbContext, intent: &TradeIntent) {
             NATS_MESSAGES_PUBLISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
             INTENTS_GENERATED_TOTAL.fetch_add(1, Ordering::Relaxed);
             ctx.intents_generated.fetch_add(1, Ordering::Relaxed);
+            if let Some(key) =
+                in_flight_key_from_intent_metadata(&intent.metadata, &intent.resources.output_mint)
+            {
+                let ttl_ms = intent.ttl_ms.unwrap_or(5000);
+                ctx.in_flight_arbs
+                    .write()
+                    .register(key, intent.intent_id.clone(), ttl_ms);
+            }
             info!(
                 intent_id = %intent.intent_id,
                 mint = %intent.resources.output_mint,
@@ -4967,6 +4982,8 @@ struct ArbContext {
     pool_accounts_index: RwLock<HashMap<String, Vec<String>>>,
     /// DexPoolAccounts received before mint tracker exists (bounded side-map).
     pending_pool_accounts: RwLock<HashMap<String, PendingDexPoolAccountsEntry>>,
+    /// In-flight cross-DEX arb routes (mint + buy/sell dex/pool) until EE terminal outcome.
+    in_flight_arbs: RwLock<InFlightArbRegistry>,
 }
 
 /// Cached vault balances from PoolStateUpdate events
@@ -6844,6 +6861,31 @@ impl ArbContext {
         intent_cooldown_ms: u64,
         opp: ArbOpportunity,
     ) -> Option<ArbOpportunity> {
+        let route_key = InFlightArbKey::from_metadata(
+            &opp.base_mint,
+            &opp.buy_dex,
+            &opp.sell_dex,
+            &opp.buy_pool,
+            &opp.sell_pool,
+        );
+        {
+            let mut registry = self.in_flight_arbs.write();
+            registry.expire_stale();
+            if let Some(in_flight_id) = registry.blocking_intent_id(&route_key) {
+                inc_arb_in_flight_dedup_blocked_total();
+                debug!(
+                    mint = %opp.base_mint,
+                    buy_dex = %opp.buy_dex,
+                    sell_dex = %opp.sell_dex,
+                    buy_pool = %opp.buy_pool,
+                    sell_pool = %opp.sell_pool,
+                    in_flight_intent_id = %in_flight_id,
+                    "Skipping arb opportunity: route still in-flight at EE"
+                );
+                return None;
+            }
+        }
+
         let cooldown = Duration::from_millis(intent_cooldown_ms);
         let mut trackers = self.trackers.write();
         let tracker = trackers.get_mut(mint)?;
@@ -8068,6 +8110,53 @@ fn spawn_arb_tracker_write_worker(
     });
 }
 
+fn spawn_arb_execution_results_worker(ctx: Arc<ArbContext>, consumer: JetStreamPullConsumer) {
+    tokio::spawn(async move {
+        use futures::StreamExt;
+
+        loop {
+            let mut messages = match consumer
+                .fetch()
+                .max_messages(32)
+                .expires(Duration::from_secs(1))
+                .messages()
+                .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    trace!(error = %e, "ExecutionResult JetStream fetch failed (may be empty)");
+                    continue;
+                }
+            };
+
+            while let Some(msg_res) = messages.next().await {
+                match msg_res {
+                    Ok(msg) => {
+                        NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        match serde_json::from_slice::<ExecutionResult>(&msg.payload) {
+                            Ok(exec) => {
+                                ctx.in_flight_arbs.write().handle_execution_result(&exec);
+                                if let Err(e) = msg.ack().await {
+                                    warn!(error = %e, "Failed to ack ExecutionResult JetStream message");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to deserialize ExecutionResult");
+                                if let Err(ack_e) = msg.ack().await {
+                                    warn!(error = %ack_e, "Failed to ack bad ExecutionResult message");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Error receiving ExecutionResult JetStream message");
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn spawn_arb_pool_cache_sync_worker(ctx: Arc<ArbContext>, consumer: JetStreamPullConsumer) {
     tokio::spawn(async move {
         loop {
@@ -8321,6 +8410,7 @@ async fn main() -> Result<()> {
         v2_sell_stale_recovery_pending: RwLock::new(HashMap::new()),
         pool_accounts_index: RwLock::new(HashMap::new()),
         pending_pool_accounts: RwLock::new(HashMap::new()),
+        in_flight_arbs: RwLock::new(InFlightArbRegistry::new()),
     });
 
     spawn_arb_tracker_write_worker(Arc::clone(&ctx), tracker_write_rx);
@@ -8495,6 +8585,46 @@ async fn main() -> Result<()> {
         None
     };
 
+    // JetStream consumer for ExecutionResults — release in-flight arb dedup on terminal EE outcomes.
+    let execution_results_consumer = if let Some(ref nats) = ctx.nats {
+        if let Err(e) = ensure_execution_results_stream(nats.client()).await {
+            warn!(error = %e, "Failed to ensure EXECUTION_RESULTS JetStream stream");
+        }
+
+        use async_nats::jetstream;
+
+        let jetstream = jetstream::new(nats.client().clone());
+        match jetstream.get_stream(EXECUTION_RESULTS_STREAM_NAME).await {
+            Ok(stream) => match stream
+                .create_consumer(execution_results_consumer_config("arb-strategy"))
+                .await
+            {
+                Ok(consumer) => {
+                    info!(
+                        stream = EXECUTION_RESULTS_STREAM_NAME,
+                        topic = TOPIC_EXECUTION_RESULTS,
+                        "Subscribed to ExecutionResults for in-flight arb dedup"
+                    );
+                    Some(consumer)
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to create arb ExecutionResults JetStream consumer");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    stream = EXECUTION_RESULTS_STREAM_NAME,
+                    "ExecutionResults JetStream stream not found"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Multi-hop intent publisher (decoupled from search worker)
     let multi_hop_publish_ctx = ctx.clone();
     tokio::spawn(async move {
@@ -8544,6 +8674,10 @@ async fn main() -> Result<()> {
     if let Some(consumer) = pool_cache_consumer {
         info!("Starting dedicated PoolCache JetStream sync worker (decoupled from main loop)");
         spawn_arb_pool_cache_sync_worker(ctx.clone(), consumer);
+    }
+    if let Some(consumer) = execution_results_consumer {
+        info!("Starting dedicated ExecutionResults JetStream worker (in-flight arb dedup)");
+        spawn_arb_execution_results_worker(ctx.clone(), consumer);
     }
     if let Some(consumer) = config_js_consumer {
         info!("Starting dedicated JetStream config consumer worker (decoupled from main loop)");
@@ -8602,6 +8736,7 @@ async fn main() -> Result<()> {
 
             // Heartbeat
             _ = heartbeat_interval.tick() => {
+                ctx.in_flight_arbs.write().expire_stale();
                 tick_arb_heartbeat_seconds_since_last_finish();
 
                 let (records, bytes) = ctx.jsonl_writer.stats();
@@ -9410,6 +9545,7 @@ mod event_pipeline_tests {
             v2_sell_stale_recovery_pending: RwLock::new(HashMap::new()),
             pool_accounts_index: RwLock::new(HashMap::new()),
             pending_pool_accounts: RwLock::new(HashMap::new()),
+            in_flight_arbs: RwLock::new(InFlightArbRegistry::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9525,6 +9661,7 @@ mod event_pipeline_tests {
             v2_sell_stale_recovery_pending: RwLock::new(HashMap::new()),
             pool_accounts_index: RwLock::new(HashMap::new()),
             pending_pool_accounts: RwLock::new(HashMap::new()),
+            in_flight_arbs: RwLock::new(InFlightArbRegistry::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9638,6 +9775,7 @@ mod event_pipeline_tests {
             v2_sell_stale_recovery_pending: RwLock::new(HashMap::new()),
             pool_accounts_index: RwLock::new(HashMap::new()),
             pending_pool_accounts: RwLock::new(HashMap::new()),
+            in_flight_arbs: RwLock::new(InFlightArbRegistry::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -9822,6 +9960,7 @@ mod event_pipeline_tests {
             v2_sell_stale_recovery_pending: RwLock::new(HashMap::new()),
             pool_accounts_index: RwLock::new(HashMap::new()),
             pending_pool_accounts: RwLock::new(HashMap::new()),
+            in_flight_arbs: RwLock::new(InFlightArbRegistry::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
         spawn_arb_two_hop_worker(ctx.clone(), two_hop_rx);
@@ -10019,6 +10158,7 @@ mod event_pipeline_tests {
             v2_sell_stale_recovery_pending: RwLock::new(HashMap::new()),
             pool_accounts_index: RwLock::new(HashMap::new()),
             pending_pool_accounts: RwLock::new(HashMap::new()),
+            in_flight_arbs: RwLock::new(InFlightArbRegistry::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -10130,6 +10270,7 @@ mod event_pipeline_tests {
             v2_sell_stale_recovery_pending: RwLock::new(HashMap::new()),
             pool_accounts_index: RwLock::new(HashMap::new()),
             pending_pool_accounts: RwLock::new(HashMap::new()),
+            in_flight_arbs: RwLock::new(InFlightArbRegistry::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -10245,6 +10386,7 @@ mod event_pipeline_tests {
             v2_sell_stale_recovery_pending: RwLock::new(HashMap::new()),
             pool_accounts_index: RwLock::new(HashMap::new()),
             pending_pool_accounts: RwLock::new(HashMap::new()),
+            in_flight_arbs: RwLock::new(InFlightArbRegistry::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -10331,6 +10473,7 @@ mod event_pipeline_tests {
             v2_sell_stale_recovery_pending: RwLock::new(HashMap::new()),
             pool_accounts_index: RwLock::new(HashMap::new()),
             pending_pool_accounts: RwLock::new(HashMap::new()),
+            in_flight_arbs: RwLock::new(InFlightArbRegistry::new()),
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
@@ -10429,6 +10572,7 @@ fn test_arb_context(live_pool_cache: SharedLivePoolCache) -> ArbContext {
         v2_sell_stale_recovery_pending: RwLock::new(HashMap::new()),
         pool_accounts_index: RwLock::new(HashMap::new()),
         pending_pool_accounts: RwLock::new(HashMap::new()),
+        in_flight_arbs: RwLock::new(InFlightArbRegistry::new()),
     }
 }
 
