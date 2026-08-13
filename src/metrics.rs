@@ -5000,6 +5000,20 @@ pub fn record_arb_bundle_profit_insufficient() {
     ARB_BUNDLE_PROFIT_INSUFFICIENT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Cross-DEX arb intents blocked while the same mint+route is still in-flight at EE.
+pub static ARB_IN_FLIGHT_DEDUP_BLOCKED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub fn inc_arb_in_flight_dedup_blocked_total() {
+    ARB_IN_FLIGHT_DEDUP_BLOCKED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Cross-DEX arb bundles rejected after simulation due to negative / below-min net WSOL delta.
+pub static ARB_POST_SIM_PNL_REJECTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub fn inc_arb_post_sim_pnl_rejected_total() {
+    ARB_POST_SIM_PNL_REJECTED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Cross-DEX arb bundle omitted token ATA CreateIdempotent (wallet snapshot proved ATA exists).
 pub static ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -10860,6 +10874,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_bundle_profit_insufficient_total",
         ARB_BUNDLE_PROFIT_INSUFFICIENT.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_in_flight_dedup_blocked_total",
+        ARB_IN_FLIGHT_DEDUP_BLOCKED.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_post_sim_pnl_rejected_total",
+        ARB_POST_SIM_PNL_REJECTED.load(Ordering::Relaxed)
     );
     line!(
         ARB_BUNDLE_ATA_CREATE_SKIPPED_KNOWN_ATA_LINE,
