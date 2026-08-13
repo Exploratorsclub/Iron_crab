@@ -261,3 +261,21 @@ host = "127.0.0.1"
 port = 8080
 # API key for authentication (generate with: openssl rand -hex 32)
 # api_key = "your-secret-key"
+
+# -----------------------------------------------------------------------------
+# Execution Engine (execution-engine binary)
+# -----------------------------------------------------------------------------
+[execution_engine]
+jito_enabled = true
+jito_tip_lamports = 100000   # 0.0001 SOL — cross-DEX bundle min tip floor with auction math
+
+[execution_engine.fee_policy]
+default_priority_fee_micro_lamports = 100000
+arb_compute_units = 400000
+# Jito bundle auction budget (shared with arb-strategy pre-filter)
+bundle_auction_max_spend_bps = 1500      # 15% of estimated profit cap (tip + priority)
+bundle_tip_min_lamports = 100000
+bundle_tip_default_bps = 1000            # 10% of profit when intent has no bundle_tip_bps
+bundle_tip_max_lamports = 2000000
+jito_bundle_tip_floor_lamports = 1000
+# bundle_min_profit_lamports = 0         # 0 = auto from formula (min tip + assumed priority)
