@@ -9,6 +9,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOCAL_RPC = os.environ.get("VALIDATOR_LAG_LOCAL_RPC", "http://127.0.0.1:8899")
@@ -16,7 +17,8 @@ REF_RPC = os.environ.get(
     "VALIDATOR_LAG_REFERENCE_RPC", "https://api.mainnet-beta.solana.com"
 )
 LISTEN = os.environ.get("VALIDATOR_LAG_LISTEN", "127.0.0.1:9180")
-INTERVAL = float(os.environ.get("VALIDATOR_LAG_INTERVAL_SEC", "10"))
+INTERVAL = float(os.environ.get("VALIDATOR_LAG_INTERVAL_SEC", "5"))
+SLOT_COMMITMENT = os.environ.get("VALIDATOR_LAG_COMMITMENT", "confirmed")
 
 _lock = threading.Lock()
 _metrics = {
@@ -31,7 +33,12 @@ _metrics = {
 
 def get_slot(rpc_url: str) -> int:
     payload = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": "getSlot", "params": []}
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSlot",
+            "params": [{"commitment": SLOT_COMMITMENT}],
+        }
     ).encode()
     req = urllib.request.Request(
         rpc_url,
@@ -49,8 +56,11 @@ def get_slot(rpc_url: str) -> int:
 def poll_loop() -> None:
     while True:
         try:
-            local = get_slot(LOCAL_RPC)
-            reference = get_slot(REF_RPC)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                local_future = pool.submit(get_slot, LOCAL_RPC)
+                reference_future = pool.submit(get_slot, REF_RPC)
+                local = local_future.result()
+                reference = reference_future.result()
             with _lock:
                 _metrics["ironcrab_validator_local_slot"] = local
                 _metrics["ironcrab_validator_reference_slot"] = reference

@@ -2,7 +2,7 @@
   "title": "IronCrab Multi-Process Architecture",
   "description": "Dashboard for the Debuggable-First Multi-Process Architecture",
   "schemaVersion": 39,
-  "version": 9,
+  "version": 10,
   "time": {
     "from": "now-1h",
     "to": "now"
@@ -299,9 +299,8 @@
       "description": "Systemweite CPU-Auslastung (alle Kerne, node-exporter)",
       "targets": [
         {
-          "expr": "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[2m])))",
-          "refId": "A",
-          "instant": true
+          "expr": "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[5m])))",
+          "refId": "A"
         }
       ],
       "gridPos": {
@@ -470,10 +469,11 @@
       "description": "CPU- und RAM-Auslastung ueber Zeit",
       "targets": [
         {
-          "expr": "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[2m])))",
+          "expr": "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[5m])))",
           "refId": "A",
           "legendFormat": "CPU %",
-          "interval": "30s"
+          "interval": "1m",
+          "minInterval": "1m"
         },
         {
           "expr": "(1 - node_memory_MemAvailable_bytes{job=\"node-exporter\"} / node_memory_MemTotal_bytes{job=\"node-exporter\"}) * 100",
@@ -600,7 +600,7 @@
     {
       "type": "stat",
       "title": "Slots Behind",
-      "description": "Echter Slot-Rueckstand vs. Mainnet (local getSlot vs. public RPC)",
+      "description": "Echter Slot-Rueckstand vs. Mainnet (getSlot confirmed, parallel wie solana catchup)",
       "targets": [
         {
           "expr": "ironcrab_validator_slots_behind{job=\"validator-lag-exporter\"}",
