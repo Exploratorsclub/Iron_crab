@@ -1257,7 +1257,7 @@
               "relativeTimeRange": { "from": 300, "to": 0 },
               "datasourceUid": "bf5zln2g4x5vka",
               "model": {
-                "expr": "ironcrab_validator_slots_behind{job=\"validator-lag-exporter\"}",
+                "expr": "(ironcrab_validator_slots_behind{job=\"validator-lag-exporter\"} > 100) or (ironcrab_validator_lag_scrape_success{job=\"validator-lag-exporter\"} == 0)",
                 "refId": "A"
               }
             },
@@ -1270,7 +1270,7 @@
               "refId": "C",
               "datasourceUid": "__expr__",
               "model": {
-                "conditions": [{ "evaluator": { "params": [100], "type": "gt" } }],
+                "conditions": [{ "evaluator": { "params": [0], "type": "gt" } }],
                 "expression": "B", "refId": "C", "type": "threshold"
               }
             }
@@ -1294,7 +1294,7 @@
               "relativeTimeRange": { "from": 300, "to": 0 },
               "datasourceUid": "bf5zln2g4x5vka",
               "model": {
-                "expr": "ironcrab_validator_slots_behind{job=\"validator-lag-exporter\"}",
+                "expr": "(ironcrab_validator_slots_behind{job=\"validator-lag-exporter\"} > 1000) and (ironcrab_validator_lag_scrape_success{job=\"validator-lag-exporter\"} == 1)",
                 "refId": "A"
               }
             },
@@ -1307,7 +1307,7 @@
               "refId": "C",
               "datasourceUid": "__expr__",
               "model": {
-                "conditions": [{ "evaluator": { "params": [1000], "type": "gt" } }],
+                "conditions": [{ "evaluator": { "params": [0], "type": "gt" } }],
                 "expression": "B", "refId": "C", "type": "threshold"
               }
             }
