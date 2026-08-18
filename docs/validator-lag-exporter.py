@@ -61,7 +61,7 @@ def poll_loop() -> None:
                 )
         except Exception:
             with _lock:
-                _metrics["ironcrab_validator_slots_behind"] = -1
+                _metrics["ironcrab_validator_slots_behind"] = float("nan")
                 _metrics["ironcrab_validator_lag_scrape_success"] = 0
                 _metrics["ironcrab_validator_lag_scrape_errors_total"] += 1
         time.sleep(INTERVAL)
