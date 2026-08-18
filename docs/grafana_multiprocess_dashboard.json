@@ -2,7 +2,7 @@
   "title": "IronCrab Multi-Process Architecture",
   "description": "Dashboard for the Debuggable-First Multi-Process Architecture",
   "schemaVersion": 39,
-  "version": 10,
+  "version": 11,
   "time": {
     "from": "now-1h",
     "to": "now"
@@ -466,14 +466,13 @@
     {
       "type": "timeseries",
       "title": "CPU & RAM Over Time",
-      "description": "CPU- und RAM-Auslastung ueber Zeit",
+      "description": "CPU- und RAM-Auslastung ueber Zeit (CPU: gleiche 5m-Query wie Gauge, 30s-Abtastung)",
       "targets": [
         {
           "expr": "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[5m])))",
           "refId": "A",
           "legendFormat": "CPU %",
-          "interval": "1m",
-          "minInterval": "1m"
+          "interval": "30s"
         },
         {
           "expr": "(1 - node_memory_MemAvailable_bytes{job=\"node-exporter\"} / node_memory_MemTotal_bytes{job=\"node-exporter\"}) * 100",
