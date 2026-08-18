@@ -752,7 +752,7 @@ impl LivePoolCache {
         if let Some(mapping) = self.vault_to_pool.get(vault) {
             let (pool_addr, position) = *mapping;
             if let Some(mut entry) = self.pools.get_mut(&pool_addr) {
-                if slot > 0 && slot < entry.last_seen_slot {
+                if slot > 0 && slot < entry.slot {
                     return;
                 }
                 let balance_changed = match &entry.state {
