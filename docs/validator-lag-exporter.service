@@ -9,7 +9,8 @@ Group=sol
 Environment=VALIDATOR_LAG_LOCAL_RPC=http://127.0.0.1:8899
 Environment=VALIDATOR_LAG_REFERENCE_RPC=https://api.mainnet-beta.solana.com
 Environment=VALIDATOR_LAG_LISTEN=127.0.0.1:9180
-Environment=VALIDATOR_LAG_INTERVAL_SEC=10
+Environment=VALIDATOR_LAG_INTERVAL_SEC=5
+Environment=VALIDATOR_LAG_COMMITMENT=confirmed
 ExecStart=/usr/local/bin/validator-lag-exporter
 Restart=on-failure
 RestartSec=10
