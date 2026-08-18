@@ -1,0 +1,22 @@
+[Unit]
+Description=Validator Lag Exporter (real slot lag vs mainnet for Prometheus)
+After=network-online.target agave-validator.service
+Wants=network-online.target
+
+[Service]
+User=sol
+Group=sol
+Environment=VALIDATOR_LAG_LOCAL_RPC=http://127.0.0.1:8899
+Environment=VALIDATOR_LAG_REFERENCE_RPC=https://api.mainnet-beta.solana.com
+Environment=VALIDATOR_LAG_LISTEN=127.0.0.1:9180
+Environment=VALIDATOR_LAG_INTERVAL_SEC=10
+ExecStart=/usr/local/bin/validator-lag-exporter
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=validator-lag-exporter
+
+[Install]
+WantedBy=multi-user.target

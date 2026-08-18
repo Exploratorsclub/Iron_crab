@@ -1257,7 +1257,7 @@
               "relativeTimeRange": { "from": 300, "to": 0 },
               "datasourceUid": "bf5zln2g4x5vka",
               "model": {
-                "expr": "solana_node_num_slots_behind{job=\"solana-exporter\"}",
+                "expr": "ironcrab_validator_slots_behind{job=\"validator-lag-exporter\"}",
                 "refId": "A"
               }
             },
@@ -1294,7 +1294,7 @@
               "relativeTimeRange": { "from": 300, "to": 0 },
               "datasourceUid": "bf5zln2g4x5vka",
               "model": {
-                "expr": "solana_node_num_slots_behind{job=\"solana-exporter\"}",
+                "expr": "ironcrab_validator_slots_behind{job=\"validator-lag-exporter\"}",
                 "refId": "A"
               }
             },

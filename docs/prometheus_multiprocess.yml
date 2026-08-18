@@ -53,3 +53,9 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9179']
     scrape_interval: 10s
+
+  # Validator Lag Exporter (real slot lag: local getSlot vs mainnet reference RPC)
+  - job_name: 'validator-lag-exporter'
+    static_configs:
+      - targets: ['localhost:9180']
+    scrape_interval: 10s

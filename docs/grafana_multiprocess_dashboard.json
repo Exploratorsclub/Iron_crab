@@ -2,7 +2,7 @@
   "title": "IronCrab Multi-Process Architecture",
   "description": "Dashboard for the Debuggable-First Multi-Process Architecture",
   "schemaVersion": 39,
-  "version": 8,
+  "version": 9,
   "time": {
     "from": "now-1h",
     "to": "now"
@@ -296,11 +296,12 @@
     {
       "type": "gauge",
       "title": "CPU Usage",
-      "description": "Aktuelle CPU-Auslastung (alle Kerne)",
+      "description": "Systemweite CPU-Auslastung (alle Kerne, node-exporter)",
       "targets": [
         {
-          "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[1m])) * 100)",
-          "refId": "A"
+          "expr": "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[2m])))",
+          "refId": "A",
+          "instant": true
         }
       ],
       "gridPos": {
@@ -308,6 +309,17 @@
         "w": 4,
         "x": 0,
         "y": 7
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
       },
       "fieldConfig": {
         "defaults": {
@@ -458,7 +470,7 @@
       "description": "CPU- und RAM-Auslastung ueber Zeit",
       "targets": [
         {
-          "expr": "(1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[$__rate_interval]))) * 100",
+          "expr": "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",job=\"node-exporter\"}[2m])))",
           "refId": "A",
           "legendFormat": "CPU %",
           "interval": "30s"
@@ -588,11 +600,12 @@
     {
       "type": "stat",
       "title": "Slots Behind",
-      "description": "Anzahl Slots hinter dem Cluster",
+      "description": "Echter Slot-Rueckstand vs. Mainnet (local getSlot vs. public RPC)",
       "targets": [
         {
-          "expr": "solana_node_num_slots_behind{job=\"solana-exporter\"}",
-          "refId": "A"
+          "expr": "ironcrab_validator_slots_behind{job=\"validator-lag-exporter\"}",
+          "refId": "A",
+          "instant": true
         }
       ],
       "gridPos": {
@@ -617,15 +630,15 @@
               },
               {
                 "color": "yellow",
-                "value": 50
+                "value": 3
               },
               {
                 "color": "orange",
-                "value": 200
+                "value": 50
               },
               {
                 "color": "red",
-                "value": 1000
+                "value": 200
               }
             ]
           }
@@ -689,10 +702,10 @@
     {
       "type": "timeseries",
       "title": "Slots Behind Over Time",
-      "description": "Sync-Abstand zum Cluster ueber Zeit",
+      "description": "Echter Slot-Rueckstand vs. Mainnet ueber Zeit",
       "targets": [
         {
-          "expr": "solana_node_num_slots_behind{job=\"solana-exporter\"}",
+          "expr": "ironcrab_validator_slots_behind{job=\"validator-lag-exporter\"}",
           "refId": "A",
           "legendFormat": "Slots Behind"
         }
@@ -724,15 +737,15 @@
               },
               {
                 "color": "yellow",
-                "value": 50
+                "value": 3
               },
               {
                 "color": "orange",
-                "value": 200
+                "value": 50
               },
               {
                 "color": "red",
-                "value": 1000
+                "value": 200
               }
             ]
           }
