@@ -23,7 +23,8 @@ Endpoints:
 - GET /ready - Readiness probe (K8s/Systemd)
 - GET /status - System status (all components)
 - GET /positions - Current open positions
-- GET /metrics - Aggregated metrics from all components
+- GET /metrics - Prometheus metrics for monitoring scrapes
+- GET /metrics/summary - Aggregated JSON metrics from all components (UI)
 - POST /config - Update configuration
 - POST /kill - Emergency kill switch
 - POST /command/{component} - Send command to component via NATS
@@ -44,6 +45,7 @@ from contextlib import asynccontextmanager
 import shlex
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, Security
+from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -960,8 +962,46 @@ async def get_positions(user: User = Depends(require_viewer)):
     }
 
 @app.get("/metrics")
+async def prometheus_metrics():
+    """Prometheus scrape endpoint (text format, no auth — localhost scraper only)."""
+    lines = [
+        "# HELP control_plane_up Control plane process is running",
+        "# TYPE control_plane_up gauge",
+        "control_plane_up 1",
+        "# HELP control_plane_kill_switch_active Kill switch state in control plane",
+        "# TYPE control_plane_kill_switch_active gauge",
+        f"control_plane_kill_switch_active {1 if state.kill_switch_active else 0}",
+        "# HELP control_plane_component_reachable Component liveness from control plane",
+        "# TYPE control_plane_component_reachable gauge",
+    ]
+
+    component_configs = [
+        ("market-data", config.MARKET_DATA_URL),
+        ("momentum-bot", config.MOMENTUM_BOT_URL),
+        ("arb-strategy", config.ARB_STRATEGY_URL),
+        ("execution-engine", config.EXECUTION_ENGINE_URL),
+    ]
+
+    for name, base_url in component_configs:
+        reachable = 0
+        try:
+            response = await state.http_client.get(f"{base_url}/live", timeout=2.0)
+            if response.status_code == 200:
+                reachable = 1
+        except Exception:
+            reachable = 0
+        lines.append(f'control_plane_component_reachable{{component="{name}"}} {reachable}')
+
+    body = "\n".join(lines) + "\n"
+    return PlainTextResponse(
+        content=body,
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
+@app.get("/metrics/summary")
 async def get_aggregated_metrics(user: User = Depends(require_viewer)):
-    """Aggregate metrics from all components (requires: viewer)"""
+    """Aggregate metrics from all components as JSON (requires: viewer)."""
     audit_logger.info(f"METRICS_VIEW: user={user.name}, role={user.role}")
     metrics = {}
     
@@ -1014,7 +1054,6 @@ async def get_component_metrics(component: str, user: User = Depends(require_vie
         response = await state.http_client.get(f"{base_url}/metrics", timeout=5.0)
         if response.status_code == 200:
             # Return raw Prometheus text format
-            from fastapi.responses import PlainTextResponse
             return PlainTextResponse(content=response.text, media_type="text/plain")
         else:
             raise HTTPException(status_code=response.status_code, detail=f"Component returned {response.status_code}")
@@ -1451,7 +1490,7 @@ async def rbac_info_short():
             },
             Role.VIEWER: {
                 "description": "Read-only access",
-                "endpoints": ["GET /status", "GET /positions", "GET /metrics", "GET /logs/*"]
+                "endpoints": ["GET /status", "GET /positions", "GET /metrics", "GET /metrics/summary", "GET /logs/*"]
             }
         },
         "note": "Set CONTROL_PLANE_REQUIRE_AUTH=true to enable authentication"
