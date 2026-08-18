@@ -819,7 +819,7 @@
       "interval": "1m",
       "rules": [
         {
-          "uid": "ironcrab-pumpswap-healing-skipped-no-nats",
+          "uid": "ic-ps-heal-skipped-no-nats",
           "title": "PumpSwap Healing Skipped (No NATS)",
           "condition": "C",
           "data": [
@@ -887,7 +887,7 @@
           }
         },
         {
-          "uid": "ironcrab-pumpswap-healing-async-publish-fail",
+          "uid": "ic-ps-heal-async-pub-fail",
           "title": "PumpSwap Healing Async Publish Failures",
           "condition": "C",
           "data": [
@@ -1023,7 +1023,7 @@
           }
         },
         {
-          "uid": "ironcrab-pumpswap-healing-cooldown-suppressed-spike",
+          "uid": "ic-ps-heal-cd-suppress-spike",
           "title": "PumpSwap Healing Cooldown Suppressions High",
           "condition": "C",
           "data": [
@@ -1151,7 +1151,7 @@
           }
         },
         {
-          "uid": "ironcrab-marketdata-geyser-reconnect-storm",
+          "uid": "ic-md-geyser-reconnect-storm",
           "title": "MarketDataGeyserReconnectStorm",
           "condition": "C",
           "data": [
@@ -1246,6 +1246,43 @@
             "description": "Der Validator RPC-Endpunkt meldet 'unhealthy'. Der Node ist moeglicherweise nicht synchron oder hat interne Probleme."
           },
           "labels": { "severity": "critical", "component": "validator", "type": "health" }
+        },
+        {
+          "uid": "solana-validator-slots-warning",
+          "title": "Validator Slots Warning (>10 Behind)",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": { "from": 300, "to": 0 },
+              "datasourceUid": "bf5zln2g4x5vka",
+              "model": {
+                "expr": "(ironcrab_validator_slots_behind{job=\"validator-lag-exporter\"} > 10) and (ironcrab_validator_lag_scrape_success{job=\"validator-lag-exporter\"} == 1)",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "datasourceUid": "__expr__",
+              "model": { "expression": "A", "reducer": "last", "refId": "B", "type": "reduce" }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [{ "evaluator": { "params": [0], "type": "gt" } }],
+                "expression": "B", "refId": "C", "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "OK",
+          "for": "2m",
+          "annotations": {
+            "summary": "Validator ist >10 Slots hinter dem Cluster",
+            "description": "Fruehwarnung per Telegram: Der Node faellt zurueck. Netzwerk, CPU und Disk-I/O pruefen. Bei anhaltendem Rueckstand Trading pausieren."
+          },
+          "labels": { "severity": "warning", "component": "validator", "type": "sync" }
         },
         {
           "uid": "solana-validator-out-of-sync",
