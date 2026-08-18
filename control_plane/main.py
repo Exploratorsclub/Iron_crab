@@ -982,14 +982,17 @@ async def prometheus_metrics():
         ("execution-engine", config.EXECUTION_ENGINE_URL),
     ]
 
-    for name, base_url in component_configs:
-        reachable = 0
+    async def _check_reachable(name: str, base_url: str) -> tuple[str, int]:
         try:
             response = await state.http_client.get(f"{base_url}/live", timeout=2.0)
-            if response.status_code == 200:
-                reachable = 1
+            return (name, 1 if response.status_code == 200 else 0)
         except Exception:
-            reachable = 0
+            return (name, 0)
+
+    probe_results = await asyncio.gather(
+        *(_check_reachable(name, base_url) for name, base_url in component_configs)
+    )
+    for name, reachable in probe_results:
         lines.append(f'control_plane_component_reachable{{component="{name}"}} {reachable}')
 
     body = "\n".join(lines) + "\n"
