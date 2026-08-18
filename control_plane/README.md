@@ -31,7 +31,8 @@ uvicorn control_plane.main:app --host 0.0.0.0 --port 8080 --reload
 ### Health & Status
 - `GET /health` - Health check
 - `GET /status` - System status (all components)
-- `GET /metrics` - Aggregated metrics from all components
+- `GET /metrics` - Prometheus metrics (for monitoring scrapes)
+- `GET /metrics/summary` - Aggregated JSON metrics from all components
 
 ### Trading
 - `GET /positions` - Current open positions
