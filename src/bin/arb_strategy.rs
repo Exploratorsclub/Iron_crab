@@ -38,7 +38,7 @@ use ironcrab::arbitrage::{
     is_arb_route_executable, is_expected_token_output_plausible, is_quote_fresh,
     populate_arb_slave_from_live_pool_cache, price_based_token_output_raw, quote_exact_in,
     quote_exact_in_with_freshness, quote_sell_round_trip, quotes_pairable,
-    round_trip_profit_lamports, select_arb_track_pools, select_round_trip_pools,
+    round_trip_profit_lamports, select_arb_track_pools, select_round_trip_pools, state_fingerprint,
     sync_arb_slave_from_pool_cache_update, MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch,
     NoCrossDexSellDetailReason, PoolQuote, QuoteFreshnessConfig, QuoteKind, QuotePoolInput,
     QuoteVaultInput, RoundTripInsufficient, RoundTripInsufficientSubreason, RoundTripLeg,
@@ -248,6 +248,8 @@ struct ArbConfig {
     arb_quote_state_ttl_ms: u64,
     /// Max allowed |buy.as_of_slot - sell.as_of_slot| for v2 round-trip (0 = gate off). Default: 2.
     arb_max_leg_slot_delta: u64,
+    /// Max allowed chain_head_slot - leg.as_of_slot for each v2 leg (0 = gate off). Default: 16.
+    arb_max_leg_age_slots: u64,
     /// Jito bundle auction parameters (from [execution_engine.fee_policy] + jito tip).
     bundle_auction: BundleAuctionParams,
 }
@@ -272,6 +274,7 @@ impl Default for ArbConfig {
             arb_quote_trade_ttl_ms: 30_000,
             arb_quote_state_ttl_ms: 120_000,
             arb_max_leg_slot_delta: 2,
+            arb_max_leg_age_slots: 16,
             bundle_auction: BundleAuctionParams::default(),
         };
         sync_arb_probe_to_max_position(&mut cfg);
@@ -493,11 +496,32 @@ fn vault_balance_from_live_cache_state(
 }
 
 fn live_pool_cache_fresher_than_vault(
-    cache_slot: u64,
-    cache_updated_at: Instant,
+    new_vault: &VaultBalanceCache,
     existing: &VaultBalanceCache,
 ) -> bool {
-    cache_slot > existing.update_slot || cache_updated_at > existing.updated_at
+    if state_fingerprint(&vault_cache_to_quote_input(new_vault))
+        == state_fingerprint(&vault_cache_to_quote_input(existing))
+    {
+        return false;
+    }
+    new_vault.update_slot > existing.update_slot || new_vault.updated_at > existing.updated_at
+}
+
+fn vault_material_unchanged(new_vault: &VaultBalanceCache, existing: &VaultBalanceCache) -> bool {
+    state_fingerprint(&vault_cache_to_quote_input(new_vault))
+        == state_fingerprint(&vault_cache_to_quote_input(existing))
+}
+
+fn bin_array_material_fingerprint(bins: &[BinData]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for bin in bins {
+        bin.offset.hash(&mut hasher);
+        bin.amount_x.hash(&mut hasher);
+        bin.amount_y.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// H3 / C1vault: seed missing vault row from SLAVE LivePoolCache (Geyser-only, all SOL-quoted DEXes).
@@ -544,7 +568,7 @@ fn try_refresh_vault_from_live_cache(
     let Some(new_vault) = vault_balance_from_live_cache_state(&state, slot, age_ms) else {
         return false;
     };
-    if !live_pool_cache_fresher_than_vault(slot, new_vault.updated_at, existing) {
+    if !live_pool_cache_fresher_than_vault(&new_vault, existing) {
         return false;
     }
     record_live_cache_age_at_snapshot("refresh", age_ms, pin_class);
@@ -1879,13 +1903,27 @@ fn seed_one_pool_from_live_cache(
     };
     let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
 
-    let (should_replace_vault, should_touch_vault_updated_at) = match vault_balances.get(&pool_addr)
-    {
-        Some(existing) => (
-            slot >= existing.update_slot,
-            cache_updated_at > existing.updated_at,
-        ),
-        None => (true, false),
+    let (should_replace_vault, should_touch_vault_updated_at) = {
+        let candidate_vault = VaultBalanceCache {
+            reserve_base: warmup.reserve_base,
+            reserve_quote: warmup.reserve_quote,
+            update_slot: slot,
+            active_id: warmup.active_id,
+            bin_step: warmup.bin_step,
+            updated_at: cache_updated_at,
+            dlmm_sol_is_x,
+            dlmm_token_x_mint: dlmm_token_x_mint.clone(),
+        };
+        match vault_balances.get(&pool_addr) {
+            Some(existing) if vault_material_unchanged(&candidate_vault, existing) => {
+                (false, false)
+            }
+            Some(existing) => (
+                slot >= existing.update_slot,
+                cache_updated_at > existing.updated_at,
+            ),
+            None => (true, false),
+        }
     };
 
     let tracker = trackers
@@ -3009,6 +3047,8 @@ struct ArbCheckContext<'a> {
     selected_mints: Option<&'a HashSet<String>>,
     /// When set and the mint has pinned pools, round-trip candidates use only those pools.
     pinned_pools: Option<&'a HashSet<String>>,
+    /// Latest Geyser slot observed in this process (chain head watermark, no RPC).
+    chain_head_slot: u64,
 }
 
 fn pool_state_to_quote_input(
@@ -3588,6 +3628,27 @@ impl TokenArbTracker {
         if config.arb_max_leg_slot_delta > 0 && slot_delta > config.arb_max_leg_slot_delta {
             arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::SlotDeltaExceeded);
             return None;
+        }
+
+        if config.arb_max_leg_age_slots > 0 {
+            let chain_slot = check_ctx.chain_head_slot;
+            if chain_slot > 0 {
+                let buy_age = if buy_as_of_slot > 0 {
+                    chain_slot.saturating_sub(buy_as_of_slot)
+                } else {
+                    u64::MAX
+                };
+                let sell_age = if sell_as_of_slot > 0 {
+                    chain_slot.saturating_sub(sell_as_of_slot)
+                } else {
+                    u64::MAX
+                };
+                if buy_age > config.arb_max_leg_age_slots || sell_age > config.arb_max_leg_age_slots
+                {
+                    arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::LegSlotTooOld);
+                    return None;
+                }
+            }
         }
 
         let buy_pool = self.pools.get(&selection.buy_pool_address)?;
@@ -4920,6 +4981,9 @@ struct ArbContext {
     /// This is different from per-pool staleness: inactive pools are still "fresh" data.
     last_market_event: RwLock<Instant>,
 
+    /// Monotonic Geyser chain head (max slot from MarketEvents in this process). I-7: no RPC.
+    chain_head_slot: AtomicU64,
+
     // =========================================================================
     // Geyser-based Pool State Cache (from PoolStateUpdate / BinArrayUpdate)
     // =========================================================================
@@ -5021,6 +5085,31 @@ impl ArbContext {
     /// Record that a MarketEvent was received on the NATS wire (Geyser liveness).
     fn mark_market_event_seen(&self) {
         *self.last_market_event.write() = Instant::now();
+    }
+
+    fn bump_chain_head_slot(&self, slot: Option<u64>) {
+        let Some(slot) = slot else {
+            return;
+        };
+        if slot == 0 {
+            return;
+        }
+        let mut current = self.chain_head_slot.load(Ordering::Relaxed);
+        while slot > current {
+            match self.chain_head_slot.compare_exchange_weak(
+                current,
+                slot,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn chain_head_slot_value(&self) -> u64 {
+        self.chain_head_slot.load(Ordering::Relaxed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5304,6 +5393,20 @@ impl ArbContext {
                         } else {
                             rejected
                                 .push((key.clone(), "Must be 0-32 (0 disables gate)".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "arb_max_leg_age_slots" => {
+                    if let Some(v) = value.as_u64() {
+                        if v <= 512 {
+                            config.arb_max_leg_age_slots = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected
+                                .push((key.clone(), "Must be 0-512 (0 disables gate)".to_string()));
                         }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
@@ -5875,14 +5978,6 @@ impl ArbContext {
         let vault_wait = Instant::now();
         let mut cache = self.vault_balances.write();
         record_arb_writer_lock_wait(ArbWriterLockKind::VaultBalancesWrite, vault_wait.elapsed());
-        let should_update_vault = match cache.get(pool_address) {
-            Some(existing) => update_slot >= existing.update_slot,
-            None => true,
-        };
-        if !should_update_vault {
-            return;
-        }
-        let is_new = !cache.contains_key(pool_address);
         let dlmm_token_x_mint = if dex == "meteora_dlmm" {
             resolve_dlmm_token_x_mint_for_pool_update(pool_address, &cache, &self.live_pool_cache)
         } else {
@@ -5891,19 +5986,26 @@ impl ArbContext {
                 .and_then(|v| v.dlmm_token_x_mint.clone())
         };
         let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
-        cache.insert(
-            pool_address.to_string(),
-            VaultBalanceCache {
-                reserve_base,
-                reserve_quote,
-                update_slot,
-                active_id,
-                bin_step,
-                updated_at: Instant::now(),
-                dlmm_sol_is_x,
-                dlmm_token_x_mint,
-            },
-        );
+        let new_vault = VaultBalanceCache {
+            reserve_base,
+            reserve_quote,
+            update_slot,
+            active_id,
+            bin_step,
+            updated_at: Instant::now(),
+            dlmm_sol_is_x,
+            dlmm_token_x_mint,
+        };
+        if let Some(existing) = cache.get(pool_address) {
+            if vault_material_unchanged(&new_vault, existing) {
+                return;
+            }
+            if update_slot < existing.update_slot {
+                return;
+            }
+        }
+        let is_new = !cache.contains_key(pool_address);
+        cache.insert(pool_address.to_string(), new_vault);
         if is_new {
             debug!(
                 pool = %pool_address,
@@ -5986,21 +6088,27 @@ impl ArbContext {
         update_slot: u64,
     ) {
         inc_arb_dlmm_bin_array_update_received_total();
+        let new_fp = bin_array_material_fingerprint(&bins);
         let mut cache = self.bin_arrays.write();
         let pool_cache = cache.entry(pool_address.to_string()).or_default();
-        let bins_count = bins.len();
-        let should_update = match pool_cache.get(&bin_array_index) {
-            Some(existing) => update_slot >= existing.update_slot,
+        let material_changed = match pool_cache.get(&bin_array_index) {
+            Some(existing) => bin_array_material_fingerprint(&existing.bins) != new_fp,
             None => true,
         };
-        if !should_update {
+        if !material_changed {
             return;
+        }
+        let bins_count = bins.len();
+        if let Some(existing) = pool_cache.get(&bin_array_index) {
+            if update_slot < existing.update_slot {
+                return;
+            }
         }
         pool_cache.insert(bin_array_index, BinArrayCache { bins, update_slot });
         inc_arb_dlmm_bin_array_update_applied_total();
         drop(cache);
 
-        // Bin liquidity updates are a valid DLMM price signal (H3): refresh vault + pool timestamps.
+        // Bin liquidity updates are a valid DLMM price signal: refresh vault material slot.
         let now = Instant::now();
         {
             let pinned = self.arb_pinned_pools.read();
@@ -6016,17 +6124,18 @@ impl ArbContext {
                 &self.live_pool_cache,
                 &mut vault_cache,
             );
-            if vault_cache.contains_key(pool_address)
-                && !try_refresh_vault_from_live_cache(
-                    pool_address,
-                    &self.live_pool_cache,
-                    &mut vault_cache,
-                    pin_class,
-                )
-            {
-                if let Some(v) = vault_cache.get_mut(pool_address) {
-                    v.updated_at = now;
+            if try_refresh_vault_from_live_cache(
+                pool_address,
+                &self.live_pool_cache,
+                &mut vault_cache,
+                pin_class,
+            ) {
+                // refreshed from live cache with material change
+            } else if let Some(v) = vault_cache.get_mut(pool_address) {
+                if update_slot >= v.update_slot {
+                    v.update_slot = update_slot;
                 }
+                v.updated_at = now;
             }
         }
         let read_wait = Instant::now();
@@ -6509,6 +6618,7 @@ impl ArbContext {
                 v2_forensics: Some(&self.v2_eligibility_forensics),
                 selected_mints: Some(&selected_mints),
                 pinned_pools: Some(&pinned_pools),
+                chain_head_slot: self.chain_head_slot_value(),
             },
         )
     }
@@ -6940,6 +7050,7 @@ impl ArbContext {
                 v2_forensics: Some(&self.v2_eligibility_forensics),
                 selected_mints: Some(&selected_mints),
                 pinned_pools: Some(&pinned_pools),
+                chain_head_slot: self.chain_head_slot_value(),
             },
         )?;
         self.finalize_trade_opportunity(mint, config.intent_cooldown_ms, opp)
@@ -8389,6 +8500,7 @@ async fn main() -> Result<()> {
         zero_amount_trades: AtomicU64::new(0),
         data_quality_rejects: AtomicU64::new(0),
         last_market_event: RwLock::new(Instant::now()),
+        chain_head_slot: AtomicU64::new(0),
         vault_balances: RwLock::new(HashMap::new()),
         bin_arrays: RwLock::new(HashMap::new()),
         live_pool_cache,
@@ -8877,6 +8989,7 @@ async fn main() -> Result<()> {
 async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<TradeIntent> {
     // Update Geyser connection health timestamp on every event
     *ctx.last_market_event.write() = Instant::now();
+    ctx.bump_chain_head_slot(event.slot);
 
     match &event.kind {
         MarketEventKind::Trade {
@@ -9521,6 +9634,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -9637,6 +9751,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -9751,6 +9866,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -9932,6 +10048,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -10134,6 +10251,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(vault_balances),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -10246,6 +10364,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -10362,6 +10481,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -10449,6 +10569,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -10542,6 +10663,7 @@ fn test_arb_context(live_pool_cache: SharedLivePoolCache) -> ArbContext {
         zero_amount_trades: AtomicU64::new(0),
         data_quality_rejects: AtomicU64::new(0),
         last_market_event: RwLock::new(Instant::now()),
+        chain_head_slot: AtomicU64::new(0),
         vault_balances: RwLock::new(HashMap::new()),
         bin_arrays: RwLock::new(HashMap::new()),
         live_pool_cache: live_pool_cache.clone(),
@@ -11384,6 +11506,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         // Same reserves → spread ~0, rejected by spread_below_min not insufficient_pools
@@ -11471,6 +11594,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         let opp = opp.expect("v2 round-trip should find cross-dex edge");
@@ -11558,11 +11682,104 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         assert!(opp.is_none(), "slot delta 99 should exceed default gate");
         assert!(
             ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED.load(Ordering::Relaxed)
+                > before
+        );
+    }
+
+    #[test]
+    fn check_arbitrage_v2_rejects_stale_leg_vs_chain_head() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        let update_orca = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_a.to_string(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            980_000_000,
+            10,
+        );
+        let update_pump = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_b.to_string(),
+            "pump_amm".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_020_000_000,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            None,
+        );
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert(pool_a.to_string());
+        known_pools.insert(pool_b.to_string());
+
+        let tracker = trackers.get_mut(&mint_str).unwrap();
+        tracker.token_decimals = Some(6);
+
+        let config = with_small_v2_probe(ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            arb_max_leg_slot_delta: 512,
+            arb_max_leg_age_slots: 16,
+            min_spread_bps: 1,
+            min_profit_lamports: 1,
+            est_tx_cost_lamports: 1,
+            ..Default::default()
+        });
+
+        let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        let before =
+            ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD.load(Ordering::Relaxed);
+        let opp = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &bin_arrays,
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+                v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
+                chain_head_slot: 100,
+            },
+        );
+        assert!(
+            opp.is_none(),
+            "buy leg slot 10 vs chain 100 exceeds age gate"
+        );
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD.load(Ordering::Relaxed)
                 > before
         );
     }
@@ -11675,6 +11892,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         assert!(opp.is_none(), "equal reserves should fail spread gate");
@@ -11763,6 +11981,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         assert!(opp.is_none(), "tiny edge should fail profit gate");
@@ -11847,6 +12066,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
     }
@@ -12360,7 +12580,7 @@ mod two_hop_price_tests {
             protocol_fee_rate: orca.protocol_fee_rate,
             tick_spacing: orca.tick_spacing,
             vault_a_balance: orca.vault_a_balance,
-            vault_b_balance: orca.vault_b_balance,
+            vault_b_balance: Some(2_000_000_001),
             token_a_program: orca.token_a_program,
             token_b_program: orca.token_b_program,
         });
@@ -12379,7 +12599,7 @@ mod two_hop_price_tests {
             mint_str.clone(),
             NATIVE_SOL_MINT.to_string(),
             1_000_000_000_000,
-            2_000_000_000,
+            2_000_000_001,
             100,
         );
         assert!(
@@ -12399,7 +12619,7 @@ mod two_hop_price_tests {
             pool_str.clone(),
             VaultBalanceCache {
                 reserve_base: 1_000_000_000_000,
-                reserve_quote: 2_000_000_000,
+                reserve_quote: 2_000_000_001,
                 update_slot: 200,
                 active_id: None,
                 bin_step: None,
@@ -12420,9 +12640,9 @@ mod two_hop_price_tests {
 
         let vault = vault_balances.get(&pool_str).expect("vault");
         assert_eq!(vault.update_slot, 200);
-        assert!(
-            vault.updated_at > stale_vault_updated_at,
-            "vault.updated_at must follow fresher cache age at seed"
+        assert_eq!(
+            vault.updated_at, stale_vault_updated_at,
+            "identical material state must not refresh vault.updated_at at seed"
         );
         let (_, _, age_ms) = cache.get_with_metadata(&pool).expect("cached");
         assert!(
@@ -12795,6 +13015,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         assert!(opp.is_none());
@@ -12870,6 +13091,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         )
     }
@@ -12898,6 +13120,7 @@ mod two_hop_price_tests {
                 v2_forensics: Some(v2_forensics),
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         )
     }
@@ -13353,6 +13576,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         assert!(
@@ -13395,6 +13619,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: Some(&selected_mints),
                 pinned_pools: Some(&pinned_pools),
+                chain_head_slot: 0,
             },
         );
 
@@ -13460,6 +13685,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: Some(&selected_mints),
                 pinned_pools: Some(&pinned_pools),
+                chain_head_slot: 0,
             },
         );
 

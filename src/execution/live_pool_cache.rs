@@ -35,6 +35,8 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use solana_sdk::pubkey::Pubkey;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -341,6 +343,45 @@ impl CachedPoolState {
     }
 }
 
+/// Hash of quotable reserve snapshot — material changes only (not heartbeat slots).
+pub fn pool_state_material_fingerprint(state: &CachedPoolState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    match state {
+        CachedPoolState::RaydiumCpmm(s) => {
+            s.reserve_0.hash(&mut hasher);
+            s.reserve_1.hash(&mut hasher);
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            s.reserve_0.hash(&mut hasher);
+            s.reserve_1.hash(&mut hasher);
+        }
+        CachedPoolState::Meteora(s) => {
+            s.reserve_x_balance.hash(&mut hasher);
+            s.reserve_y_balance.hash(&mut hasher);
+            s.active_id.hash(&mut hasher);
+            s.bin_step.hash(&mut hasher);
+        }
+        CachedPoolState::PumpAmm(s) => {
+            s.base_reserve.hash(&mut hasher);
+            s.quote_reserve.hash(&mut hasher);
+        }
+        CachedPoolState::Orca(s) => {
+            s.vault_a_balance.hash(&mut hasher);
+            s.vault_b_balance.hash(&mut hasher);
+        }
+        CachedPoolState::RaydiumAmm(s) => {
+            s.coin_reserve.hash(&mut hasher);
+            s.pc_reserve.hash(&mut hasher);
+        }
+        CachedPoolState::PumpFun(s) => {
+            s.virtual_sol_reserves.hash(&mut hasher);
+            s.virtual_token_reserves.hash(&mut hasher);
+            s.complete.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
 /// True when the cached pool row has at least one non-zero reserve / vault balance.
 pub fn pool_state_has_reserve_basis(state: &CachedPoolState) -> bool {
     let fresh = |opt: Option<u64>| opt.is_some_and(|v| v > 0);
@@ -366,8 +407,11 @@ pub fn pool_state_has_reserve_basis(state: &CachedPoolState) -> bool {
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub state: CachedPoolState,
+    /// Slot of the last **material** (fingerprint) change — used for quote freshness.
     pub slot: u64,
     pub updated_at: Instant,
+    /// Latest Geyser slot observed for this pool (not used for quotes).
+    pub last_seen_slot: u64,
 }
 
 impl CacheEntry {
@@ -376,6 +420,7 @@ impl CacheEntry {
             state,
             slot,
             updated_at: Instant::now(),
+            last_seen_slot: slot,
         }
     }
 
@@ -569,6 +614,11 @@ impl LivePoolCache {
         }
     }
 
+    /// Latest Geyser slot observed for this pool (not the material quote slot).
+    pub fn get_last_seen_slot(&self, pool: &Pubkey) -> Option<u64> {
+        self.pools.get(pool).map(|entry| entry.last_seen_slot)
+    }
+
     /// Check if pool is in cache
     pub fn contains(&self, pool: &Pubkey) -> bool {
         self.pools.contains_key(pool)
@@ -609,6 +659,7 @@ impl LivePoolCache {
     /// `updated_at` on an existing row — prevents age-gate spoofing without quote readiness.
     pub fn upsert(&self, pool: Pubkey, state: CachedPoolState, slot: u64) -> bool {
         let refresh_age = pool_state_has_reserve_basis(&state);
+        let new_fingerprint = pool_state_material_fingerprint(&state);
         match self.pools.entry(pool) {
             Entry::Vacant(v) => {
                 let stored_slot = if slot == 0 { 0 } else { slot };
@@ -618,16 +669,38 @@ impl LivePoolCache {
                 true
             }
             Entry::Occupied(mut o) => {
-                let prev_slot = o.get().slot;
-                if slot > 0 && prev_slot > slot {
+                let prev = o.get();
+                if slot > 0 && prev.slot > slot {
                     return false;
                 }
-                let stored_slot = if slot == 0 { prev_slot } else { slot };
-                let prev_updated_at = o.get().updated_at;
+                let material_changed =
+                    new_fingerprint != pool_state_material_fingerprint(&prev.state);
+                let stored_slot = if slot == 0 {
+                    prev.slot
+                } else if material_changed {
+                    slot
+                } else {
+                    prev.slot
+                };
+                let last_seen_slot = if slot > 0 {
+                    prev.last_seen_slot.max(slot)
+                } else {
+                    prev.last_seen_slot
+                };
+                let prev_updated_at = prev.updated_at;
                 self.register_vaults(&pool, &state);
-                let mut entry = CacheEntry::new(state, stored_slot);
-                if !refresh_age {
-                    entry.updated_at = prev_updated_at;
+                let entry = CacheEntry {
+                    state,
+                    slot: stored_slot,
+                    updated_at: if refresh_age && material_changed {
+                        Instant::now()
+                    } else {
+                        prev_updated_at
+                    },
+                    last_seen_slot,
+                };
+                if refresh_age && !material_changed {
+                    crate::metrics::inc_live_pool_cache_fingerprint_unchanged_skip_total();
                 }
                 *o.get_mut() = entry;
                 self.updates_total.fetch_add(1, Ordering::Relaxed);
@@ -679,40 +752,76 @@ impl LivePoolCache {
         if let Some(mapping) = self.vault_to_pool.get(vault) {
             let (pool_addr, position) = *mapping;
             if let Some(mut entry) = self.pools.get_mut(&pool_addr) {
-                // Only update if slot is newer
-                if slot >= entry.slot {
-                    match &mut entry.state {
-                        CachedPoolState::Orca(ref mut s) => match position {
-                            VaultPosition::A => s.vault_a_balance = Some(balance),
-                            VaultPosition::B => s.vault_b_balance = Some(balance),
-                        },
-                        CachedPoolState::RaydiumAmm(ref mut s) => match position {
-                            VaultPosition::A => s.coin_reserve = Some(balance),
-                            VaultPosition::B => s.pc_reserve = Some(balance),
-                        },
-                        CachedPoolState::RaydiumCpmm(ref mut s) => match position {
-                            VaultPosition::A => s.reserve_0 = Some(balance),
-                            VaultPosition::B => s.reserve_1 = Some(balance),
-                        },
-                        CachedPoolState::Meteora(ref mut s) => match position {
-                            VaultPosition::A => s.reserve_x_balance = Some(balance),
-                            VaultPosition::B => s.reserve_y_balance = Some(balance),
-                        },
-                        CachedPoolState::MeteoraCpmm(ref mut s) => match position {
-                            VaultPosition::A => s.reserve_0 = balance,
-                            VaultPosition::B => s.reserve_1 = balance,
-                        },
-                        CachedPoolState::PumpAmm(ref mut s) => match position {
-                            VaultPosition::A => s.base_reserve = Some(balance),
-                            VaultPosition::B => s.quote_reserve = Some(balance),
-                        },
-                        CachedPoolState::PumpFun(_) => {
-                            // PumpFun bonding curve has virtual reserves in the account itself
-                        }
-                    }
-                    entry.slot = slot;
-                    entry.updated_at = Instant::now();
+                if slot > 0 {
+                    entry.last_seen_slot = entry.last_seen_slot.max(slot);
                 }
+                let balance_changed = match &entry.state {
+                    CachedPoolState::Orca(s) => match position {
+                        VaultPosition::A => s.vault_a_balance != Some(balance),
+                        VaultPosition::B => s.vault_b_balance != Some(balance),
+                    },
+                    CachedPoolState::RaydiumAmm(s) => match position {
+                        VaultPosition::A => s.coin_reserve != Some(balance),
+                        VaultPosition::B => s.pc_reserve != Some(balance),
+                    },
+                    CachedPoolState::RaydiumCpmm(s) => match position {
+                        VaultPosition::A => s.reserve_0 != Some(balance),
+                        VaultPosition::B => s.reserve_1 != Some(balance),
+                    },
+                    CachedPoolState::Meteora(s) => match position {
+                        VaultPosition::A => s.reserve_x_balance != Some(balance),
+                        VaultPosition::B => s.reserve_y_balance != Some(balance),
+                    },
+                    CachedPoolState::MeteoraCpmm(s) => match position {
+                        VaultPosition::A => s.reserve_0 != balance,
+                        VaultPosition::B => s.reserve_1 != balance,
+                    },
+                    CachedPoolState::PumpAmm(s) => match position {
+                        VaultPosition::A => s.base_reserve != Some(balance),
+                        VaultPosition::B => s.quote_reserve != Some(balance),
+                    },
+                    CachedPoolState::PumpFun(_) => false,
+                };
+                if !balance_changed {
+                    crate::metrics::inc_live_pool_cache_fingerprint_unchanged_skip_total();
+                    return;
+                }
+                if slot > 0 && slot < entry.slot {
+                    return;
+                }
+                match &mut entry.state {
+                    CachedPoolState::Orca(ref mut s) => match position {
+                        VaultPosition::A => s.vault_a_balance = Some(balance),
+                        VaultPosition::B => s.vault_b_balance = Some(balance),
+                    },
+                    CachedPoolState::RaydiumAmm(ref mut s) => match position {
+                        VaultPosition::A => s.coin_reserve = Some(balance),
+                        VaultPosition::B => s.pc_reserve = Some(balance),
+                    },
+                    CachedPoolState::RaydiumCpmm(ref mut s) => match position {
+                        VaultPosition::A => s.reserve_0 = Some(balance),
+                        VaultPosition::B => s.reserve_1 = Some(balance),
+                    },
+                    CachedPoolState::Meteora(ref mut s) => match position {
+                        VaultPosition::A => s.reserve_x_balance = Some(balance),
+                        VaultPosition::B => s.reserve_y_balance = Some(balance),
+                    },
+                    CachedPoolState::MeteoraCpmm(ref mut s) => match position {
+                        VaultPosition::A => s.reserve_0 = balance,
+                        VaultPosition::B => s.reserve_1 = balance,
+                    },
+                    CachedPoolState::PumpAmm(ref mut s) => match position {
+                        VaultPosition::A => s.base_reserve = Some(balance),
+                        VaultPosition::B => s.quote_reserve = Some(balance),
+                    },
+                    CachedPoolState::PumpFun(_) => {
+                        // PumpFun bonding curve has virtual reserves in the account itself
+                    }
+                }
+                if slot > 0 {
+                    entry.slot = slot;
+                }
+                entry.updated_at = Instant::now();
             }
         }
     }
@@ -2642,6 +2751,45 @@ mod tests {
         assert!(
             age_after_quotable < 20,
             "quotable upsert must refresh cache age"
+        );
+    }
+
+    #[test]
+    fn upsert_identical_reserves_does_not_refresh_material_slot_or_age() {
+        use std::time::Duration;
+
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let state = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(1_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+
+        cache.upsert(pool, state.clone(), 10);
+        std::thread::sleep(Duration::from_millis(40));
+        let (_, slot_before, age_before) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(slot_before, 10);
+
+        cache.upsert(pool, state, 50);
+        let (_, slot_after, age_after) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(
+            slot_after, slot_before,
+            "identical reserves must not advance material slot"
+        );
+        assert!(
+            age_after >= age_before,
+            "identical reserves must not reset cache age"
+        );
+        assert_eq!(
+            cache.get_last_seen_slot(&pool),
+            Some(50),
+            "last_seen_slot tracks heartbeat"
         );
     }
 

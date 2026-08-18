@@ -2012,10 +2012,18 @@ mod tests {
         assert!(apply_pool_cache_update(&cache, &bal));
 
         let (_, slot_after, age_after) = cache.get_with_metadata(&pool).expect("cached");
-        assert_eq!(slot_after, 11, "slot must advance from Geyser event");
+        assert_eq!(
+            slot_after, slot_before,
+            "identical reserves must not advance material slot"
+        );
         assert!(
-            age_after < 20,
-            "unchanged reserves with newer slot must refresh SLAVE cache age (event-driven pin path)"
+            age_after >= age_before,
+            "identical reserves must not reset SLAVE cache age"
+        );
+        assert_eq!(
+            cache.get_last_seen_slot(&pool),
+            Some(11),
+            "last_seen_slot tracks Geyser heartbeat"
         );
     }
 
@@ -3276,7 +3284,7 @@ mod tests {
         }
     }
 
-    /// P0-B: Ensure-equivalent JetStream publish must advance SLAVE slot when S ≫ prior cache.
+    /// P0-B: Ensure-equivalent JetStream publish with unchanged reserves must not spoof material slot.
     #[test]
     fn ensure_equivalent_pool_cache_update_advances_slave_slot() {
         let cache = LivePoolCache::new();
@@ -3321,9 +3329,15 @@ mod tests {
             "Ensure-equivalent BalanceUpdated must apply when slot advances"
         );
         let (_, slot_after, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(
+            slot_after, 436_771_116,
+            "unchanged reserves must preserve material slot despite newer Geyser slot"
+        );
         assert!(
-            slot_after >= 436_771_200,
-            "SLAVE slot must be >= publish_slot S after apply"
+            cache
+                .get_last_seen_slot(&pool)
+                .is_some_and(|s| s >= 436_771_200),
+            "last_seen_slot must track newer Geyser slot"
         );
     }
 

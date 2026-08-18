@@ -5061,6 +5061,10 @@ pub static ARB_TWO_HOP_V2_REJECTED_INSUFFICIENT_POOLS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static LIVE_POOL_CACHE_FINGERPRINT_UNCHANGED_SKIP_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_BELOW_MIN: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_ABOVE_MAX: Lazy<AtomicU64> =
@@ -5770,6 +5774,7 @@ pub enum ArbTwoHopV2RejectReason {
     IncompatibleQuoteKind,
     InsufficientPools,
     SlotDeltaExceeded,
+    LegSlotTooOld,
 }
 
 /// Outcome label for `arb_two_hop_v2_formable_spread_bps` / `arb_two_hop_v2_formable_probe_profit_lamports`.
@@ -5829,6 +5834,11 @@ pub fn inc_arb_dlmm_bin_rescreen_scheduled_total() {
 /// Increment `arb_vault_balance_applied_total`.
 pub fn inc_arb_vault_balance_applied_total() {
     ARB_VAULT_BALANCE_APPLIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment when LivePoolCache skips material-slot/age tick (unchanged fingerprint).
+pub fn inc_live_pool_cache_fingerprint_unchanged_skip_total() {
+    LIVE_POOL_CACHE_FINGERPRINT_UNCHANGED_SKIP_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Increment `arb_vault_live_snapshot_seeded_total`.
@@ -6146,6 +6156,7 @@ pub fn arb_two_hop_v2_rejected_inc(reason: ArbTwoHopV2RejectReason) {
         }
         ArbTwoHopV2RejectReason::InsufficientPools => &*ARB_TWO_HOP_V2_REJECTED_INSUFFICIENT_POOLS,
         ArbTwoHopV2RejectReason::SlotDeltaExceeded => &*ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED,
+        ArbTwoHopV2RejectReason::LegSlotTooOld => &*ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD,
     };
     counter.fetch_add(1, Ordering::Relaxed);
 }
@@ -11055,6 +11066,13 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    out.push_str("arb_two_hop_v2_rejected_total{reason=\"leg_slot_too_old\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     out.push_str("arb_two_hop_v2_rejected_total{reason=\"round_trip_spread_below_min\"} ");
     out.push_str(
         &ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_BELOW_MIN
@@ -11249,6 +11267,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_strategy_bootstrap_live_pool_cache_rows",
         ARB_STRATEGY_BOOTSTRAP_LIVE_POOL_CACHE_ROWS.load(Ordering::Relaxed)
+    );
+    line!(
+        "live_pool_cache_fingerprint_unchanged_skip_total",
+        LIVE_POOL_CACHE_FINGERPRINT_UNCHANGED_SKIP_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "arb_strategy_bootstrap_known_pools_seeded",

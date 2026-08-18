@@ -42,12 +42,38 @@ impl Default for QuoteFreshnessConfig {
 
 /// Hash of vault reserve snapshot used for ExecutableMarginal freshness.
 pub fn state_fingerprint(vault: &QuoteVaultInput) -> u64 {
+    state_fingerprint_with_bins(vault, None)
+}
+
+/// Hash of vault + optional DLMM bin liquidity for ExecutableMarginal freshness.
+pub fn state_fingerprint_with_bins(
+    vault: &QuoteVaultInput,
+    dlmm_bins: Option<&DlmmBinArrays>,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
     vault.reserve_base.hash(&mut hasher);
     vault.reserve_quote.hash(&mut hasher);
     vault.active_id.hash(&mut hasher);
     vault.bin_step.hash(&mut hasher);
+    if let Some(bins) = dlmm_bins {
+        hash_dlmm_bins_for_fingerprint(&mut hasher, bins);
+    }
     hasher.finish()
+}
+
+fn hash_dlmm_bins_for_fingerprint(hasher: &mut DefaultHasher, bins: &DlmmBinArrays) {
+    let mut keys: Vec<&i64> = bins.keys().collect();
+    keys.sort_unstable();
+    for array_idx in keys {
+        array_idx.hash(hasher);
+        if let Some(bin_list) = bins.get(array_idx) {
+            for bin in bin_list {
+                bin.offset.hash(hasher);
+                bin.amount_x.hash(hasher);
+                bin.amount_y.hash(hasher);
+            }
+        }
+    }
 }
 
 /// I-ARB-4: re-check quote freshness (trade TTL vs state fingerprint + state TTL).
@@ -57,7 +83,18 @@ pub fn is_quote_fresh(
     current_vault: Option<&QuoteVaultInput>,
     now: Instant,
 ) -> bool {
-    diagnose_quote_not_fresh(quote, config, current_vault, now).is_none()
+    is_quote_fresh_with_bins(quote, config, current_vault, None, now)
+}
+
+/// I-ARB-4: re-check quote freshness including optional DLMM bin snapshot.
+pub fn is_quote_fresh_with_bins(
+    quote: &PoolQuote,
+    config: &QuoteFreshnessConfig,
+    current_vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    now: Instant,
+) -> bool {
+    diagnose_quote_not_fresh_with_bins(quote, config, current_vault, dlmm_bins, now).is_none()
 }
 
 /// Age bucket for vault/state-stale forensics (C1h2).
@@ -151,6 +188,17 @@ pub fn diagnose_quote_not_fresh(
     current_vault: Option<&QuoteVaultInput>,
     now: Instant,
 ) -> Option<QuoteNotFreshDiagnosis> {
+    diagnose_quote_not_fresh_with_bins(quote, config, current_vault, None, now)
+}
+
+/// Returns `Some(diagnosis)` when quote fails freshness re-check (with DLMM bins).
+pub fn diagnose_quote_not_fresh_with_bins(
+    quote: &PoolQuote,
+    config: &QuoteFreshnessConfig,
+    current_vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    now: Instant,
+) -> Option<QuoteNotFreshDiagnosis> {
     let kind = QuoteNotFreshKind::from_quote_kind(quote.kind);
     match quote.kind {
         QuoteKind::LastTradeMid => {
@@ -170,7 +218,9 @@ pub fn diagnose_quote_not_fresh(
                 });
             }
             match current_vault {
-                Some(vault) if state_fingerprint(vault) != quote.state_fingerprint => {
+                Some(vault)
+                    if state_fingerprint_with_bins(vault, dlmm_bins) != quote.state_fingerprint =>
+                {
                     Some(QuoteNotFreshDiagnosis {
                         kind,
                         cause: QuoteNotFreshCause::FingerprintMismatch,
@@ -231,10 +281,10 @@ pub fn diagnose_no_fresh_buy_quote(
         }
         return NoFreshBuyQuoteSubreason::TradeStale;
     };
-    if is_quote_fresh(&buy_quote, freshness, vault, now) {
+    if is_quote_fresh_with_bins(&buy_quote, freshness, vault, dlmm_bins, now) {
         return NoFreshBuyQuoteSubreason::NotFreshAfterQuote;
     }
-    match diagnose_quote_not_fresh(&buy_quote, freshness, vault, now) {
+    match diagnose_quote_not_fresh_with_bins(&buy_quote, freshness, vault, dlmm_bins, now) {
         Some(QuoteNotFreshDiagnosis {
             kind: QuoteNotFreshKind::LastTradeMid,
             ..
@@ -639,7 +689,7 @@ fn executable_marginal_quote(
         return None;
     }
 
-    let fingerprint = state_fingerprint(vault);
+    let fingerprint = state_fingerprint_with_bins(vault, dlmm_bins);
 
     if pool.dex == "meteora_dlmm" {
         let active_id = vault.active_id?;
@@ -1781,8 +1831,13 @@ pub fn classify_cross_dex_sell_failure(
         );
         return Some(CrossDexSellFailure::QuoteNone(sub));
     };
-    if let Some(diagnosis) = diagnose_quote_not_fresh(&sell_quote, freshness, candidate.vault, now)
-    {
+    if let Some(diagnosis) = diagnose_quote_not_fresh_with_bins(
+        &sell_quote,
+        freshness,
+        candidate.vault,
+        candidate.dlmm_bins,
+        now,
+    ) {
         return Some(CrossDexSellFailure::NotFresh(diagnosis));
     }
     let sol_per_token = sol_per_token_from_sell_quote(&sell_quote, token_decimals);
@@ -1962,9 +2017,13 @@ pub fn select_round_trip_pools(
                 *sell_fail_counts.entry(top).or_default() += 1;
                 continue;
             };
-            if let Some(diagnosis) =
-                diagnose_quote_not_fresh(&sell_quote, freshness, sell_candidate.vault, now)
-            {
+            if let Some(diagnosis) = diagnose_quote_not_fresh_with_bins(
+                &sell_quote,
+                freshness,
+                sell_candidate.vault,
+                sell_candidate.dlmm_bins,
+                now,
+            ) {
                 *sell_not_fresh_detail_counts.entry(diagnosis).or_default() += 1;
                 *sell_fail_counts
                     .entry(NoCrossDexSellDetailReason::SellNotFresh)
@@ -2857,6 +2916,26 @@ mod tests {
                 .expect("fingerprint mismatch");
         assert_eq!(diagnosis.kind, QuoteNotFreshKind::ExecutableMarginal);
         assert_eq!(diagnosis.cause, QuoteNotFreshCause::FingerprintMismatch);
+    }
+
+    #[test]
+    fn state_fingerprint_includes_dlmm_bin_liquidity() {
+        let vault = sample_vault(1_000_000_000_000, 1_000_000_000);
+        let mut bins_a: DlmmBinArrays = HashMap::new();
+        bins_a.insert(
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 100,
+                amount_y: 200,
+            }],
+        );
+        let mut bins_b = bins_a.clone();
+        bins_b.get_mut(&0).unwrap()[0].amount_y = 201;
+        assert_ne!(
+            state_fingerprint_with_bins(&vault, Some(&bins_a)),
+            state_fingerprint_with_bins(&vault, Some(&bins_b))
+        );
     }
 
     #[test]
