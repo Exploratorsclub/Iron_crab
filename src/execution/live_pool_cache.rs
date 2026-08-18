@@ -670,7 +670,7 @@ impl LivePoolCache {
             }
             Entry::Occupied(mut o) => {
                 let prev = o.get();
-                if slot > 0 && prev.slot > slot {
+                if slot > 0 && slot < prev.last_seen_slot {
                     return false;
                 }
                 let material_changed =
@@ -752,8 +752,8 @@ impl LivePoolCache {
         if let Some(mapping) = self.vault_to_pool.get(vault) {
             let (pool_addr, position) = *mapping;
             if let Some(mut entry) = self.pools.get_mut(&pool_addr) {
-                if slot > 0 {
-                    entry.last_seen_slot = entry.last_seen_slot.max(slot);
+                if slot > 0 && slot < entry.last_seen_slot {
+                    return;
                 }
                 let balance_changed = match &entry.state {
                     CachedPoolState::Orca(s) => match position {
@@ -784,9 +784,9 @@ impl LivePoolCache {
                 };
                 if !balance_changed {
                     crate::metrics::inc_live_pool_cache_fingerprint_unchanged_skip_total();
-                    return;
-                }
-                if slot > 0 && slot < entry.slot {
+                    if slot > 0 {
+                        entry.last_seen_slot = entry.last_seen_slot.max(slot);
+                    }
                     return;
                 }
                 match &mut entry.state {
@@ -819,6 +819,7 @@ impl LivePoolCache {
                     }
                 }
                 if slot > 0 {
+                    entry.last_seen_slot = entry.last_seen_slot.max(slot);
                     entry.slot = slot;
                 }
                 entry.updated_at = Instant::now();
@@ -2790,6 +2791,56 @@ mod tests {
             cache.get_last_seen_slot(&pool),
             Some(50),
             "last_seen_slot tracks heartbeat"
+        );
+    }
+
+    #[test]
+    fn upsert_rejects_out_of_order_material_change_after_newer_last_seen() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let state_a = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(1_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+        let state_b = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(2_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+
+        cache.upsert(pool, state_a.clone(), 10);
+        cache.upsert(pool, state_a, 50);
+        assert!(
+            !cache.upsert(pool, state_b, 20),
+            "late update between material and last_seen must not apply"
+        );
+
+        let (_, material_slot, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(material_slot, 10, "material slot must stay at last change");
+        assert_eq!(
+            cache.get_last_seen_slot(&pool),
+            Some(50),
+            "last_seen_slot keeps newest observed Geyser slot"
+        );
+        let cached = cache.get(&pool).expect("cached state");
+        let CachedPoolState::PumpAmm(s) = cached else {
+            panic!("expected pump amm");
+        };
+        assert_eq!(
+            s.base_reserve,
+            Some(1_000_000),
+            "state must remain prior snapshot"
         );
     }
 

@@ -1403,7 +1403,7 @@ pub fn round_trip_profit_lamports_with_freshness(
         probe_sol_lamports,
         freshness,
     )?;
-    if !is_quote_fresh(&buy_quote, freshness, buy.vault, now) {
+    if !is_quote_fresh_with_bins(&buy_quote, freshness, buy.vault, buy.dlmm_bins, now) {
         return None;
     }
     let sell_quote = quote_exact_in_with_freshness(
@@ -1415,7 +1415,7 @@ pub fn round_trip_profit_lamports_with_freshness(
         buy_quote.amount_out,
         freshness,
     )?;
-    if !is_quote_fresh(&sell_quote, freshness, sell.vault, now) {
+    if !is_quote_fresh_with_bins(&sell_quote, freshness, sell.vault, sell.dlmm_bins, now) {
         return None;
     }
     if !quotes_pairable(&buy_quote, &sell_quote) {
@@ -1900,7 +1900,13 @@ pub fn select_round_trip_pools(
         let Some(buy_quote) = buy_quote else {
             continue;
         };
-        if !is_quote_fresh(&buy_quote, freshness, candidate.vault, now) {
+        if !is_quote_fresh_with_bins(
+            &buy_quote,
+            freshness,
+            candidate.vault,
+            candidate.dlmm_bins,
+            now,
+        ) {
             continue;
         }
         let sol_per_token = sol_per_token_from_buy_quote(&buy_quote, token_decimals);
@@ -2496,7 +2502,7 @@ mod tests {
                 &freshness,
             );
             let Some(buy_quote) = buy_quote else { continue };
-            if !is_quote_fresh(&buy_quote, &freshness, buy.vault, now) {
+            if !is_quote_fresh_with_bins(&buy_quote, &freshness, buy.vault, buy.dlmm_bins, now) {
                 continue;
             }
             for sell in &candidates {
@@ -2515,7 +2521,13 @@ mod tests {
                 let Some(sell_quote) = sell_quote else {
                     continue;
                 };
-                if !is_quote_fresh(&sell_quote, &freshness, sell.vault, now) {
+                if !is_quote_fresh_with_bins(
+                    &sell_quote,
+                    &freshness,
+                    sell.vault,
+                    sell.dlmm_bins,
+                    now,
+                ) {
                     continue;
                 }
                 if !quotes_pairable(&buy_quote, &sell_quote) {
@@ -2936,6 +2948,108 @@ mod tests {
             state_fingerprint_with_bins(&vault, Some(&bins_a)),
             state_fingerprint_with_bins(&vault, Some(&bins_b))
         );
+    }
+
+    #[test]
+    fn dlmm_executable_quote_recheck_requires_bins_fingerprint() {
+        let active_id = 0i32;
+        let bin_step = 100u16;
+        let token_amount = 1_000_000_000_000u64;
+        let sol_amount = 1_000_000_000u64;
+        let array_index = active_id as i64 / 70;
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            array_index,
+            vec![BinData {
+                offset: 0,
+                amount_x: token_amount,
+                amount_y: sol_amount,
+            }],
+        );
+        let pool = sample_pool("meteora_dlmm", "dlmmFresh");
+        let vault = QuoteVaultInput {
+            reserve_base: token_amount,
+            reserve_quote: sol_amount,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(active_id),
+            bin_step: Some(bin_step),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(pool.token_mint.clone()),
+        };
+        let freshness = QuoteFreshnessConfig::default();
+        let quote = quote_exact_in_with_freshness(
+            &pool,
+            Some(&vault),
+            Some(&bins),
+            NATIVE_SOL_MINT,
+            &pool.token_mint,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &freshness,
+        )
+        .expect("dlmm buy quote");
+        let now = Instant::now();
+        assert!(
+            is_quote_fresh_with_bins(&quote, &freshness, Some(&vault), Some(&bins), now),
+            "DLMM re-check must include bin snapshot"
+        );
+        assert!(
+            !is_quote_fresh(&quote, &freshness, Some(&vault), now),
+            "vault-only re-check must not gate DLMM executable quotes"
+        );
+    }
+
+    #[test]
+    fn select_round_trip_pools_keeps_dlmm_buy_with_bins() {
+        let active_id = 0i32;
+        let bin_step = 100u16;
+        let token_amount = 1_000_000_000_000u64;
+        let sol_amount = 1_000_000_000u64;
+        let array_index = active_id as i64 / 70;
+        let mut dlmm_bins: DlmmBinArrays = HashMap::new();
+        dlmm_bins.insert(
+            array_index,
+            vec![BinData {
+                offset: 0,
+                amount_x: token_amount,
+                amount_y: sol_amount,
+            }],
+        );
+        let dlmm_pool = sample_pool("meteora_dlmm", "dlmmBuy");
+        let pump_pool = sample_pool("pump_amm", "pumpSell");
+        let dlmm_vault = QuoteVaultInput {
+            reserve_base: token_amount,
+            reserve_quote: sol_amount,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(active_id),
+            bin_step: Some(bin_step),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(dlmm_pool.token_mint.clone()),
+        };
+        let pump_vault = sample_vault(1_000_000_000_000, 1_200_000_000);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &dlmm_pool,
+                vault: Some(&dlmm_vault),
+                dlmm_bins: Some(&dlmm_bins),
+                dex: "meteora_dlmm",
+            },
+            RoundTripPoolCandidate {
+                pool: &pump_pool,
+                vault: Some(&pump_vault),
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+        ];
+        let selection = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .expect("DLMM buy must survive bin-aware freshness re-check");
+        assert_eq!(selection.buy_dex, "meteora_dlmm");
+        assert_eq!(selection.sell_dex, "pump_amm");
     }
 
     #[test]
