@@ -35,7 +35,7 @@ use ironcrab::arbitrage::in_flight::{
 use ironcrab::arbitrage::{
     arb_track_removal_reason, classify_cross_dex_sell_failure, dlmm_marginal_price_plausible,
     dlmm_sol_output_from_bins, dlmm_token_output_from_bins, freshness_age_bucket,
-    is_arb_route_executable, is_expected_token_output_plausible, is_quote_fresh,
+    is_arb_route_executable, is_expected_token_output_plausible, is_quote_fresh_with_bins,
     populate_arb_slave_from_live_pool_cache, price_based_token_output_raw, quote_exact_in,
     quote_exact_in_with_freshness, quote_sell_round_trip, quotes_pairable,
     round_trip_profit_lamports, select_arb_track_pools, select_round_trip_pools, state_fingerprint,
@@ -2847,7 +2847,7 @@ fn log_v2_cross_dex_pair_failures_debug_sample(
         ) else {
             continue;
         };
-        if !is_quote_fresh(&buy_quote, freshness, buy.vault, now) {
+        if !is_quote_fresh_with_bins(&buy_quote, freshness, buy.vault, buy.dlmm_bins, now) {
             continue;
         }
         for sell in candidates {
@@ -3416,7 +3416,13 @@ impl TokenArbTracker {
             let Some(buy_quote) = buy_quote else {
                 continue;
             };
-            if !is_quote_fresh(&buy_quote, freshness, candidate.vault, now) {
+            if !is_quote_fresh_with_bins(
+                &buy_quote,
+                freshness,
+                candidate.vault,
+                candidate.dlmm_bins,
+                now,
+            ) {
                 continue;
             }
             let replace = match pairing_token_amount {
@@ -3442,9 +3448,9 @@ impl TokenArbTracker {
                 freshness,
             );
             let buy_quote_ok = buy_quote.is_some();
-            let buy_quote_fresh = buy_quote
-                .as_ref()
-                .is_some_and(|q| is_quote_fresh(q, freshness, candidate.vault, now));
+            let buy_quote_fresh = buy_quote.as_ref().is_some_and(|q| {
+                is_quote_fresh_with_bins(q, freshness, candidate.vault, candidate.dlmm_bins, now)
+            });
 
             let token_amount_in = pairing_token_amount;
             let (
@@ -3469,7 +3475,13 @@ impl TokenArbTracker {
                 };
                 let ok = sell_quote.is_some();
                 let fresh = sell_quote.as_ref().is_some_and(|q| {
-                    is_quote_fresh(q, freshness, candidate.vault, now) && quotes_pairable(buy_q, q)
+                    is_quote_fresh_with_bins(
+                        q,
+                        freshness,
+                        candidate.vault,
+                        candidate.dlmm_bins,
+                        now,
+                    ) && quotes_pairable(buy_q, q)
                 });
                 let failure = if ok {
                     None
@@ -6689,7 +6701,7 @@ impl ArbContext {
             Some(q) => q,
             None => return false,
         };
-        if !is_quote_fresh(&buy_quote, &freshness, buy.vault, now) {
+        if !is_quote_fresh_with_bins(&buy_quote, &freshness, buy.vault, buy.dlmm_bins, now) {
             return false;
         }
         classify_cross_dex_sell_failure(
@@ -6848,7 +6860,7 @@ impl ArbContext {
             ) else {
                 continue;
             };
-            if !is_quote_fresh(&buy_quote, &freshness, buy.vault, now) {
+            if !is_quote_fresh_with_bins(&buy_quote, &freshness, buy.vault, buy.dlmm_bins, now) {
                 continue;
             }
             buy_checks += 1;

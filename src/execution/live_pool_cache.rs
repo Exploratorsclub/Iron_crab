@@ -783,10 +783,10 @@ impl LivePoolCache {
                     CachedPoolState::PumpFun(_) => false,
                 };
                 if !balance_changed {
-                    crate::metrics::inc_live_pool_cache_fingerprint_unchanged_skip_total();
                     if slot > 0 {
                         entry.last_seen_slot = entry.last_seen_slot.max(slot);
                     }
+                    crate::metrics::inc_live_pool_cache_fingerprint_unchanged_skip_total();
                     return;
                 }
                 match &mut entry.state {
