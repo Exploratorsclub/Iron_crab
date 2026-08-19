@@ -83,14 +83,16 @@ use ironcrab::market_data::sidefx::{
 };
 use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_admitted_pool_sets_from_admission, explicit_set_snapshot_path,
-    explicit_subscription_has_new_keys, flush_explicit_set_snapshot, load_explicit_set_snapshot,
-    momentum_coalesce_try_send, owner_group_snapshot_to_disk, pin_priority_for_momentum_active_pin,
-    restore_admission_from_owner_groups, spawn_track_worker, track_worker_try_enqueue,
-    try_admit_owner_group, AdmissionConvergeResult, AdmissionRestoreResult, CapShrinkResult,
-    ConsumerId, ExplicitAccountKind, ExplicitConsumer, ExplicitEntry, ExplicitOwner,
-    ExplicitOwnerKey, ExplicitSetSnapshot, ExplicitSnapshotRow, FixedCapAdmission,
-    GeyserConnectBarrier, PinPriority, SnapshotConsumer, TrackPinReason, TrackWorkerCommand,
-    TrackWorkerContext, TrackWorkerSender, EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
+    explicit_subscription_has_new_keys, filter_tracker_consumer_from_snapshot,
+    flush_explicit_set_snapshot, load_explicit_set_snapshot, momentum_coalesce_try_send,
+    owner_group_snapshot_to_disk, pin_priority_for_momentum_active_pin,
+    restore_admission_from_owner_groups, snapshot_owner_groups_for_persist,
+    snapshot_rows_for_persist, spawn_track_worker, track_worker_try_enqueue, try_admit_owner_group,
+    AdmissionConvergeResult, AdmissionRestoreResult, CapShrinkResult, ConsumerId,
+    ExplicitAccountKind, ExplicitConsumer, ExplicitEntry, ExplicitOwner, ExplicitOwnerKey,
+    ExplicitSetSnapshot, ExplicitSnapshotRow, FixedCapAdmission, GeyserConnectBarrier, PinPriority,
+    SnapshotConsumer, TrackPinReason, TrackWorkerCommand, TrackWorkerContext, TrackWorkerSender,
+    EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP,
 };
 use ironcrab::metrics::{
     dec_market_data_account_enrich_ingress_queue_depth,
@@ -132,15 +134,14 @@ use ironcrab::metrics::{
     inc_market_data_open_position_pumpfun_remediate_flush_pending_total,
     inc_market_data_open_position_pumpfun_remediate_ok_total,
     inc_market_data_open_position_pumpfun_remediate_still_unsatisfied_total,
-    inc_market_data_tracker_admission_admitted_total,
-    inc_market_data_tracker_admission_rejected_total,
+    inc_market_data_tracker_track_mint_rejected_total,
     inc_market_data_vault_high_priority_dispatch_total,
     inc_market_data_wallet_admission_admitted_total,
     inc_market_data_wallet_admission_rejected_total, market_data_bump_geyser_head_slot,
     market_data_enrich_shed_active, market_data_exec_hot_arb_admit_suppress,
     market_data_exec_hot_lag_p50_est_ms, market_data_exec_hot_lag_p99_est_ms,
     market_data_exec_hot_last_shed_groups, market_data_exec_hot_momentum_admit_suppress,
-    market_data_exec_hot_tracker_admit_suppress, market_data_geyser_head_slot_value,
+    market_data_geyser_head_slot_value,
     market_data_geyser_tracking_enqueue_dropped_value,
     market_data_geyser_tracking_jobs_processed_value, market_data_md_state_bursts_completed_value,
     market_data_request_account_session_reconnect, market_data_request_tx_session_reconnect,
@@ -2341,8 +2342,9 @@ impl TrackWorkerContext for MarketDataContext {
         admission: &mut FixedCapAdmission,
         snapshot: &ExplicitSetSnapshot,
     ) -> AdmissionRestoreResult {
-        self.restore_tracked_maps_from_snapshot_rows(snapshot);
-        MarketDataContext::restore_explicit_admission_from_snapshot(self, admission, snapshot)
+        let snapshot = filter_tracker_consumer_from_snapshot(snapshot.clone());
+        self.restore_tracked_maps_from_snapshot_rows(&snapshot);
+        MarketDataContext::restore_explicit_admission_from_snapshot(self, admission, &snapshot)
     }
 
     fn on_admission_converge_result(
@@ -3086,32 +3088,10 @@ impl MarketDataContext {
         pin: Option<TrackPinReason>,
     ) -> bool {
         match pin {
+            // I-MD-5: unpinned tracker demand from TX ingest is forbidden; legacy path is no-op.
             None => {
-                let skip_tracker_admit = self
-                    .tracked_mints
-                    .read()
-                    .get(&mint)
-                    .is_some_and(|info| info.pin.is_some());
-                if !skip_tracker_admit {
-                    let owner = Self::tracker_mint_owner(mint);
-                    if admission.owner_group(&owner).is_none()
-                        && market_data_exec_hot_tracker_admit_suppress()
-                    {
-                        inc_market_data_exec_hot_pressure_admit_rejected_total(
-                            ExecHotShedTier::Tracker,
-                        );
-                        inc_market_data_tracker_admission_rejected_total();
-                        return false;
-                    }
-                    if !try_admit_owner_group(admission, owner, vec![mint]) {
-                        inc_market_data_tracker_admission_rejected_total();
-                        return false;
-                    }
-                    inc_market_data_tracker_admission_admitted_total();
-                }
-                let _ = self.track_mint_for_geyser_metadata(mint, None);
-                // Unpinned tracker LRU refresh / already-tracked mint is idempotent success.
-                true
+                inc_market_data_tracker_track_mint_rejected_total();
+                false
             }
             Some(TrackPinReason::Wallet) => self.apply_wallet_pin(admission, mint),
             Some(other) => {
@@ -3253,6 +3233,9 @@ impl MarketDataContext {
             }
         }
         for row in &snapshot.rows {
+            if row.consumer == SnapshotConsumer::Tracker {
+                continue;
+            }
             let Ok(pk) = Pubkey::from_str(&row.pubkey) else {
                 continue;
             };
@@ -3732,12 +3715,14 @@ impl MarketDataContext {
 
     fn build_explicit_set_snapshot(&self, admission: &FixedCapAdmission) -> ExplicitSetSnapshot {
         let mut snapshot = ExplicitSetSnapshot::new(Some(self.run_id.clone()));
-        snapshot.rows = self.collect_explicit_snapshot_rows();
-        snapshot.owner_groups = admission
-            .snapshot_owner_groups()
-            .iter()
-            .map(owner_group_snapshot_to_disk)
-            .collect();
+        snapshot.rows = snapshot_rows_for_persist(&self.collect_explicit_snapshot_rows());
+        snapshot.owner_groups = snapshot_owner_groups_for_persist(
+            &admission
+                .snapshot_owner_groups()
+                .iter()
+                .map(owner_group_snapshot_to_disk)
+                .collect::<Vec<_>>(),
+        );
         snapshot.pool_mint_map =
             self.collect_pool_mint_map_tier1(EXPLICIT_SET_SNAPSHOT_POOL_MINT_MAP_CAP);
         snapshot.momentum_pools = self
@@ -3768,6 +3753,7 @@ impl MarketDataContext {
         admission: &mut FixedCapAdmission,
         snapshot: &ExplicitSetSnapshot,
     ) -> AdmissionRestoreResult {
+        let snapshot = filter_tracker_consumer_from_snapshot(snapshot.clone());
         let groups = snapshot.to_owner_group_snapshots();
         let result = restore_admission_from_owner_groups(admission, &groups);
         match result {
@@ -18444,7 +18430,7 @@ mod pr_b_geyser_tracking_tests {
         let jobs0 = MARKET_DATA_GEYSER_TRACKING_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
         for _ in 0..128 {
             let mint = Pubkey::new_unique();
-            md_state_try_enqueue(&md_state, MdStateCommand::TrackMint { mint, pin: None });
+            md_state_try_enqueue(&md_state, MdStateCommand::TrackWalletMint { mint });
         }
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -18905,9 +18891,9 @@ mod pr_b_geyser_tracking_tests {
         let _ = hold.await;
     }
 
-    /// Phase-R-R2: burst job processing sets `schedule_sync` once per worker drain (not per job).
+    /// Phase-R-R2: burst wallet pin processing sets `schedule_sync` once per worker drain (not per job).
     #[test]
-    fn pr_r2_burst_track_mint_coalesces_single_schedule_sync_flag() {
+    fn pr_r2_burst_wallet_pin_coalesces_single_schedule_sync_flag() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
@@ -18919,7 +18905,7 @@ mod pr_b_geyser_tracking_tests {
             let mint = Pubkey::new_unique();
             if md_state_process_job(
                 &ctx,
-                MdStateCommand::TrackMint { mint, pin: None },
+                MdStateCommand::TrackWalletMint { mint },
                 &track_worker,
             ) {
                 schedule_sync = true;
@@ -18928,12 +18914,12 @@ mod pr_b_geyser_tracking_tests {
         std::thread::sleep(Duration::from_millis(20));
         assert!(
             schedule_sync || !ctx.tracked_mints.read().is_empty(),
-            "burst TrackMint should track mints via track-worker"
+            "burst wallet pin should track mints via track-worker"
         );
         assert_eq!(
             ctx.tracked_mints.read().len(),
             32,
-            "all burst mints should be tracked on md-state"
+            "all burst wallet pins should be tracked on md-state"
         );
     }
 
@@ -20750,6 +20736,22 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
+    fn pr4b_unpinned_track_mint_rejected_without_admission_change() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let mint = Pubkey::new_unique();
+        let mints_before = ctx.tracked_mints.read().len();
+        let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
+        assert!(!ctx.apply_track_mint(&mut admission, mint, None));
+        assert_eq!(ctx.tracked_mints.read().len(), mints_before);
+        assert!(!ctx.tracked_mints.read().contains_key(&mint));
+        assert!(!admission.contains(&mint));
+    }
+
+    #[test]
     fn pr4b_tracker_admission_reject_skips_tracked_map_mutation() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
@@ -20821,7 +20823,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn pr4b_repeated_track_mint_unpinned_is_idempotent_success() {
+    fn pr4b_unpinned_track_mint_is_never_idempotent_success() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
@@ -20829,14 +20831,14 @@ mod pr_b_geyser_tracking_tests {
 
         let mint = Pubkey::new_unique();
         let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
-        assert!(ctx.apply_track_mint(&mut admission, mint, None));
-        assert!(ctx.tracked_mints.read().contains_key(&mint));
-        assert!(ctx.apply_track_mint(&mut admission, mint, None));
+        assert!(!ctx.apply_track_mint(&mut admission, mint, None));
+        assert!(!ctx.tracked_mints.read().contains_key(&mint));
+        assert!(!ctx.apply_track_mint(&mut admission, mint, None));
     }
 
-    /// Scope H: lock-free mint membership snapshot gates redundant TX TrackMint enqueue.
+    /// Scope H: lock-free mint membership snapshot reflects wallet/strategy pins only.
     #[test]
-    fn scope_h_ingest_membership_mint_contains_after_track() {
+    fn scope_h_ingest_membership_mint_contains_after_wallet_pin() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
@@ -20845,7 +20847,7 @@ mod pr_b_geyser_tracking_tests {
         assert!(!ctx.ingest_membership_mint_contains(&mint));
 
         let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
-        assert!(ctx.apply_track_mint(&mut admission, mint, None));
+        assert!(ctx.apply_wallet_pin(&mut admission, mint));
         ctx.refresh_tracked_membership_snapshot();
         assert!(ctx.ingest_membership_mint_contains(&mint));
     }
@@ -20931,9 +20933,9 @@ mod pr_b_geyser_tracking_tests {
         assert!(!ctx.tracked_mints.read().contains_key(&mint));
     }
 
-    /// PR4b: tracker snapshot rows restore as unpinned mints, not arb-pinned.
+    /// PR4b: tracker snapshot rows are not persisted or restored (I-MD-6).
     #[test]
-    fn pr4b_tracker_snapshot_mint_restores_unpinned() {
+    fn pr4b_tracker_snapshot_mint_excluded_from_persist_and_restore() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
@@ -20944,12 +20946,17 @@ mod pr_b_geyser_tracking_tests {
         let mut admission = FixedCapAdmission::new(ctx.max_tracked_accounts());
         converge_admission_from_ctx(ctx.as_ref(), &mut admission);
         let snapshot = ctx.build_explicit_set_snapshot(&admission);
-        let row = snapshot
-            .rows
-            .iter()
-            .find(|r| r.pubkey == mint.to_string())
-            .expect("tracker mint row");
-        assert_eq!(row.consumer, SnapshotConsumer::Tracker);
+        assert!(
+            !snapshot.rows.iter().any(|r| r.pubkey == mint.to_string()),
+            "tracker mint rows must not be written to snapshot"
+        );
+        assert!(
+            !snapshot
+                .owner_groups
+                .iter()
+                .any(|g| g.consumer == SnapshotConsumer::Tracker),
+            "tracker owner groups must not be written to snapshot"
+        );
 
         let fresh = minimal_market_data_context_for_pr_d_tests(
             QueuedJsonlWriter::spawn(
@@ -20958,12 +20965,16 @@ mod pr_b_geyser_tracking_tests {
             )
             .expect("jsonl2"),
         );
-        let restored = fresh.restore_tracked_maps_from_snapshot_rows(&snapshot);
-        assert!(restored > 0);
-        let tracked = fresh.tracked_mints.read();
-        let info = tracked.get(&mint).expect("restored tracker mint");
-        assert_eq!(info.pin, None);
-        assert!(!info.pinned);
+        let mut legacy = snapshot.clone();
+        legacy.rows.push(ExplicitSnapshotRow {
+            pubkey: mint.to_string(),
+            consumer: SnapshotConsumer::Tracker,
+            pool: None,
+            kind: ExplicitAccountKind::Mint,
+        });
+        let restored = fresh.restore_tracked_maps_from_snapshot_rows(&legacy);
+        assert_eq!(restored, 0);
+        assert!(!fresh.tracked_mints.read().contains_key(&mint));
     }
 
     /// Scope C / Bugbot: position pools survive snapshot restore with MomentumPosition consumer + pin subset.
@@ -21028,6 +21039,20 @@ mod pr_b_geyser_tracking_tests {
         assert!(restored > 0);
         assert!(fresh.hot_pool_registry.is_position_pin_for_pool(pool));
         assert!(fresh.hot_pool_registry.is_position_pin(base_mint, pool));
+    }
+
+    /// I-MD-5: TX ingest must not enqueue unpinned TrackMint.
+    #[test]
+    fn imd5_tx_handler_no_unpinned_track_mint_enqueue() {
+        let tx_body = include_str!("../market_data/ingest/tx_handler.rs");
+        assert!(
+            !tx_body.contains("MdStateCommand::TrackMint"),
+            "TX handler must not enqueue TrackMint (I-MD-5)"
+        );
+        assert!(
+            !tx_body.contains("TrackMint { mint, pin: None }"),
+            "TX handler must not enqueue unpinned tracker demand"
+        );
     }
 
     /// Phase 2c: trade handler must not reference arb reconcile enqueue helpers.

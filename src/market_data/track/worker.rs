@@ -21,6 +21,7 @@ use crate::metrics::{
     inc_market_data_track_request_coalesce_batches_total,
     inc_market_data_track_worker_enqueue_by_kind,
     inc_market_data_track_worker_enqueue_deduped_total,
+    inc_market_data_tracker_track_mint_rejected_total,
     record_market_data_arb_track_requests_messages_total,
     record_market_data_momentum_active_pool_messages_total, set_market_data_arb_pinned_pools_gauge,
     set_market_data_exec_hot_last_shed_groups, set_market_data_momentum_active_pool_pins_gauge,
@@ -349,11 +350,15 @@ pub fn track_worker_process_command<C: TrackWorkerContext>(
         TrackWorkerCommand::WithdrawWalletPin { mint } => ctx.withdraw_wallet_pin(admission, mint),
         TrackWorkerCommand::TrackMint { mint, pin } => ctx.apply_track_mint(admission, mint, pin),
         TrackWorkerCommand::TrackMints { entries } => {
-            let mut all_ok = true;
+            let mut any_ok = false;
             for (mint, pin) in entries {
-                all_ok &= ctx.apply_track_mint(admission, mint, pin);
+                if pin.is_none() {
+                    inc_market_data_tracker_track_mint_rejected_total();
+                    continue;
+                }
+                any_ok |= ctx.apply_track_mint(admission, mint, pin);
             }
-            all_ok
+            any_ok
         }
         TrackWorkerCommand::ScheduleGeyserSyncAfterConfigChange => {
             let new_cap = ctx.max_tracked_accounts();

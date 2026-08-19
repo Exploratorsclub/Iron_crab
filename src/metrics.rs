@@ -1348,6 +1348,9 @@ pub static MARKET_DATA_TRACK_PROTOCOL_PENDING_COALESCED_TOTAL: Lazy<AtomicU64> =
 /// Scope H: TX ingest skipped TrackMint because mint is already in tracked-membership snapshot.
 pub static MARKET_DATA_TRACK_MINT_SKIPPED_ALREADY_TRACKED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// I-MD-5: unpinned tracker TrackMint rejected (TX ingest + legacy callers).
+pub static MARKET_DATA_TRACKER_TRACK_MINT_REJECTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Scope H: TrackMint messages absorbed by md-state burst coalesce (before dedupe).
 pub static MARKET_DATA_MD_STATE_TRACK_MINT_COALESCE_MESSAGES_IN_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1724,6 +1727,11 @@ pub fn inc_market_data_track_protocol_pending_coalesced_total() {
 #[inline]
 pub fn inc_market_data_track_mint_skipped_already_tracked_total() {
     MARKET_DATA_TRACK_MINT_SKIPPED_ALREADY_TRACKED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tracker_track_mint_rejected_total() {
+    MARKET_DATA_TRACKER_TRACK_MINT_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -8714,6 +8722,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_track_mint_skipped_already_tracked_total",
         MARKET_DATA_TRACK_MINT_SKIPPED_ALREADY_TRACKED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tracker_track_mint_rejected_total",
+        MARKET_DATA_TRACKER_TRACK_MINT_REJECTED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_md_state_track_mint_coalesce_messages_in_total",
