@@ -752,9 +752,6 @@ impl LivePoolCache {
         if let Some(mapping) = self.vault_to_pool.get(vault) {
             let (pool_addr, position) = *mapping;
             if let Some(mut entry) = self.pools.get_mut(&pool_addr) {
-                if slot > 0 && slot < entry.slot {
-                    return;
-                }
                 let balance_changed = match &entry.state {
                     CachedPoolState::Orca(s) => match position {
                         VaultPosition::A => s.vault_a_balance != Some(balance),
@@ -783,10 +780,10 @@ impl LivePoolCache {
                     CachedPoolState::PumpFun(_) => false,
                 };
                 if !balance_changed {
-                    if slot > 0 {
-                        entry.last_seen_slot = entry.last_seen_slot.max(slot);
-                    }
                     crate::metrics::inc_live_pool_cache_fingerprint_unchanged_skip_total();
+                    return;
+                }
+                if slot > 0 && slot < entry.slot {
                     return;
                 }
                 match &mut entry.state {
@@ -819,7 +816,6 @@ impl LivePoolCache {
                     }
                 }
                 if slot > 0 {
-                    entry.last_seen_slot = entry.last_seen_slot.max(slot);
                     entry.slot = slot;
                 }
                 entry.updated_at = Instant::now();
@@ -2841,6 +2837,49 @@ mod tests {
             s.base_reserve,
             Some(1_000_000),
             "state must remain prior snapshot"
+        );
+    }
+
+    #[test]
+    fn update_vault_balance_applies_below_pool_last_seen_when_material_advances() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let state = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: base_vault,
+            pool_quote_token_account: quote_vault,
+            base_reserve: Some(1_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+
+        cache.upsert(pool, state.clone(), 10);
+        cache.upsert(pool, state, 50);
+
+        let (_, material_before, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(material_before, 10);
+        assert_eq!(cache.get_last_seen_slot(&pool), Some(50));
+
+        cache.update_vault_balance(&base_vault, 2_000_000, 40);
+
+        let (_, material_after, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(
+            material_after, 40,
+            "vault ATA slot advances material watermark"
+        );
+        assert_eq!(cache.get_last_seen_slot(&pool), Some(50));
+        let cached = cache.get(&pool).expect("cached state");
+        let CachedPoolState::PumpAmm(s) = cached else {
+            panic!("expected pump amm");
+        };
+        assert_eq!(
+            s.base_reserve,
+            Some(2_000_000),
+            "vault balance must apply despite pool last_seen ahead of vault slot"
         );
     }
 
