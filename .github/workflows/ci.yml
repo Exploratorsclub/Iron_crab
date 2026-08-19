@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [architecture-rebuild, main, 'release/**']
+    branches: [architecture-rebuild, architecture-rebuild-next, main, 'release/**']
   pull_request:
-    branches: [architecture-rebuild, main, 'release/**']
+    branches: [architecture-rebuild, architecture-rebuild-next, main, 'release/**']
 
 jobs:
   build-test:
@@ -72,8 +72,8 @@ jobs:
     name: Eval (Level 5)
     needs: [build-test]
     if: |
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/architecture-rebuild' || startsWith(github.ref, 'refs/heads/release'))) ||
-      (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'architecture-rebuild' || startsWith(github.base_ref, 'release')) && github.repository == github.event.pull_request.head.repo.full_name)
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/architecture-rebuild' || github.ref == 'refs/heads/architecture-rebuild-next' || startsWith(github.ref, 'refs/heads/release'))) ||
+      (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'architecture-rebuild' || github.base_ref == 'architecture-rebuild-next' || startsWith(github.base_ref, 'release')) && github.repository == github.event.pull_request.head.repo.full_name)
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: 0

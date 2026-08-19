@@ -9,8 +9,9 @@ use std::time::Instant;
 use crate::nats::{ArbTrackActiveReason, ArbTrackRemovedReason};
 
 use super::pool_quote::{
-    is_quote_fresh, quote_exact_in_with_freshness, select_round_trip_pools, DlmmBinArrays,
-    QuoteFreshnessConfig, QuotePoolInput, QuoteVaultInput, RoundTripPoolCandidate, NATIVE_SOL_MINT,
+    is_quote_fresh_with_bins, quote_exact_in_with_freshness, select_round_trip_pools,
+    DlmmBinArrays, QuoteFreshnessConfig, QuotePoolInput, QuoteVaultInput, RoundTripPoolCandidate,
+    NATIVE_SOL_MINT,
 };
 
 /// Readiness tier for a pool candidate (lowest ordinal = highest priority).
@@ -592,7 +593,13 @@ fn can_fresh_sell_quote(
     ) else {
         return false;
     };
-    is_quote_fresh(&quote, &config.freshness, pool.vault.as_ref(), now)
+    is_quote_fresh_with_bins(
+        &quote,
+        &config.freshness,
+        pool.vault.as_ref(),
+        pool.dlmm_bins.as_ref(),
+        now,
+    )
 }
 
 fn is_warmable_pool(pool: &TrackPoolInput, config: &TrackSelectionConfig, now: Instant) -> bool {
@@ -618,7 +625,13 @@ fn can_fresh_buy_quote(pool: &TrackPoolInput, config: &TrackSelectionConfig, now
     ) else {
         return false;
     };
-    is_quote_fresh(&quote, &config.freshness, pool.vault.as_ref(), now)
+    is_quote_fresh_with_bins(
+        &quote,
+        &config.freshness,
+        pool.vault.as_ref(),
+        pool.dlmm_bins.as_ref(),
+        now,
+    )
 }
 
 fn is_structurally_quote_capable(pool: &TrackPoolInput) -> bool {
