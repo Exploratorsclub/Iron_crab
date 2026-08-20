@@ -6831,10 +6831,20 @@ impl ArbContext {
         };
         if seeded {
             inc_arb_vault_seed_from_cache_ok_total();
-            if matches!(
-                pending.sell_detail,
-                Some(NoCrossDexSellDetailReason::SellMissingDlmmBins)
-            ) {
+            let bins_still_missing = self
+                .trackers
+                .read()
+                .get(mint)
+                .and_then(|t| t.pools.get(sell_pool))
+                .is_some_and(|p| {
+                    p.dex == "meteora_dlmm"
+                        && self
+                            .bin_arrays
+                            .read()
+                            .get(sell_pool)
+                            .is_none_or(|bins| bins.is_empty())
+                });
+            if bins_still_missing {
                 // Vault refresh alone does not resolve missing DLMM bins; keep 5s completeness retry.
                 return false;
             }
