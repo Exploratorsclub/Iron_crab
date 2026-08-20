@@ -6831,6 +6831,13 @@ impl ArbContext {
         };
         if seeded {
             inc_arb_vault_seed_from_cache_ok_total();
+            if matches!(
+                pending.sell_detail,
+                Some(NoCrossDexSellDetailReason::SellMissingDlmmBins)
+            ) {
+                // Vault refresh alone does not resolve missing DLMM bins; keep 5s completeness retry.
+                return false;
+            }
             inc_arb_v2_sell_stale_recovery_outcome_total("fresh_after_vault_seed");
             if let Some(entry) = self.v2_sell_stale_recovery_pending.write().get_mut(mint) {
                 entry.completeness_seeded = true;
