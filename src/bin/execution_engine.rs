@@ -9235,14 +9235,32 @@ async fn main() -> Result<()> {
                             stream = TRADE_INTENTS_STREAM_NAME,
                             "TRADE_INTENTS consumer has non-New deliver policy; deleting for recreate"
                         );
-                        if let Err(e) = stream.delete_consumer(TRADE_INTENTS_CONSUMER).await {
-                            warn!(
-                                error = %e,
-                                consumer = TRADE_INTENTS_CONSUMER,
-                                "Failed to delete stale TRADE_INTENTS consumer"
-                            );
+                        match stream.delete_consumer(TRADE_INTENTS_CONSUMER).await {
+                            Ok(_) => None,
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    consumer = TRADE_INTENTS_CONSUMER,
+                                    "Failed to delete stale TRADE_INTENTS consumer; falling back to existing consumer"
+                                );
+                                match stream
+                                    .get_consumer::<async_nats::jetstream::consumer::pull::Config>(
+                                        TRADE_INTENTS_CONSUMER,
+                                    )
+                                    .await
+                                {
+                                    Ok(consumer) => Some(consumer),
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            consumer = TRADE_INTENTS_CONSUMER,
+                                            "Failed to get existing TRADE_INTENTS consumer after delete failure"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
                         }
-                        None
                     } else {
                         match stream
                             .get_consumer::<async_nats::jetstream::consumer::pull::Config>(
