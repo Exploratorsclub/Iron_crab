@@ -324,6 +324,8 @@ histogram_quantile(0.99, sum(rate(execution_process_intent_us_bucket[5m])) by (l
 
 **Intent-Delivery-Segmentierung (execution-engine):** F1 + F2 + JetStream-Fetch-Latenz (nicht histogrammiert) erklaeren approx. den Gesamtweg bis F. Hohes F3 bei gleichzeitig hohem F2 deutet auf `interval.tick`-Starvation hin (Main-Loop blockiert durch PoolCache/WalletSnapshot-Batches). Hohes F1 bei niedrigem F2 deutet auf JetStream-Fetch-/Consumer-Verzoegerung hin.
 
+**TRADE_INTENTS JetStream-Consumer (`execution-engine`):** Der durable Consumer `execution-engine` auf Stream `TRADE_INTENTS` nutzt `DeliverPolicy::New` (nur Live-Intents, kein Replay alter Intents). Beim ersten Deploy nach diesem Wechsel loescht EE beim Start einen bestehenden Consumer mit alter Policy (`All`) und erstellt ihn neu — einmalig, nur dieser Consumer (nicht der Stream). Nach Recreate werden nur Intents ab Consumer-Create geliefert (gewollt).
+
 ### PumpSwap Async-Healing Metrics
 
 Im `execution-engine`-Metrics-Endpoint sind fuer den Hot-Path-Healing-Pfad jetzt

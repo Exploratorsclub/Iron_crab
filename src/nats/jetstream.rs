@@ -533,10 +533,12 @@ pub fn wallet_tx_confirm_live_consumer_config_execution_engine(
     }
 }
 
-/// Consumer config for trade intents (All = includes intents published before we subscribed)
+/// Consumer config for trade intents. `DeliverPolicy::New` — only live intents in the hot path;
+/// no replay of stale intents (durable consumer survives EE restarts; replay caused TTL-expired
+/// intent storms and multi-second `execution_intent_header_to_receive_ms`).
 pub fn trade_intents_consumer_config() -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {
-        deliver_policy: jetstream::consumer::DeliverPolicy::All,
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
         durable_name: Some("execution-engine".to_string()),
         max_ack_pending: 1000,
@@ -633,6 +635,16 @@ mod tests {
             Some("execution-engine-wallet-snapshot-WALLET123")
         );
         assert_eq!(live.filter_subject, "ironcrab.wallet_snapshot.WALLET123.*");
+    }
+
+    #[test]
+    fn trade_intents_consumer_uses_new_deliver_policy() {
+        let cfg = trade_intents_consumer_config();
+        assert!(matches!(
+            cfg.deliver_policy,
+            jetstream::consumer::DeliverPolicy::New
+        ));
+        assert_eq!(cfg.durable_name.as_deref(), Some("execution-engine"));
     }
 
     #[test]
