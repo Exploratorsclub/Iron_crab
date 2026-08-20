@@ -5272,6 +5272,12 @@ pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_NO_STALE_SELL: Lazy<Atomic
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_REPUBLISH_BOTH_LEGS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_VAULT_SEED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_VAULT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_BINS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_MISS_TOTAL: Lazy<AtomicU64> =
@@ -5970,6 +5976,9 @@ pub fn inc_arb_v2_sell_stale_recovery_outcome_total(outcome: &str) {
         "skipped_rate_limit" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_RATE_LIMIT,
         "skipped_no_stale_sell" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_NO_STALE_SELL,
         "republish_both_legs" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_REPUBLISH_BOTH_LEGS,
+        "fresh_after_vault_seed" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_VAULT_SEED,
+        "still_missing_vault" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_VAULT,
+        "still_missing_bins" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_BINS,
         _ => return,
     };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -11026,6 +11035,18 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_v2_sell_stale_recovery_outcome_total{outcome=\"republish_both_legs\"}",
         ARB_V2_SELL_STALE_RECOVERY_OUTCOME_REPUBLISH_BOTH_LEGS.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"fresh_after_vault_seed\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_VAULT_SEED.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"still_missing_vault\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_VAULT.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"still_missing_bins\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_BINS.load(Ordering::Relaxed)
     );
     line!(
         "arb_v2_screen_meteora_sell_bin_hit_total",

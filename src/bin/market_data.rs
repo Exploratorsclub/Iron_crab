@@ -21816,6 +21816,51 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
+    /// Scope C1c+: must-hot sell-leg bypasses admit_suppress when LivePoolCache row exists.
+    #[test]
+    fn scope_c1c_arb_admit_suppress_must_hot_admits_with_cache_hit() {
+        use ironcrab::metrics::set_market_data_exec_hot_admit_suppress;
+        use ironcrab::nats::{
+            ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRequestsUpdate,
+        };
+
+        set_market_data_exec_hot_admit_suppress(false, false, true);
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        ctx.live_pool_cache
+            .upsert(pool, test_meteora_dlmm_cached_state(42), 1);
+
+        let mut admission = test_admission_for(&ctx);
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::MultiDex,
+                    readiness: ArbTrackReadiness::Executable,
+                }],
+                removed: vec![],
+                reconcile: false,
+            },
+        );
+        set_market_data_exec_hot_admit_suppress(false, false, false);
+
+        assert!(
+            !ctx
+                .deferred_hot_pool_reserve_pins
+                .read()
+                .contains_key(&pool),
+            "must-hot Executable sell-leg must not stay deferred under admit_suppress when cache hit"
+        );
+        assert!(ctx.hot_pool_registry.arb_pool_is_must_hot(pool));
+    }
+
     fn test_meteora_dlmm_cached_state(active_id: i32) -> CachedPoolState {
         use ironcrab::execution::live_pool_cache::MeteoraState;
         CachedPoolState::Meteora(MeteoraState {
