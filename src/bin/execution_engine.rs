@@ -9221,24 +9221,80 @@ async fn main() -> Result<()> {
         use ironcrab::nats::trade_intents_consumer_config;
 
         let jetstream = jetstream::new(nats.client().clone());
+        const TRADE_INTENTS_CONSUMER: &str = "execution-engine";
+
         match jetstream.get_stream(TRADE_INTENTS_STREAM_NAME).await {
-            Ok(stream) => match stream
-                .create_consumer(trade_intents_consumer_config())
-                .await
-            {
-                Ok(consumer) => {
-                    info!(
-                        stream = TRADE_INTENTS_STREAM_NAME,
-                        subject = TOPIC_TRADE_INTENTS,
-                        "Subscribed to TradeIntents via JetStream (persistent)"
-                    );
-                    Some(consumer)
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to create trade intents consumer");
+            Ok(stream) => {
+                let existing_consumer = if let Ok(info) =
+                    stream.consumer_info(TRADE_INTENTS_CONSUMER).await
+                {
+                    if info.config.deliver_policy != jetstream::consumer::DeliverPolicy::New {
+                        warn!(
+                            deliver_policy = ?info.config.deliver_policy,
+                            consumer = TRADE_INTENTS_CONSUMER,
+                            stream = TRADE_INTENTS_STREAM_NAME,
+                            "TRADE_INTENTS consumer has non-New deliver policy; deleting for recreate"
+                        );
+                        if let Err(e) = stream.delete_consumer(TRADE_INTENTS_CONSUMER).await {
+                            warn!(
+                                error = %e,
+                                consumer = TRADE_INTENTS_CONSUMER,
+                                "Failed to delete stale TRADE_INTENTS consumer"
+                            );
+                        }
+                        None
+                    } else {
+                        match stream
+                            .get_consumer::<async_nats::jetstream::consumer::pull::Config>(
+                                TRADE_INTENTS_CONSUMER,
+                            )
+                            .await
+                        {
+                            Ok(consumer) => Some(consumer),
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    consumer = TRADE_INTENTS_CONSUMER,
+                                    "Failed to get existing TRADE_INTENTS consumer"
+                                );
+                                None
+                            }
+                        }
+                    }
+                } else {
                     None
+                };
+
+                match existing_consumer {
+                    Some(consumer) => {
+                        info!(
+                            stream = TRADE_INTENTS_STREAM_NAME,
+                            subject = TOPIC_TRADE_INTENTS,
+                            deliver_policy = "New",
+                            "Subscribed to TradeIntents via JetStream (persistent)"
+                        );
+                        Some(consumer)
+                    }
+                    None => match stream
+                        .create_consumer(trade_intents_consumer_config())
+                        .await
+                    {
+                        Ok(consumer) => {
+                            info!(
+                                stream = TRADE_INTENTS_STREAM_NAME,
+                                subject = TOPIC_TRADE_INTENTS,
+                                deliver_policy = "New",
+                                "Subscribed to TradeIntents via JetStream (persistent)"
+                            );
+                            Some(consumer)
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to create trade intents consumer");
+                            None
+                        }
+                    },
                 }
-            },
+            }
             Err(e) => {
                 warn!(
                     error = %e,
