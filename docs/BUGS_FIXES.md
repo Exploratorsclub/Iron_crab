@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-ATA-3012: Arb ATA CreateIdempotent skip after full SELL + ATA close (Custom 3012)
+**Datum**: 2026-08-21  
+**Problem**: Cross-DEX Arb BUY sim-fail `InstructionError(2, Custom(3012))` — `token_wallet_snapshot_seen` war `true` weil `set_available_token_balance(mint, 0)` den Map-Key behielt; CreateIdempotent wurde fälschlich übersprungen.  
+**Fix**: Separates `token_wallet_ata_present`-Set; `token_wallet_snapshot_seen` nur bei Balance > 0 oder explizitem Geyser-Snapshot-Mark. Full-Close ruft `clear_token_wallet_presence` statt `set(..., 0)`. Geyser/Bootstrap/Liquidation nutzen `apply_wallet_token_snapshot`. **Invarianten**: I-7 kein RPC; I-9 Sim-Gate unverändert.  
+**Dateien**: `src/storage/locks.rs`, `src/bin/execution_engine.rs`, `src/solana/cross_dex_handler.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-I-MD-5-6: TX Tracker explicit subs removed; snapshot excludes Tracker (I-MD-5 / I-MD-6)
 **Datum**: 2026-08-19  
 **Problem** (Prod): ~99k `geyser_subscription_accounts`, ~97% unpinned Tracker-Mints aus TX-Ingest + I-MD-6 Snapshot-Restore — nicht aus Arb/Momentum-Pins. Scope H drosselte nur Amplifikation; TX-Pfad und blind Tracker-restore blieben spec-widrig.  
