@@ -4491,7 +4491,7 @@ impl ExecutionContext {
             // SIM_INSUFFICIENT_BALANCE preflight check passes for SELL intents.
             for (mint_str, balance_raw, _decimals, _token_prog, _ta_pubkey) in &inventory {
                 ctx.lock_manager
-                    .set_available_token_balance(mint_str.clone(), *balance_raw);
+                    .apply_wallet_token_snapshot(mint_str.clone(), *balance_raw, None);
                 info!(
                     mint = %mint_str,
                     balance_raw = balance_raw,
@@ -7158,8 +7158,11 @@ impl ExecutionContext {
                 }
             } else {
                 let old = self.lock_manager.available_token_balance(mint);
-                self.lock_manager
-                    .set_available_token_balance(mint.clone(), *balance_raw);
+                self.lock_manager.apply_wallet_token_snapshot(
+                    mint.clone(),
+                    *balance_raw,
+                    event.slot,
+                );
 
                 if old != *balance_raw {
                     info!(
@@ -7536,7 +7539,11 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
                 } else if mint != SOL_MINT {
                     // Regular token balance (skip SOL_MINT which equals WSOL_MINT
                     // but could appear from old JetStream entries)
-                    lock_manager.set_available_token_balance(mint.clone(), *balance_raw);
+                    lock_manager.apply_wallet_token_snapshot(
+                        mint.clone(),
+                        *balance_raw,
+                        event.slot,
+                    );
                     wallet_snapshot_kinds.push(event.kind.clone());
                 }
             } else if matches!(event.kind, MarketEventKind::WalletSnapshotComplete { .. }) {
@@ -13696,7 +13703,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
 
                 if s48.full_close {
                     ctx.lock_manager
-                        .set_available_token_balance(mint_str.clone(), 0);
+                        .clear_token_wallet_presence(mint_str.as_str(), tx_landing_slot);
                     info!(
                         intent_id = %intent.intent_id,
                         mint = %mint_str,
@@ -13704,7 +13711,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         total_pos,
                         is_cold_path_recovery,
                         sell_token_account_closed = s48.sell_token_account_closed,
-                        "LockManager: cleared token balance after confirmed full SELL"
+                        "LockManager: cleared token wallet presence after confirmed full SELL"
                     );
                 } else {
                     // Partial SELL: `available_tokens` already reflects post-sell unlocked balance
@@ -17735,10 +17742,14 @@ mod execution_engine_tests {
         let s48 = scope48_confirmed_sell_close_decision(false, total, total_pos, false);
         assert!(s48.full_close);
 
-        m.set_available_token_balance(M.to_string(), 0);
+        m.clear_token_wallet_presence(M, None);
         m.release_locks_after_confirmed_sell("sell-all");
         assert_eq!(m.available_token_balance(M), 0);
         assert_eq!(m.count_non_zero_token_balances(), 0);
+        assert!(
+            !m.token_wallet_snapshot_seen(M),
+            "full SELL close must clear ATA presence for next arb BUY"
+        );
     }
 
     /// No tx-meta fill (`confirmed_sell_fill_in_raw` None): still classify partial from
