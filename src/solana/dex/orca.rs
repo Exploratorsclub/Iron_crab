@@ -134,6 +134,29 @@ impl Orca {
             .store(skip, Ordering::Relaxed);
     }
 
+    /// True when DexPoolAccounts-style list lacks tick layout fields (accounts[5+]).
+    #[must_use]
+    pub fn orca_accounts_missing_tick_layout(accounts: &[String]) -> bool {
+        let mut has_tick = false;
+        let mut has_spacing = false;
+        for acct in accounts.iter().skip(5) {
+            if acct.starts_with("tick_current_index:") {
+                has_tick = true;
+            } else if acct.starts_with("tick_spacing:") {
+                has_spacing = true;
+            }
+        }
+        !has_tick || !has_spacing
+    }
+
+    /// LivePoolCache Orca state has tick layout required for hot-path swap build.
+    #[must_use]
+    pub fn orca_tick_layout_ready_in_cache(
+        state: &crate::execution::live_pool_cache::OrcaWhirlpoolState,
+    ) -> bool {
+        state.tick_spacing > 0
+    }
+
     /// Inject cached Orca Whirlpool state from LivePoolCache.
     ///
     /// This allows build_swap_ix to use fresh Geyser-sourced data
