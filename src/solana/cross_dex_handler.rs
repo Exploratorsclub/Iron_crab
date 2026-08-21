@@ -793,15 +793,64 @@ impl CrossDexHandler {
         }
         let pool_pk = Pubkey::from_str(pool)
             .map_err(|_| anyhow!("Invalid {} pool address: {}", leg, pool))?;
-        if self.try_inject_from_cache("orca", &pool_pk, connector) {
-            Ok(())
-        } else {
-            Err(anyhow!(
+        let Some(ref cache) = self.pool_cache else {
+            return Err(anyhow!(
+                "ORCA_LAYOUT_NOT_READY: {} pool {} — intent DexPoolAccounts missing tick/spacing and LivePoolCache unavailable",
+                leg,
+                pool
+            ));
+        };
+        let Some(CachedPoolState::Orca(orca_state)) = cache.get(&pool_pk) else {
+            return Err(anyhow!(
                 "ORCA_LAYOUT_NOT_READY: {} pool {} — intent DexPoolAccounts missing tick/spacing and LivePoolCache miss or incomplete",
                 leg,
                 pool
-            ))
+            ));
+        };
+        if !Orca::orca_tick_layout_ready_in_cache(&orca_state) {
+            return Err(anyhow!(
+                "ORCA_LAYOUT_NOT_READY: {} pool {} — intent DexPoolAccounts missing tick/spacing and LivePoolCache miss or incomplete",
+                leg,
+                pool
+            ));
         }
+
+        // Keep intent vaults/mints; only append tick layout from LivePoolCache.
+        let mut merged = accounts.to_vec();
+        merged.push(format!(
+            "tick_current_index:{}",
+            orca_state.tick_current_index
+        ));
+        merged.push(format!("tick_spacing:{}", orca_state.tick_spacing));
+        if let Some(prog_a) = orca_state.token_a_program {
+            if !merged.iter().any(|a| a.starts_with("token_a_program:")) {
+                merged.push(format!("token_a_program:{}", prog_a));
+            }
+        }
+        if let Some(prog_b) = orca_state.token_b_program {
+            if !merged.iter().any(|a| a.starts_with("token_b_program:")) {
+                merged.push(format!("token_b_program:{}", prog_b));
+            }
+        }
+
+        connector
+            .set_pool_from_accounts(pool, &merged)
+            .map_err(|e| {
+                anyhow!(
+                    "ORCA_LAYOUT_NOT_READY: {} pool {} — failed to merge tick from LivePoolCache: {}",
+                    leg,
+                    pool,
+                    e
+                )
+            })?;
+        info!(
+            pool = %pool_pk,
+            leg = %leg,
+            tick = orca_state.tick_current_index,
+            tick_spacing = orca_state.tick_spacing,
+            "Merged Orca tick layout from LivePoolCache into intent pool (vaults preserved)"
+        );
+        Ok(())
     }
 
     /// Validate a cross-DEX arbitrage opportunity - OPTION B (SIMULATION-BASED)
