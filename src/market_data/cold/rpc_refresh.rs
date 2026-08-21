@@ -793,6 +793,7 @@ pub async fn cold_path_raydium_serum_backfill_and_publish(
         .merge_raydium_amm_pool_readiness(pool_addr, readiness);
 
     let Some(nats) = host.nats() else {
+        host.raydium_serum_fetched_insert(pool_addr);
         return true;
     };
     let Some((CachedPoolState::RaydiumAmm(st), pool_slot, _age_ms)) =
@@ -842,6 +843,7 @@ pub async fn cold_path_raydium_serum_backfill_and_publish(
                 readiness = ?readiness,
                 "Raydium AMM serum backfill: published PoolCacheUpdate::BalanceUpdated to JetStream"
             );
+            host.raydium_serum_fetched_insert(pool_addr);
             true
         }
         Ok(false) | Err(_) => {
@@ -850,6 +852,7 @@ pub async fn cold_path_raydium_serum_backfill_and_publish(
                 pool = %pool_addr,
                 "Raydium AMM serum backfill: JetStream publish failed after cache update"
             );
+            host.raydium_serum_fetched_insert(pool_addr);
             true
         }
     }

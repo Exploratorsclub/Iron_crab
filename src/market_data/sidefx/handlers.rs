@@ -3,10 +3,11 @@
 use super::host::{MarketEventCorePublishTrace, SidefxWorkerHost};
 use super::pool_publish::{
     cache_balance_fields_unchanged, cached_pool_has_fresh_reserve_basis,
-    meteora_cpmm_onchain_mints_for_pool_cache_update, meteora_cpmm_vaults_for_pool_cache_update,
-    meteora_dlmm_metadata_for_pool_cache_update, orca_metadata_for_pool_cache_update,
-    pool_cache_balance_fields_from_state, pool_cache_state_layout_significant_change,
-    pump_amm_sell_layout_publish_state, raydium_cpmm_readiness_for_pool_cache_update,
+    merge_raydium_amm_serum_fields_from_prior, meteora_cpmm_onchain_mints_for_pool_cache_update,
+    meteora_cpmm_vaults_for_pool_cache_update, meteora_dlmm_metadata_for_pool_cache_update,
+    orca_metadata_for_pool_cache_update, pool_cache_balance_fields_from_state,
+    pool_cache_state_layout_significant_change, pump_amm_sell_layout_publish_state,
+    raydium_amm_metadata_for_pool_cache_update, raydium_cpmm_readiness_for_pool_cache_update,
     raydium_cpmm_vaults_for_pool_cache_update,
 };
 use super::worker::{DlmmPoolStateSignal, MdSidefxBurstScratch, MdSidefxCommand};
@@ -118,6 +119,10 @@ fn md_sidefx_build_balance_updated_from_cache(
                 .merge_meteora_cpmm_pool_readiness(*pool_pubkey, readiness);
         }
         CachedPoolState::RaydiumAmm(s) => {
+            let meta = raydium_amm_metadata_for_pool_cache_update(s);
+            if !meta.is_empty() {
+                balance_update.metadata = Some(meta);
+            }
             let readiness = raydium_amm_readiness_for_pool_cache_update(s);
             balance_update.set_dex_readiness_in_metadata(readiness);
             host.live_pool_cache()
@@ -1421,21 +1426,7 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
         // Geyser Raydium pool parse omits Serum/OpenBook static accounts; preserve from prior cache row.
         if let CachedPoolState::RaydiumAmm(ref mut new_am) = cached_state {
             if let Some(CachedPoolState::RaydiumAmm(ex)) = prev_state.as_ref() {
-                if new_am.serum_bids.is_none() {
-                    new_am.serum_bids = ex.serum_bids;
-                }
-                if new_am.serum_asks.is_none() {
-                    new_am.serum_asks = ex.serum_asks;
-                }
-                if new_am.serum_event_queue.is_none() {
-                    new_am.serum_event_queue = ex.serum_event_queue;
-                }
-                if new_am.serum_base_vault.is_none() {
-                    new_am.serum_base_vault = ex.serum_base_vault;
-                }
-                if new_am.serum_quote_vault.is_none() {
-                    new_am.serum_quote_vault = ex.serum_quote_vault;
-                }
+                merge_raydium_amm_serum_fields_from_prior(new_am, ex);
             }
         }
 
@@ -1734,23 +1725,7 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                 CachedPoolState::RaydiumAmm(s) => {
                     // FIX-29: Always propagate market_id (from Geyser parse),
                     // plus serum accounts when available (from async RPC fetch)
-                    let mut meta = std::collections::HashMap::new();
-                    if s.market_id != Pubkey::default() {
-                        meta.insert("market_id".to_string(), s.market_id.to_string());
-                    }
-                    if let (Some(bids), Some(asks), Some(eq)) =
-                        (s.serum_bids, s.serum_asks, s.serum_event_queue)
-                    {
-                        meta.insert("serum_bids".to_string(), bids.to_string());
-                        meta.insert("serum_asks".to_string(), asks.to_string());
-                        meta.insert("serum_event_queue".to_string(), eq.to_string());
-                    }
-                    if let Some(bv) = s.serum_base_vault {
-                        meta.insert("serum_base_vault".to_string(), bv.to_string());
-                    }
-                    if let Some(qv) = s.serum_quote_vault {
-                        meta.insert("serum_quote_vault".to_string(), qv.to_string());
-                    }
+                    let meta = raydium_amm_metadata_for_pool_cache_update(s);
                     if !meta.is_empty() {
                         pool_update.metadata = Some(meta);
                     }
@@ -1951,6 +1926,9 @@ pub fn md_sidefx_process_vault_balance_tick(
             if let Some(CachedPoolState::RaydiumAmm(ref s)) =
                 host.live_pool_cache().get(&vault_view.pool_address)
             {
+                let mut meta = balance_update.metadata.take().unwrap_or_default();
+                meta.extend(raydium_amm_metadata_for_pool_cache_update(s));
+                balance_update.metadata = Some(meta);
                 let readiness = raydium_amm_readiness_for_pool_cache_update(s);
                 balance_update.set_dex_readiness_in_metadata(readiness);
                 host.live_pool_cache()
