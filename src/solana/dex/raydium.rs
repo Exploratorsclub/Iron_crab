@@ -306,8 +306,49 @@ impl Raydium {
     /// Serum accounts are optional - if not provided, they'll be fetched via RPC.
     /// Vault reserves (`coin_reserve` / `pc_reserve`) populate `SimplePool` for `quote_exact_in`;
     /// use `None` when unknown (quotes skip zero-reserve pools).
+    ///
+    /// Stable 13-arg surface for Eval / external call sites; serum market vault pubkeys
+    /// default to `None`. Use [`Self::inject_cached_amm_state_with_serum_vaults`] or
+    /// [`Self::inject_raydium_amm_from_live_cache`] when vaults are known from cache.
     #[allow(clippy::too_many_arguments)]
     pub fn inject_cached_amm_state(
+        &self,
+        pool_address: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        base_vault: Pubkey,
+        quote_vault: Pubkey,
+        _base_decimals: u8,
+        _quote_decimals: u8,
+        coin_reserve: Option<u64>,
+        pc_reserve: Option<u64>,
+        market_id: Pubkey,
+        serum_bids: Option<Pubkey>,
+        serum_asks: Option<Pubkey>,
+        serum_event_queue: Option<Pubkey>,
+    ) {
+        self.inject_cached_amm_state_with_serum_vaults(
+            pool_address,
+            base_mint,
+            quote_mint,
+            base_vault,
+            quote_vault,
+            _base_decimals,
+            _quote_decimals,
+            coin_reserve,
+            pc_reserve,
+            market_id,
+            serum_bids,
+            serum_asks,
+            serum_event_queue,
+            None,
+            None,
+        );
+    }
+
+    /// Like [`Self::inject_cached_amm_state`] but also injects optional Serum market vault pubkeys.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inject_cached_amm_state_with_serum_vaults(
         &self,
         pool_address: Pubkey,
         base_mint: Pubkey,
@@ -384,7 +425,7 @@ impl Raydium {
 
     /// Inject full Raydium AMM row from LivePoolCache (Cross-DEX / EE hot path).
     pub fn inject_raydium_amm_from_live_cache(&self, pool_address: Pubkey, s: &RaydiumAmmState) {
-        self.inject_cached_amm_state(
+        self.inject_cached_amm_state_with_serum_vaults(
             pool_address,
             s.base_mint,
             s.quote_mint,
@@ -1887,8 +1928,6 @@ mod tests {
             None,
             None,
             market_id,
-            None,
-            None,
             None,
             None,
             None,

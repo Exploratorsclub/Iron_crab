@@ -633,23 +633,7 @@ pub async fn build_tx_plan(
                             has_serum = has_serum_from_cache,
                             "raydium: using cached pool state"
                         );
-                        raydium.inject_cached_amm_state(
-                            pool_id,
-                            amm_state.base_mint,
-                            amm_state.quote_mint,
-                            amm_state.coin_vault,
-                            amm_state.pc_vault,
-                            amm_state.base_decimals,
-                            amm_state.quote_decimals,
-                            amm_state.coin_reserve,
-                            amm_state.pc_reserve,
-                            amm_state.market_id,
-                            amm_state.serum_bids,
-                            amm_state.serum_asks,
-                            amm_state.serum_event_queue,
-                            amm_state.serum_base_vault,
-                            amm_state.serum_quote_vault,
-                        );
+                        raydium.inject_raydium_amm_from_live_cache(pool_id, &amm_state);
                         used_cache = true;
                     }
                     _ => {
@@ -2095,23 +2079,7 @@ async fn build_hop_raydium(
                 has_serum = has_serum_from_cache,
                 "multi-hop raydium: using cached pool state"
             );
-            raydium.inject_cached_amm_state(
-                *pool_address,
-                amm_state.base_mint,
-                amm_state.quote_mint,
-                amm_state.coin_vault,
-                amm_state.pc_vault,
-                amm_state.base_decimals,
-                amm_state.quote_decimals,
-                amm_state.coin_reserve,
-                amm_state.pc_reserve,
-                amm_state.market_id,
-                amm_state.serum_bids,
-                amm_state.serum_asks,
-                amm_state.serum_event_queue,
-                amm_state.serum_base_vault,
-                amm_state.serum_quote_vault,
-            );
+            raydium.inject_raydium_amm_from_live_cache(*pool_address, &amm_state);
             used_cache = true;
         }
     }
