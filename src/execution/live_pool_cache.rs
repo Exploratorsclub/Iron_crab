@@ -149,6 +149,26 @@ pub struct RaydiumAmmState {
     pub serum_quote_vault: Option<Pubkey>,
 }
 
+/// Static Serum/OpenBook accounts required for Raydium AMM swap IX building.
+///
+/// Shared by readiness scoring, Cross-DEX inject gates, and cold-path serum backfill triggers.
+#[must_use]
+pub fn raydium_amm_serum_static_accounts_ready(s: &RaydiumAmmState) -> bool {
+    s.market_id != Pubkey::default()
+        && s.serum_bids.is_some()
+        && s.serum_asks.is_some()
+        && s.serum_event_queue.is_some()
+        && s.serum_base_vault.is_some()
+        && s.serum_quote_vault.is_some()
+}
+
+/// True when a Raydium AMM row has `market_id` but still lacks any static Serum field
+/// (including serum vaults). Cold-path only — never call from hot-path TX building.
+#[must_use]
+pub fn raydium_amm_serum_needs_cold_backfill(s: &RaydiumAmmState) -> bool {
+    s.market_id != Pubkey::default() && !raydium_amm_serum_static_accounts_ready(s)
+}
+
 /// JetStream / MASTER [`DexPoolReadiness`] for Raydium AMM v4 (conservative, explicit).
 ///
 /// `Ready` only when the static Serum/OpenBook accounts required for swap building are present
@@ -159,12 +179,7 @@ pub struct RaydiumAmmState {
 /// Reserves alone never imply `Ready` (swap path still needs Serum accounts — see `RaydiumSwapAccounts`).
 #[must_use]
 pub fn raydium_amm_readiness_for_pool_cache_update(s: &RaydiumAmmState) -> DexPoolReadiness {
-    let static_ok = s.market_id != Pubkey::default()
-        && s.serum_bids.is_some()
-        && s.serum_asks.is_some()
-        && s.serum_event_queue.is_some()
-        && s.serum_base_vault.is_some()
-        && s.serum_quote_vault.is_some();
+    let static_ok = raydium_amm_serum_static_accounts_ready(s);
     let r_coin = s.coin_reserve.unwrap_or(0);
     let r_pc = s.pc_reserve.unwrap_or(0);
     // `coin_reserve` / `pc_reserve` are the two pool legs; both must be non-zero for a usable
@@ -4337,7 +4352,66 @@ mod tests {
     }
 
     #[test]
+    fn test_raydium_amm_readiness_helper_bids_without_vaults_is_partial() {
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let s = RaydiumAmmState {
+            base_mint: base,
+            quote_mint: quote,
+            coin_vault: Pubkey::new_unique(),
+            pc_vault: Pubkey::new_unique(),
+            base_decimals: 9,
+            quote_decimals: 9,
+            coin_reserve: Some(100),
+            pc_reserve: Some(200),
+            market_id: Pubkey::new_unique(),
+            serum_bids: Some(Pubkey::new_unique()),
+            serum_asks: Some(Pubkey::new_unique()),
+            serum_event_queue: Some(Pubkey::new_unique()),
+            serum_base_vault: None,
+            serum_quote_vault: None,
+        };
+        assert_eq!(
+            raydium_amm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Partial
+        );
+        assert!(!raydium_amm_serum_static_accounts_ready(&s));
+        assert!(raydium_amm_serum_needs_cold_backfill(&s));
+    }
+
+    #[test]
     fn test_base_mint_has_any_ready_pool_raydium_amm_explicit_ready() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint,
+                quote_mint,
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 9,
+                quote_decimals: 9,
+                coin_reserve: Some(1),
+                pc_reserve: Some(2),
+                market_id: Pubkey::new_unique(),
+                serum_bids: Some(Pubkey::new_unique()),
+                serum_asks: Some(Pubkey::new_unique()),
+                serum_event_queue: Some(Pubkey::new_unique()),
+                serum_base_vault: Some(Pubkey::new_unique()),
+                serum_quote_vault: Some(Pubkey::new_unique()),
+            }),
+            100,
+        );
+        cache.merge_raydium_amm_pool_readiness(pool, DexPoolReadiness::Ready);
+        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
+        assert!(cache.base_mint_has_explicit_raydium_amm_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_raydium_amm_explicit_ready_without_vaults_is_false() {
         let cache = LivePoolCache::new();
         let pool = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
@@ -4362,9 +4436,14 @@ mod tests {
             }),
             100,
         );
-        cache.merge_raydium_amm_pool_readiness(pool, DexPoolReadiness::Ready);
-        assert!(cache.base_mint_has_any_ready_pool(&base_mint));
-        assert!(cache.base_mint_has_explicit_raydium_amm_ready_pool(&base_mint));
+        let readiness =
+            raydium_amm_readiness_for_pool_cache_update(match cache.get(&pool).unwrap() {
+                CachedPoolState::RaydiumAmm(ref s) => s,
+                _ => panic!("expected RaydiumAmm"),
+            });
+        assert_eq!(readiness, DexPoolReadiness::Partial);
+        cache.merge_raydium_amm_pool_readiness(pool, readiness);
+        assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
     }
 
     #[test]
@@ -4388,8 +4467,8 @@ mod tests {
                 serum_bids: Some(Pubkey::new_unique()),
                 serum_asks: Some(Pubkey::new_unique()),
                 serum_event_queue: Some(Pubkey::new_unique()),
-                serum_base_vault: None,
-                serum_quote_vault: None,
+                serum_base_vault: Some(Pubkey::new_unique()),
+                serum_quote_vault: Some(Pubkey::new_unique()),
             }),
             100,
         );

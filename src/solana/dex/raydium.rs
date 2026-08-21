@@ -11,7 +11,9 @@ use crate::execution::live_pool_cache::{CachedPoolState, RaydiumAmmState, Shared
 
 /// Re-export: conservative [`crate::ipc::DexPoolReadiness`] for Raydium AMM v4 pool cache / JetStream
 /// (static Serum accounts + both-side liquidity; reserves alone are never `Ready`).
-pub use crate::execution::live_pool_cache::raydium_amm_readiness_for_pool_cache_update;
+pub use crate::execution::live_pool_cache::{
+    raydium_amm_readiness_for_pool_cache_update, raydium_amm_serum_static_accounts_ready,
+};
 use crate::solana::rpc::SolanaRpc;
 use dashmap::DashMap;
 #[cfg(feature = "rpc_fallback")]
@@ -450,12 +452,7 @@ impl Raydium {
     /// Returns true when static Serum/OpenBook accounts required for swap IX building
     /// are present in LivePoolCache (matches `build_swap_ix` serum account requirements).
     pub fn raydium_amm_serum_accounts_ready_in_cache(s: &RaydiumAmmState) -> bool {
-        s.market_id != Pubkey::default()
-            && s.serum_bids.is_some()
-            && s.serum_asks.is_some()
-            && s.serum_event_queue.is_some()
-            && s.serum_base_vault.is_some()
-            && s.serum_quote_vault.is_some()
+        raydium_amm_serum_static_accounts_ready(s)
     }
 
     /// Get Serum/OpenBook accounts for a cached pool (if populated).
@@ -746,7 +743,12 @@ impl Raydium {
                 .get(&pool_addr)
                 .ok_or_else(|| anyhow!("pool snapshot missing"))?;
             (
-                pool.serum_bids.is_none() || pool.serum_asks.is_none(),
+                pool.market_id.filter(|m| *m != Pubkey::default()).is_some()
+                    && (pool.serum_bids.is_none()
+                        || pool.serum_asks.is_none()
+                        || pool.serum_event_queue.is_none()
+                        || pool.serum_base_vault.is_none()
+                        || pool.serum_quote_vault.is_none()),
                 pool.reserve_base == 0 || pool.reserve_quote == 0,
             )
         };

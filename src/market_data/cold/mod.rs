@@ -25,6 +25,7 @@ pub use pump_layout::{
     pump_amm_sell_layout_state_for_ensure_publish,
 };
 pub use rpc_refresh::{
+    cold_path_backfill_raydium_serum_accounts, cold_path_raydium_serum_backfill_and_publish,
     cold_path_rpc_refresh_meteora_cpmm_pool_row, cold_path_rpc_refresh_meteora_dlmm_pool_row,
     cold_path_rpc_refresh_orca_whirlpool_pool_row, cold_path_rpc_refresh_raydium_amm_pool_row,
     cold_path_rpc_refresh_raydium_cpmm_pool_row,

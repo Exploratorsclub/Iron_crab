@@ -1,7 +1,7 @@
 //! Sidefx worker host trait — bin implements via `MarketDataSidefxHost`.
 
 use super::worker::MdSidefxBurstScratch;
-use crate::execution::live_pool_cache::LivePoolCache;
+use crate::execution::live_pool_cache::{LivePoolCache, RaydiumAmmState};
 use crate::ipc::{MarketEvent, MarketEventKind};
 use crate::metrics::MarketDataLatencySegment;
 use solana_sdk::pubkey::Pubkey;
@@ -89,6 +89,9 @@ pub trait SidefxWorkerHost: Send + Sync {
 
     /// C1g: enqueue deferred vault/bin registration retry after LivePoolCache gains layout.
     fn maybe_retry_deferred_hot_pool_reserves_on_cache_fill(&self, pool: &Pubkey);
+
+    /// FIX-29: spawn cold-path Serum backfill when Geyser/cache row has bids but missing vaults.
+    fn maybe_spawn_raydium_serum_cold_backfill(&self, pool: Pubkey, state: &RaydiumAmmState);
 }
 
 #[inline]

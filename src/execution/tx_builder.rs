@@ -1,4 +1,6 @@
-use crate::execution::live_pool_cache::{CachedPoolState, MeteoraState, SharedLivePoolCache};
+use crate::execution::live_pool_cache::{
+    raydium_amm_serum_static_accounts_ready, CachedPoolState, MeteoraState, SharedLivePoolCache,
+};
 use crate::ipc::{RejectReason, SwapHop, TradeIntent, TradeSide, NATIVE_SOL_MINT};
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
@@ -625,7 +627,7 @@ pub async fn build_tx_plan(
             if let Some((state, slot, age_ms)) = cache.get_with_metadata(&pool_id) {
                 match state {
                     CachedPoolState::RaydiumAmm(amm_state) => {
-                        has_serum_from_cache = amm_state.serum_bids.is_some();
+                        has_serum_from_cache = raydium_amm_serum_static_accounts_ready(&amm_state);
                         tracing::debug!(
                             pool = %pool_id,
                             slot,
@@ -2073,7 +2075,7 @@ async fn build_hop_raydium(
     let mut has_serum_from_cache = false;
     if let Some(cache) = cache {
         if let Some(CachedPoolState::RaydiumAmm(amm_state)) = cache.get(pool_address) {
-            has_serum_from_cache = amm_state.serum_bids.is_some();
+            has_serum_from_cache = raydium_amm_serum_static_accounts_ready(&amm_state);
             tracing::debug!(
                 pool = %pool_address,
                 has_serum = has_serum_from_cache,

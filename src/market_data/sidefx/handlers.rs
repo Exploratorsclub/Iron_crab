@@ -1430,6 +1430,10 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
 
         md_sidefx_merge_pool_readiness_from_cached_state(host, pool_pubkey, &cached_state);
 
+        if let CachedPoolState::RaydiumAmm(ref s) = cached_state {
+            host.maybe_spawn_raydium_serum_cold_backfill(*pool_pubkey, s);
+        }
+
         if let CachedPoolState::Meteora(ref s) = cached_state {
             let meta_changed = match prev_meteora_meta {
                 None => host.is_hot_pool(pool_pubkey),

@@ -366,6 +366,8 @@ pub fn pool_cache_state_layout_significant_change(
                 || p.serum_bids != n.serum_bids
                 || p.serum_asks != n.serum_asks
                 || p.serum_event_queue != n.serum_event_queue
+                || p.serum_base_vault != n.serum_base_vault
+                || p.serum_quote_vault != n.serum_quote_vault
         }
         (CachedPoolState::RaydiumCpmm(p), CachedPoolState::RaydiumCpmm(n)) => {
             p.token_0_mint != n.token_0_mint
