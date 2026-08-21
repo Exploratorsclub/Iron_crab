@@ -669,6 +669,15 @@ impl CrossDexHandler {
                 }
             }
             ("orca", CachedPoolState::Orca(orca_state)) => {
+                if !Orca::orca_tick_layout_ready_in_cache(&orca_state) {
+                    warn!(
+                        pool = %pool_pk,
+                        dex = %dex,
+                        tick_spacing = orca_state.tick_spacing,
+                        "Orca pool in LivePoolCache but tick layout incomplete — not injecting"
+                    );
+                    return false;
+                }
                 let mut accounts = vec![
                     pool_pk.to_string(),
                     orca_state.token_mint_a.to_string(),
@@ -769,6 +778,79 @@ impl CrossDexHandler {
         }
 
         false
+    }
+
+    /// After intent DexPoolAccounts set the Orca pool, merge tick/spacing from LivePoolCache when missing.
+    fn merge_orca_tick_from_cache_if_needed(
+        &self,
+        pool: &str,
+        accounts: &[String],
+        connector: &Arc<dyn Dex>,
+        leg: &str,
+    ) -> Result<()> {
+        if !Orca::orca_accounts_missing_tick_layout(accounts) {
+            return Ok(());
+        }
+        let pool_pk = Pubkey::from_str(pool)
+            .map_err(|_| anyhow!("Invalid {} pool address: {}", leg, pool))?;
+        let Some(ref cache) = self.pool_cache else {
+            return Err(anyhow!(
+                "ORCA_LAYOUT_NOT_READY: {} pool {} — intent DexPoolAccounts missing tick/spacing and LivePoolCache unavailable",
+                leg,
+                pool
+            ));
+        };
+        let Some(CachedPoolState::Orca(orca_state)) = cache.get(&pool_pk) else {
+            return Err(anyhow!(
+                "ORCA_LAYOUT_NOT_READY: {} pool {} — intent DexPoolAccounts missing tick/spacing and LivePoolCache miss or incomplete",
+                leg,
+                pool
+            ));
+        };
+        if !Orca::orca_tick_layout_ready_in_cache(&orca_state) {
+            return Err(anyhow!(
+                "ORCA_LAYOUT_NOT_READY: {} pool {} — intent DexPoolAccounts missing tick/spacing and LivePoolCache miss or incomplete",
+                leg,
+                pool
+            ));
+        }
+
+        // Keep intent vaults/mints; only append tick layout from LivePoolCache.
+        let mut merged = accounts.to_vec();
+        merged.push(format!(
+            "tick_current_index:{}",
+            orca_state.tick_current_index
+        ));
+        merged.push(format!("tick_spacing:{}", orca_state.tick_spacing));
+        if let Some(prog_a) = orca_state.token_a_program {
+            if !merged.iter().any(|a| a.starts_with("token_a_program:")) {
+                merged.push(format!("token_a_program:{}", prog_a));
+            }
+        }
+        if let Some(prog_b) = orca_state.token_b_program {
+            if !merged.iter().any(|a| a.starts_with("token_b_program:")) {
+                merged.push(format!("token_b_program:{}", prog_b));
+            }
+        }
+
+        connector
+            .set_pool_from_accounts(pool, &merged)
+            .map_err(|e| {
+                anyhow!(
+                    "ORCA_LAYOUT_NOT_READY: {} pool {} — failed to merge tick from LivePoolCache: {}",
+                    leg,
+                    pool,
+                    e
+                )
+            })?;
+        info!(
+            pool = %pool_pk,
+            leg = %leg,
+            tick = orca_state.tick_current_index,
+            tick_spacing = orca_state.tick_spacing,
+            "Merged Orca tick layout from LivePoolCache into intent pool (vaults preserved)"
+        );
+        Ok(())
     }
 
     /// Validate a cross-DEX arbitrage opportunity - OPTION B (SIMULATION-BASED)
@@ -1454,6 +1536,14 @@ impl CrossDexHandler {
                             e
                         )
                     })?;
+                if buy_dex == "orca" {
+                    self.merge_orca_tick_from_cache_if_needed(
+                        &buy_pool,
+                        accts,
+                        buy_connector,
+                        "buy",
+                    )?;
+                }
             } else if !buy_pool.is_empty() && buy_dex != "raydium" {
                 let pool_pk = Pubkey::from_str(&buy_pool)
                     .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
@@ -1552,6 +1642,14 @@ impl CrossDexHandler {
                             e
                         )
                     })?;
+                if sell_dex == "orca" {
+                    self.merge_orca_tick_from_cache_if_needed(
+                        &sell_pool,
+                        accts,
+                        sell_connector,
+                        "sell",
+                    )?;
+                }
             } else if !sell_pool.is_empty() && sell_dex != "raydium" {
                 let pool_pk = Pubkey::from_str(&sell_pool)
                     .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
@@ -2823,6 +2921,350 @@ mod tests {
         assert!(
             !build_err.contains("fetch them first"),
             "hot-path inject must not defer serum to RPC fetch; got: {build_err}"
+        );
+    }
+
+    fn orca_whirlpool_cache_state(token_mint: Pubkey, sol_mint: Pubkey) -> OrcaWhirlpoolState {
+        OrcaWhirlpoolState {
+            token_mint_a: token_mint,
+            token_mint_b: sol_mint,
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            tick_current_index: -624,
+            sqrt_price: 1u128 << 64,
+            liquidity: 5_000_000_000,
+            fee_rate: 3000,
+            protocol_fee_rate: 300,
+            tick_spacing: 8,
+            vault_a_balance: Some(1_000_000_000_000),
+            vault_b_balance: Some(50_000_000_000),
+            token_a_program: None,
+            token_b_program: None,
+        }
+    }
+
+    fn orca_pool_accounts_without_tick(
+        pool: Pubkey,
+        token_mint: Pubkey,
+        sol_mint: Pubkey,
+    ) -> Vec<String> {
+        vec![
+            pool.to_string(),
+            token_mint.to_string(),
+            sol_mint.to_string(),
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+        ]
+    }
+
+    fn orca_pool_accounts_with_tick(
+        pool: Pubkey,
+        token_mint: Pubkey,
+        sol_mint: Pubkey,
+        tick: i32,
+        spacing: u16,
+    ) -> Vec<String> {
+        let mut accounts = orca_pool_accounts_without_tick(pool, token_mint, sol_mint);
+        accounts.push(format!("tick_current_index:{tick}"));
+        accounts.push(format!("tick_spacing:{spacing}"));
+        accounts
+    }
+
+    fn meteora_orca_cross_dex_intent(
+        token_mint: &Pubkey,
+        buy_pool: &Pubkey,
+        sell_pool: &Pubkey,
+        buy_accounts: Vec<String>,
+        sell_accounts: Vec<String>,
+    ) -> TradeIntent {
+        let mut metadata = HashMap::new();
+        metadata.insert("buy_dex".to_string(), "meteora_dlmm".to_string());
+        metadata.insert("sell_dex".to_string(), "orca".to_string());
+        metadata.insert("buy_pool".to_string(), buy_pool.to_string());
+        metadata.insert("sell_pool".to_string(), sell_pool.to_string());
+        metadata.insert("spread_bps".to_string(), "50".to_string());
+        metadata.insert(
+            "estimated_profit_lamports".to_string(),
+            "500000".to_string(),
+        );
+
+        let mut accounts = Vec::new();
+        accounts.push(format!("buy_pool_accounts_start:{}", buy_accounts.len()));
+        accounts.extend(buy_accounts);
+        accounts.push(format!("sell_pool_accounts_start:{}", sell_accounts.len()));
+        accounts.extend(sell_accounts);
+
+        TradeIntent {
+            header: RecordHeader {
+                schema_version: 1,
+                ts_unix_ms: 1,
+                component: "test".to_string(),
+                build: "test".to_string(),
+                run_id: "run".to_string(),
+            },
+            intent_id: "arb-meteora-orca-tick-merge".to_string(),
+            source: "arb-strategy".to_string(),
+            tier: IntentTier::Arb,
+            origin_type: IntentOrigin::StrategyA,
+            deadline_slot: None,
+            ttl_ms: Some(30_000),
+            required_capital: ExplicitAmount {
+                raw: 100_000_000,
+                decimals: 9,
+                ui: None,
+            },
+            resources: TradeResources {
+                input_mint: SOL_MINT.to_string(),
+                output_mint: token_mint.to_string(),
+                pools: vec![buy_pool.to_string(), sell_pool.to_string()],
+                accounts,
+                token_program: Some(spl_token::id().to_string()),
+            },
+            expected_roi_bps: 50,
+            max_slippage_bps: 500,
+            side: TradeSide::Buy,
+            regime: TradingRegime::NotApplicable,
+            trigger_event_id: None,
+            require_bundle: Some(true),
+            bundle_tip_lamports: Some(10_000),
+            hint_compute_units: None,
+            hint_priority_fee_micro_lamports: None,
+            hint_urgency: None,
+            metadata,
+            execution: None,
+            swap_path: None,
+        }
+    }
+
+    fn seed_meteora_orca_cross_dex_cache(
+        cache: &LivePoolCache,
+        buy_pool: Pubkey,
+        sell_pool: Pubkey,
+        token_mint: Pubkey,
+        orca_state: OrcaWhirlpoolState,
+    ) {
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        cache.upsert(
+            buy_pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: token_mint,
+                token_y_mint: sol_mint,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: -281,
+                bin_step: 10,
+                reserve_x_balance: Some(1_000_000_000_000),
+                reserve_y_balance: Some(50_000_000_000),
+            }),
+            100,
+        );
+        cache.upsert(sell_pool, CachedPoolState::Orca(orca_state), 100);
+    }
+
+    #[test]
+    fn orca_accounts_missing_tick_layout_detects_incomplete_accounts() {
+        let pool = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        assert!(Orca::orca_accounts_missing_tick_layout(
+            &orca_pool_accounts_without_tick(pool, token_mint, sol_mint)
+        ));
+        assert!(!Orca::orca_accounts_missing_tick_layout(
+            &orca_pool_accounts_with_tick(pool, token_mint, sol_mint, -624, 8)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cross_dex_orca_incomplete_intent_merges_tick_from_cache_on_sell_leg() {
+        let wallet = Keypair::new();
+        let token_mint = Pubkey::new_unique();
+        let buy_pool = Pubkey::new_unique();
+        let sell_pool = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+
+        let cache = Arc::new(LivePoolCache::new());
+        seed_meteora_orca_cross_dex_cache(
+            &cache,
+            buy_pool,
+            sell_pool,
+            token_mint,
+            orca_whirlpool_cache_state(token_mint, sol_mint),
+        );
+
+        let buy_accounts = vec![
+            buy_pool.to_string(),
+            token_mint.to_string(),
+            sol_mint.to_string(),
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+            "active_id:-281".to_string(),
+            "bin_step:10".to_string(),
+        ];
+        let sell_accounts = orca_pool_accounts_without_tick(sell_pool, token_mint, sol_mint);
+
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mut handler = CrossDexHandler::new(rpc, Some(wallet.pubkey())).with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes");
+
+        let intent = meteora_orca_cross_dex_intent(
+            &token_mint,
+            &buy_pool,
+            &sell_pool,
+            buy_accounts,
+            sell_accounts,
+        );
+        let validation = cross_dex_validation_fixture(&token_mint);
+        let plan = handler
+            .build_swap_plan(
+                &intent,
+                &validation,
+                CrossDexPlanOptions {
+                    skip_token_ata_create: true,
+                },
+            )
+            .await
+            .expect("incomplete Orca intent must merge tick from LivePoolCache");
+
+        assert_eq!(plan.sell_dex, "orca");
+        let sell_ix = plan
+            .sell_instructions
+            .first()
+            .expect("orca sell swap ix present");
+        assert_eq!(sell_ix.program_id.to_string(), ORCA_WHIRLPOOL_PROGRAM);
+        assert!(
+            sell_ix.accounts.iter().any(|a| a.pubkey == sell_pool),
+            "orca sell ix must reference whirlpool from cache merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_dex_orca_incomplete_intent_cache_miss_rejects_layout_not_ready() {
+        let wallet = Keypair::new();
+        let token_mint = Pubkey::new_unique();
+        let buy_pool = Pubkey::new_unique();
+        let sell_pool = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+
+        let cache = Arc::new(LivePoolCache::new());
+        seed_meteora_orca_cross_dex_cache(
+            &cache,
+            buy_pool,
+            sell_pool,
+            token_mint,
+            OrcaWhirlpoolState {
+                tick_spacing: 0,
+                ..orca_whirlpool_cache_state(token_mint, sol_mint)
+            },
+        );
+
+        let buy_accounts = vec![
+            buy_pool.to_string(),
+            token_mint.to_string(),
+            sol_mint.to_string(),
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+            "active_id:-281".to_string(),
+            "bin_step:10".to_string(),
+        ];
+        let sell_accounts = orca_pool_accounts_without_tick(sell_pool, token_mint, sol_mint);
+
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mut handler = CrossDexHandler::new(rpc, Some(wallet.pubkey())).with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes");
+
+        let intent = meteora_orca_cross_dex_intent(
+            &token_mint,
+            &buy_pool,
+            &sell_pool,
+            buy_accounts,
+            sell_accounts,
+        );
+        let validation = cross_dex_validation_fixture(&token_mint);
+        let err = handler
+            .build_swap_plan(
+                &intent,
+                &validation,
+                CrossDexPlanOptions {
+                    skip_token_ata_create: true,
+                },
+            )
+            .await
+            .expect_err("must reject when cache cannot supply tick layout");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ORCA_LAYOUT_NOT_READY"),
+            "expected layout-not-ready reject, got: {msg}"
+        );
+        assert!(
+            !msg.contains("no cached tick_current_index"),
+            "must reject before orca build_swap_ix_async missing-tick error; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_dex_orca_complete_intent_tick_does_not_require_cache_merge() {
+        let wallet = Keypair::new();
+        let token_mint = Pubkey::new_unique();
+        let buy_pool = Pubkey::new_unique();
+        let sell_pool = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+
+        // No Orca entry in cache — complete intent tick must be enough for sell leg.
+        let cache = Arc::new(LivePoolCache::new());
+        cache.upsert(
+            buy_pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: token_mint,
+                token_y_mint: sol_mint,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: -281,
+                bin_step: 10,
+                reserve_x_balance: Some(1_000_000_000_000),
+                reserve_y_balance: Some(50_000_000_000),
+            }),
+            100,
+        );
+
+        let buy_accounts = vec![
+            buy_pool.to_string(),
+            token_mint.to_string(),
+            sol_mint.to_string(),
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+            "active_id:-281".to_string(),
+            "bin_step:10".to_string(),
+        ];
+        let sell_accounts = orca_pool_accounts_with_tick(sell_pool, token_mint, sol_mint, -624, 8);
+
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mut handler = CrossDexHandler::new(rpc, Some(wallet.pubkey())).with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes");
+
+        let intent = meteora_orca_cross_dex_intent(
+            &token_mint,
+            &buy_pool,
+            &sell_pool,
+            buy_accounts,
+            sell_accounts,
+        );
+        let validation = cross_dex_validation_fixture(&token_mint);
+        let plan = handler
+            .build_swap_plan(
+                &intent,
+                &validation,
+                CrossDexPlanOptions {
+                    skip_token_ata_create: true,
+                },
+            )
+            .await
+            .expect("complete Orca intent accounts must build without cache tick merge");
+
+        assert_eq!(plan.sell_dex, "orca");
+        assert!(
+            !plan.sell_instructions.is_empty(),
+            "orca sell leg must produce swap instructions from intent tick alone"
         );
     }
 }
