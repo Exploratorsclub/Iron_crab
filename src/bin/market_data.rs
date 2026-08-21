@@ -2473,10 +2473,7 @@ impl ColdHost for MarketDataContext {
         if self.raydium_serum_fetched_contains(pool_addr) {
             return false;
         }
-        let mut set = self.raydium_serum_fetched.write();
-        // Drop stale partial markers (legacy FIX-29 rows that marked fetched before vault gate).
-        set.remove(&pool_addr);
-        set.insert(pool_addr)
+        self.raydium_serum_fetched.write().insert(pool_addr)
     }
 
     fn raydium_serum_fetched_remove(&self, pool_addr: Pubkey) {

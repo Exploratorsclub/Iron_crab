@@ -1418,6 +1418,27 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
             }
         }
 
+        // Geyser Raydium pool parse omits Serum/OpenBook static accounts; preserve from prior cache row.
+        if let CachedPoolState::RaydiumAmm(ref mut new_am) = cached_state {
+            if let Some(CachedPoolState::RaydiumAmm(ex)) = prev_state.as_ref() {
+                if new_am.serum_bids.is_none() {
+                    new_am.serum_bids = ex.serum_bids;
+                }
+                if new_am.serum_asks.is_none() {
+                    new_am.serum_asks = ex.serum_asks;
+                }
+                if new_am.serum_event_queue.is_none() {
+                    new_am.serum_event_queue = ex.serum_event_queue;
+                }
+                if new_am.serum_base_vault.is_none() {
+                    new_am.serum_base_vault = ex.serum_base_vault;
+                }
+                if new_am.serum_quote_vault.is_none() {
+                    new_am.serum_quote_vault = ex.serum_quote_vault;
+                }
+            }
+        }
+
         // Update MASTER LivePoolCache (Single Source of Truth)
         if !host
             .live_pool_cache()
