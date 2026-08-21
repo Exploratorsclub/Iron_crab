@@ -1465,9 +1465,7 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
             }
         }
 
-        if host.is_hot_pool(pool_pubkey) {
-            host.maybe_retry_deferred_hot_pool_reserves_on_cache_fill(pool_pubkey);
-        }
+        host.maybe_retry_deferred_hot_pool_reserves_on_cache_fill(pool_pubkey);
 
         // Phase1: sidefx only updates MASTER cache + JetStream; vault registration stays in md-state.
         // (No RegisterPoolVaultsFromAccount enqueue from account parse.)
