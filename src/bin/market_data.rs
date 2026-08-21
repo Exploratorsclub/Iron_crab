@@ -12076,12 +12076,14 @@ mod discovery_tests {
                 serum_bids: None,
                 serum_asks: None,
                 serum_event_queue: None,
+                serum_base_vault: None,
+                serum_quote_vault: None,
             }),
             DISCOVERY_SLOT,
         );
         cache.update_vault_balance(&coin_vault, 10, VAULT_SLOT);
         cache.update_vault_balance(&pc_vault, 20, VAULT_SLOT);
-        cache.set_raydium_serum_accounts(&pool, bids, asks, eq);
+        cache.set_raydium_serum_accounts(&pool, bids, asks, eq, None, None);
 
         let (_, cache_slot, _) = cache.get_with_metadata(&pool).expect("pool in cache");
         assert_eq!(

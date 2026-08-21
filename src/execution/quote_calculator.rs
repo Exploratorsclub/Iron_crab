@@ -781,6 +781,8 @@ mod tests {
             serum_bids: None,
             serum_asks: None,
             serum_event_queue: None,
+            serum_base_vault: None,
+            serum_quote_vault: None,
         };
 
         let intent = create_test_intent(wsol_mint, token_mint, 1_000_000_000); // 1 SOL
@@ -812,6 +814,8 @@ mod tests {
             serum_bids: None,
             serum_asks: None,
             serum_event_queue: None,
+            serum_base_vault: None,
+            serum_quote_vault: None,
         };
 
         let intent = create_test_intent(token_mint, wsol_mint, 10_000_000_000); // 10 tokens

@@ -50,6 +50,8 @@ async fn raydium_cold_path_known_pool_missing_reserves_rpc_unreachable_yields_er
         None,
         None,
         None,
+        None,
+        None,
     );
 
     let result = raydium.fetch_and_update_reserves(&pool_addr).await;

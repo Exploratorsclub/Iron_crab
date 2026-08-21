@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::{Dex, Quote};
-use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
+use crate::execution::live_pool_cache::{CachedPoolState, RaydiumAmmState, SharedLivePoolCache};
 
 /// Re-export: conservative [`crate::ipc::DexPoolReadiness`] for Raydium AMM v4 pool cache / JetStream
 /// (static Serum accounts + both-side liquidity; reserves alone are never `Ready`).
@@ -322,6 +322,8 @@ impl Raydium {
         serum_bids: Option<Pubkey>,
         serum_asks: Option<Pubkey>,
         serum_event_queue: Option<Pubkey>,
+        serum_base_vault: Option<Pubkey>,
+        serum_quote_vault: Option<Pubkey>,
     ) {
         // Derive PDAs (same as load_pool_from_rpc_fallback)
         let (amm_auth, _) = Self::derive_amm_authority();
@@ -354,8 +356,8 @@ impl Raydium {
             serum_bids,
             serum_asks,
             serum_event_queue,
-            serum_base_vault: None, // Will be fetched if needed
-            serum_quote_vault: None,
+            serum_base_vault,
+            serum_quote_vault,
         };
 
         // Insert into pools cache
@@ -378,6 +380,36 @@ impl Raydium {
             has_serum_accounts = serum_bids.is_some(),
             "injected raydium pool from live cache"
         );
+    }
+
+    /// Inject full Raydium AMM row from LivePoolCache (Cross-DEX / EE hot path).
+    pub fn inject_raydium_amm_from_live_cache(&self, pool_address: Pubkey, s: &RaydiumAmmState) {
+        self.inject_cached_amm_state(
+            pool_address,
+            s.base_mint,
+            s.quote_mint,
+            s.coin_vault,
+            s.pc_vault,
+            s.base_decimals,
+            s.quote_decimals,
+            s.coin_reserve,
+            s.pc_reserve,
+            s.market_id,
+            s.serum_bids,
+            s.serum_asks,
+            s.serum_event_queue,
+            s.serum_base_vault,
+            s.serum_quote_vault,
+        );
+    }
+
+    /// Returns true when static Serum/OpenBook accounts required for swap IX building
+    /// are present in LivePoolCache (matches tx_builder FIX-29 `has_serum_from_cache` gate).
+    pub fn raydium_amm_serum_accounts_ready_in_cache(s: &RaydiumAmmState) -> bool {
+        s.market_id != Pubkey::default()
+            && s.serum_bids.is_some()
+            && s.serum_asks.is_some()
+            && s.serum_event_queue.is_some()
     }
 
     /// Get Serum/OpenBook accounts for a cached pool (if populated).
@@ -1855,6 +1887,8 @@ mod tests {
             None,
             None,
             market_id,
+            None,
+            None,
             None,
             None,
             None,

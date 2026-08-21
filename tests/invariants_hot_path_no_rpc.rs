@@ -75,6 +75,8 @@ async fn raydium_vault_cache_miss_no_rpc() {
         None,
         None,
         None,
+        None,
+        None,
     );
 
     let result = raydium.fetch_and_update_reserves(&pool_addr).await;

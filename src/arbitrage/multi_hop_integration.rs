@@ -1454,6 +1454,8 @@ mod tests {
                 serum_bids: None,
                 serum_asks: None,
                 serum_event_queue: None,
+                serum_base_vault: None,
+                serum_quote_vault: None,
             }),
             1,
         );

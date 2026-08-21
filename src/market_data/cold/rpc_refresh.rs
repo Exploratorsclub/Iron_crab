@@ -806,12 +806,12 @@ pub async fn cold_path_rpc_refresh_raydium_amm_pool_row(
     {
         match rpc.get_account_retry(&state.market_id).await {
             Ok(account) => {
-                if let Some((bids_o, asks_o, eq_o, _bv, _qv)) =
+                if let Some((bids_o, asks_o, eq_o, bv_o, qv_o)) =
                     Raydium::parse_serum_market_accounts(&account.data)
                 {
                     if let (Some(b), Some(a), Some(e)) = (bids_o, asks_o, eq_o) {
                         host.live_pool_cache()
-                            .set_raydium_serum_accounts(&pool_addr, b, a, e);
+                            .set_raydium_serum_accounts(&pool_addr, b, a, e, bv_o, qv_o);
                         host.raydium_serum_fetched_insert(pool_addr);
                     }
                 }

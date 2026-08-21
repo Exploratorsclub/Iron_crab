@@ -144,6 +144,9 @@ pub struct RaydiumAmmState {
     pub serum_bids: Option<Pubkey>,
     pub serum_asks: Option<Pubkey>,
     pub serum_event_queue: Option<Pubkey>,
+    /// Serum market vaults (from OpenBook market parse; static per pool)
+    pub serum_base_vault: Option<Pubkey>,
+    pub serum_quote_vault: Option<Pubkey>,
 }
 
 /// JetStream / MASTER [`DexPoolReadiness`] for Raydium AMM v4 (conservative, explicit).
@@ -1575,6 +1578,8 @@ impl LivePoolCache {
         serum_bids: Pubkey,
         serum_asks: Pubkey,
         serum_event_queue: Pubkey,
+        serum_base_vault: Option<Pubkey>,
+        serum_quote_vault: Option<Pubkey>,
     ) {
         if let Some(mut entry) = self.pools.get_mut(pool) {
             if let CachedPoolState::RaydiumAmm(ref mut s) = entry.value_mut().state {
@@ -1582,12 +1587,20 @@ impl LivePoolCache {
                 s.serum_bids = Some(serum_bids);
                 s.serum_asks = Some(serum_asks);
                 s.serum_event_queue = Some(serum_event_queue);
+                if let Some(bv) = serum_base_vault {
+                    s.serum_base_vault = Some(bv);
+                }
+                if let Some(qv) = serum_quote_vault {
+                    s.serum_quote_vault = Some(qv);
+                }
                 if was_none {
                     tracing::info!(
                         pool = %pool,
                         bids = %serum_bids,
                         asks = %serum_asks,
                         event_queue = %serum_event_queue,
+                        serum_base_vault = ?serum_base_vault,
+                        serum_quote_vault = ?serum_quote_vault,
                         "LivePoolCache: Raydium serum accounts populated"
                     );
                 }
@@ -2426,6 +2439,8 @@ fn parse_raydium_amm(data: &[u8]) -> Option<CachedPoolState> {
         serum_bids: None,
         serum_asks: None,
         serum_event_queue: None,
+        serum_base_vault: None,
+        serum_quote_vault: None,
     }))
 }
 
@@ -3034,6 +3049,8 @@ mod tests {
                 serum_bids: None,
                 serum_asks: None,
                 serum_event_queue: None,
+                serum_base_vault: None,
+                serum_quote_vault: None,
             }),
             100,
         );
@@ -4281,6 +4298,8 @@ mod tests {
             serum_bids: None,
             serum_asks: None,
             serum_event_queue: None,
+            serum_base_vault: None,
+            serum_quote_vault: None,
         };
         assert_eq!(
             raydium_amm_readiness_for_pool_cache_update(&s),
@@ -4305,6 +4324,8 @@ mod tests {
             serum_bids: Some(Pubkey::new_unique()),
             serum_asks: Some(Pubkey::new_unique()),
             serum_event_queue: Some(Pubkey::new_unique()),
+            serum_base_vault: None,
+            serum_quote_vault: None,
         };
         assert_eq!(
             raydium_amm_readiness_for_pool_cache_update(&s),
@@ -4333,6 +4354,8 @@ mod tests {
                 serum_bids: Some(Pubkey::new_unique()),
                 serum_asks: Some(Pubkey::new_unique()),
                 serum_event_queue: Some(Pubkey::new_unique()),
+                serum_base_vault: None,
+                serum_quote_vault: None,
             }),
             100,
         );
@@ -4362,6 +4385,8 @@ mod tests {
                 serum_bids: Some(Pubkey::new_unique()),
                 serum_asks: Some(Pubkey::new_unique()),
                 serum_event_queue: Some(Pubkey::new_unique()),
+                serum_base_vault: None,
+                serum_quote_vault: None,
             }),
             100,
         );

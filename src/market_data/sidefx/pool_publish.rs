@@ -617,6 +617,8 @@ mod tests {
                 serum_bids,
                 serum_asks: Some(Pubkey::new_unique()),
                 serum_event_queue: Some(Pubkey::new_unique()),
+                serum_base_vault: None,
+                serum_quote_vault: None,
             })
         };
         let prev = base(Some(Pubkey::new_unique()));

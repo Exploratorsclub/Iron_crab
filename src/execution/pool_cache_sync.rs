@@ -242,6 +242,16 @@ fn build_minimal_pool_state_with_reserves(
                 serum_bids,
                 serum_asks,
                 serum_event_queue,
+                serum_base_vault: update
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("serum_base_vault"))
+                    .and_then(|s| Pubkey::from_str(s).ok()),
+                serum_quote_vault: update
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("serum_quote_vault"))
+                    .and_then(|s| Pubkey::from_str(s).ok()),
             })
         }
         "raydium_cpmm" => CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
@@ -992,6 +1002,12 @@ fn apply_pool_cache_update_outcome_inner(
                             }
                             if new_am.serum_event_queue.is_none() {
                                 new_am.serum_event_queue = ex.serum_event_queue;
+                            }
+                            if new_am.serum_base_vault.is_none() {
+                                new_am.serum_base_vault = ex.serum_base_vault;
+                            }
+                            if new_am.serum_quote_vault.is_none() {
+                                new_am.serum_quote_vault = ex.serum_quote_vault;
                             }
                             if new_am.coin_vault == Pubkey::default() {
                                 new_am.coin_vault = ex.coin_vault;

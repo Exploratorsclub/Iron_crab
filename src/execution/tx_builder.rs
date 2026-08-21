@@ -647,6 +647,8 @@ pub async fn build_tx_plan(
                             amm_state.serum_bids,
                             amm_state.serum_asks,
                             amm_state.serum_event_queue,
+                            amm_state.serum_base_vault,
+                            amm_state.serum_quote_vault,
                         );
                         used_cache = true;
                     }
@@ -693,7 +695,7 @@ pub async fn build_tx_plan(
             // Write back to SLAVE LivePoolCache for subsequent trades
             if let Some(cache) = cache {
                 if let Some((b, a, eq)) = raydium.get_serum_accounts(&pool_id) {
-                    cache.set_raydium_serum_accounts(&pool_id, b, a, eq);
+                    cache.set_raydium_serum_accounts(&pool_id, b, a, eq, None, None);
                 }
             }
         }
@@ -2107,6 +2109,8 @@ async fn build_hop_raydium(
                 amm_state.serum_bids,
                 amm_state.serum_asks,
                 amm_state.serum_event_queue,
+                amm_state.serum_base_vault,
+                amm_state.serum_quote_vault,
             );
             used_cache = true;
         }
@@ -2149,7 +2153,7 @@ async fn build_hop_raydium(
         // Write back to SLAVE LivePoolCache for subsequent trades
         if let Some(cache) = cache {
             if let Some((b, a, eq)) = raydium.get_serum_accounts(pool_address) {
-                cache.set_raydium_serum_accounts(pool_address, b, a, eq);
+                cache.set_raydium_serum_accounts(pool_address, b, a, eq, None, None);
             }
         }
     }

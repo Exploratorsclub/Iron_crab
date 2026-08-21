@@ -1766,3 +1766,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `Cargo.lock` |
 | **Regression-Prüfung** | `cargo audit --deny warnings`, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`. |
 | **Tags** | [ci, security, rustsec, supply-chain, event-listener] |
+
+---
+
+## FIX-29b: Cross-DEX Raydium Serum Inject (2026-08-21)
+
+| Symptom | Cross-DEX `build_swap_plan` rejected Raydium legs with `serum market accounts not populated` despite LivePoolCache holding FIX-29 serum metadata (`arb-2402d175-000000`). |
+|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | `cross_dex_handler::try_inject_from_cache` returned `true` for `RaydiumAmm` cache hits without calling `inject_raydium_amm_from_live_cache`. |
+| **Fix** | Real cache injection via typed Raydium connector; fake hit removed (incomplete serum → `false` / `RAYDIUM_LAYOUT_NOT_READY`); Raydium legs always re-inject after optional intent accounts; optional serum vault pubkeys propagated through cache + `inject_cached_amm_state`. |
+| **Betroffene Module** | `src/solana/cross_dex_handler.rs`, `src/solana/dex/raydium.rs`, `src/execution/live_pool_cache.rs`, `src/execution/pool_cache_sync.rs` |
+| **Regression-Prüfung** | Unit tests `cross_dex_raydium_*`; `cargo fmt`, `cargo clippy -D warnings`, `cargo test`. |
+| **Tags** | [arb, cross-dex, raydium, serum, i-7, i-16, hot-path] |
