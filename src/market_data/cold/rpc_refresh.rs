@@ -802,7 +802,9 @@ pub async fn cold_path_rpc_refresh_raydium_amm_pool_row(
     if state.market_id != Pubkey::default()
         && (state.serum_bids.is_none()
             || state.serum_asks.is_none()
-            || state.serum_event_queue.is_none())
+            || state.serum_event_queue.is_none()
+            || state.serum_base_vault.is_none()
+            || state.serum_quote_vault.is_none())
     {
         match rpc.get_account_retry(&state.market_id).await {
             Ok(account) => {

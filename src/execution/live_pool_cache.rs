@@ -152,8 +152,9 @@ pub struct RaydiumAmmState {
 /// JetStream / MASTER [`DexPoolReadiness`] for Raydium AMM v4 (conservative, explicit).
 ///
 /// `Ready` only when the static Serum/OpenBook accounts required for swap building are present
-/// (`market_id`, bids, asks, event queue from Geyser parse or one-time cold-path fill) **and**
-/// both vault reserves are known and non-zero (matches [`crate::execution::quote_calculator`] needs).
+/// (`market_id`, bids, asks, event queue, serum base/quote vaults from Geyser parse or one-time
+/// cold-path fill) **and** both vault reserves are known and non-zero (matches
+/// [`crate::execution::quote_calculator`] needs).
 ///
 /// Reserves alone never imply `Ready` (swap path still needs Serum accounts — see `RaydiumSwapAccounts`).
 #[must_use]
@@ -161,7 +162,9 @@ pub fn raydium_amm_readiness_for_pool_cache_update(s: &RaydiumAmmState) -> DexPo
     let static_ok = s.market_id != Pubkey::default()
         && s.serum_bids.is_some()
         && s.serum_asks.is_some()
-        && s.serum_event_queue.is_some();
+        && s.serum_event_queue.is_some()
+        && s.serum_base_vault.is_some()
+        && s.serum_quote_vault.is_some();
     let r_coin = s.coin_reserve.unwrap_or(0);
     let r_pc = s.pc_reserve.unwrap_or(0);
     // `coin_reserve` / `pc_reserve` are the two pool legs; both must be non-zero for a usable
@@ -4324,8 +4327,8 @@ mod tests {
             serum_bids: Some(Pubkey::new_unique()),
             serum_asks: Some(Pubkey::new_unique()),
             serum_event_queue: Some(Pubkey::new_unique()),
-            serum_base_vault: None,
-            serum_quote_vault: None,
+            serum_base_vault: Some(Pubkey::new_unique()),
+            serum_quote_vault: Some(Pubkey::new_unique()),
         };
         assert_eq!(
             raydium_amm_readiness_for_pool_cache_update(&s),

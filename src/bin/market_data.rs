@@ -12057,6 +12057,8 @@ mod discovery_tests {
         let bids = Pubkey::new_unique();
         let asks = Pubkey::new_unique();
         let eq = Pubkey::new_unique();
+        let serum_base_vault = Pubkey::new_unique();
+        let serum_quote_vault = Pubkey::new_unique();
 
         const DISCOVERY_SLOT: u64 = 100;
         const VAULT_SLOT: u64 = 9_999;
@@ -12083,7 +12085,14 @@ mod discovery_tests {
         );
         cache.update_vault_balance(&coin_vault, 10, VAULT_SLOT);
         cache.update_vault_balance(&pc_vault, 20, VAULT_SLOT);
-        cache.set_raydium_serum_accounts(&pool, bids, asks, eq, None, None);
+        cache.set_raydium_serum_accounts(
+            &pool,
+            bids,
+            asks,
+            eq,
+            Some(serum_base_vault),
+            Some(serum_quote_vault),
+        );
 
         let (_, cache_slot, _) = cache.get_with_metadata(&pool).expect("pool in cache");
         assert_eq!(
