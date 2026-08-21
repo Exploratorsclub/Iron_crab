@@ -876,6 +876,12 @@ pub async fn cold_path_rpc_refresh_raydium_amm_pool_row(
                 meta.insert("serum_asks".to_string(), asks.to_string());
                 meta.insert("serum_event_queue".to_string(), eq.to_string());
             }
+            if let Some(bv) = st.serum_base_vault {
+                meta.insert("serum_base_vault".to_string(), bv.to_string());
+            }
+            if let Some(qv) = st.serum_quote_vault {
+                meta.insert("serum_quote_vault".to_string(), qv.to_string());
+            }
             if !meta.is_empty() {
                 balance_update.metadata = Some(meta);
             }

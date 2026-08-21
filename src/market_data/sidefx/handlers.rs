@@ -1720,6 +1720,12 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                         meta.insert("serum_asks".to_string(), asks.to_string());
                         meta.insert("serum_event_queue".to_string(), eq.to_string());
                     }
+                    if let Some(bv) = s.serum_base_vault {
+                        meta.insert("serum_base_vault".to_string(), bv.to_string());
+                    }
+                    if let Some(qv) = s.serum_quote_vault {
+                        meta.insert("serum_quote_vault".to_string(), qv.to_string());
+                    }
                     if !meta.is_empty() {
                         pool_update.metadata = Some(meta);
                     }

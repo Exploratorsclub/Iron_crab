@@ -112,6 +112,9 @@ pub struct PoolSnapshot {
     pub serum_quote_vault: Option<Pubkey>,
 }
 
+/// Serum/OpenBook static accounts for a Raydium AMM pool.
+pub type RaydiumSerumAccounts = (Pubkey, Pubkey, Pubkey, Option<Pubkey>, Option<Pubkey>);
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct SimplePool {
@@ -445,19 +448,23 @@ impl Raydium {
     }
 
     /// Returns true when static Serum/OpenBook accounts required for swap IX building
-    /// are present in LivePoolCache (matches tx_builder FIX-29 `has_serum_from_cache` gate).
+    /// are present in LivePoolCache (matches `build_swap_ix` serum account requirements).
     pub fn raydium_amm_serum_accounts_ready_in_cache(s: &RaydiumAmmState) -> bool {
         s.market_id != Pubkey::default()
             && s.serum_bids.is_some()
             && s.serum_asks.is_some()
             && s.serum_event_queue.is_some()
+            && s.serum_base_vault.is_some()
+            && s.serum_quote_vault.is_some()
     }
 
     /// Get Serum/OpenBook accounts for a cached pool (if populated).
-    pub fn get_serum_accounts(&self, pool_address: &Pubkey) -> Option<(Pubkey, Pubkey, Pubkey)> {
+    pub fn get_serum_accounts(&self, pool_address: &Pubkey) -> Option<RaydiumSerumAccounts> {
         let pool = self.pools.get(pool_address)?;
         match (pool.serum_bids, pool.serum_asks, pool.serum_event_queue) {
-            (Some(b), Some(a), Some(eq)) => Some((b, a, eq)),
+            (Some(b), Some(a), Some(eq)) => {
+                Some((b, a, eq, pool.serum_base_vault, pool.serum_quote_vault))
+            }
             _ => None,
         }
     }
