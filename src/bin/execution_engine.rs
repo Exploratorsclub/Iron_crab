@@ -4491,7 +4491,7 @@ impl ExecutionContext {
             // SIM_INSUFFICIENT_BALANCE preflight check passes for SELL intents.
             for (mint_str, balance_raw, _decimals, _token_prog, _ta_pubkey) in &inventory {
                 ctx.lock_manager
-                    .apply_wallet_token_snapshot(mint_str.clone(), *balance_raw);
+                    .apply_wallet_token_snapshot(mint_str.clone(), *balance_raw, None);
                 info!(
                     mint = %mint_str,
                     balance_raw = balance_raw,
@@ -7158,8 +7158,11 @@ impl ExecutionContext {
                 }
             } else {
                 let old = self.lock_manager.available_token_balance(mint);
-                self.lock_manager
-                    .apply_wallet_token_snapshot(mint.clone(), *balance_raw);
+                self.lock_manager.apply_wallet_token_snapshot(
+                    mint.clone(),
+                    *balance_raw,
+                    event.slot,
+                );
 
                 if old != *balance_raw {
                     info!(
@@ -7536,7 +7539,11 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
                 } else if mint != SOL_MINT {
                     // Regular token balance (skip SOL_MINT which equals WSOL_MINT
                     // but could appear from old JetStream entries)
-                    lock_manager.apply_wallet_token_snapshot(mint.clone(), *balance_raw);
+                    lock_manager.apply_wallet_token_snapshot(
+                        mint.clone(),
+                        *balance_raw,
+                        event.slot,
+                    );
                     wallet_snapshot_kinds.push(event.kind.clone());
                 }
             } else if matches!(event.kind, MarketEventKind::WalletSnapshotComplete { .. }) {
@@ -13696,7 +13703,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
 
                 if s48.full_close {
                     ctx.lock_manager
-                        .clear_token_wallet_presence(mint_str.as_str());
+                        .clear_token_wallet_presence(mint_str.as_str(), tx_landing_slot);
                     info!(
                         intent_id = %intent.intent_id,
                         mint = %mint_str,
@@ -17735,7 +17742,7 @@ mod execution_engine_tests {
         let s48 = scope48_confirmed_sell_close_decision(false, total, total_pos, false);
         assert!(s48.full_close);
 
-        m.clear_token_wallet_presence(M);
+        m.clear_token_wallet_presence(M, None);
         m.release_locks_after_confirmed_sell("sell-all");
         assert_eq!(m.available_token_balance(M), 0);
         assert_eq!(m.count_non_zero_token_balances(), 0);

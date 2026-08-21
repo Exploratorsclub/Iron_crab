@@ -357,6 +357,9 @@ pub struct LockManager {
     /// prove the ATA still exists (e.g. full SELL + ATA close). Used only for cross-DEX ATA-create
     /// skip — never for capital locking.
     token_wallet_ata_present: RwLock<HashSet<String>>,
+    /// Confirmed full-close slot per mint. Wallet snapshots at or before this slot must not
+    /// restore [`Self::token_wallet_ata_present`] (Geyser/JetStream delivery is unordered).
+    token_wallet_ata_cleared_at_slot: RwLock<HashMap<String, Option<u64>>>,
 
     /// Active capital locks
     capital_locks: RwLock<HashMap<String, CapitalLock>>, // intent_id -> lock
@@ -382,6 +385,7 @@ impl LockManager {
             wsol_initialized: std::sync::atomic::AtomicBool::new(false),
             available_tokens: RwLock::new(HashMap::new()),
             token_wallet_ata_present: RwLock::new(HashSet::new()),
+            token_wallet_ata_cleared_at_slot: RwLock::new(HashMap::new()),
             capital_locks: RwLock::new(HashMap::new()),
             resource_locks: RwLock::new(HashMap::new()),
             processed_intents: RwLock::new(HashSet::new()),
@@ -628,7 +632,22 @@ impl LockManager {
     /// Use for Geyser / JetStream wallet snapshots where the account was observed on-chain (balance
     /// may be zero while the ATA remains open). Do **not** use for engine bookkeeping after a full
     /// SELL — call [`Self::clear_token_wallet_presence`] instead.
-    pub fn apply_wallet_token_snapshot(&self, mint: String, amount_raw: u64) {
+    pub fn apply_wallet_token_snapshot(
+        &self,
+        mint: String,
+        amount_raw: u64,
+        snapshot_slot: Option<u64>,
+    ) {
+        if self.wallet_token_snapshot_stale_after_close(&mint, amount_raw, snapshot_slot) {
+            return;
+        }
+        if self
+            .token_wallet_ata_cleared_at_slot
+            .read()
+            .contains_key(&mint)
+        {
+            self.token_wallet_ata_cleared_at_slot.write().remove(&mint);
+        }
         self.mark_token_wallet_ata_present(&mint);
         self.set_available_token_balance(mint, amount_raw);
     }
@@ -637,9 +656,43 @@ impl LockManager {
     ///
     /// Call after a confirmed full SELL when the position is closed (especially when tx-meta proves
     /// the token account is gone). Ensures cross-DEX arb BUY plans retain CreateIdempotent.
-    pub fn clear_token_wallet_presence(&self, mint: &str) {
+    pub fn clear_token_wallet_presence(&self, mint: &str, closed_at_slot: Option<u64>) {
         self.token_wallet_ata_present.write().remove(mint);
         self.available_tokens.write().remove(mint);
+        self.token_wallet_ata_cleared_at_slot
+            .write()
+            .insert(mint.to_string(), closed_at_slot);
+    }
+
+    /// True when a wallet snapshot arrived after a confirmed full close but predates that close.
+    fn wallet_token_snapshot_stale_after_close(
+        &self,
+        mint: &str,
+        amount_raw: u64,
+        snapshot_slot: Option<u64>,
+    ) -> bool {
+        let Some(closed_at_slot) = self
+            .token_wallet_ata_cleared_at_slot
+            .read()
+            .get(mint)
+            .copied()
+        else {
+            return false;
+        };
+
+        if let (Some(closed_slot), Some(snap_slot)) = (closed_at_slot, snapshot_slot) {
+            if snap_slot <= closed_slot {
+                return true;
+            }
+        } else if let (None, Some(_)) = (closed_at_slot, snapshot_slot) {
+            // Close slot unknown — cannot order this Geyser snapshot safely.
+            return true;
+        } else if amount_raw == 0 {
+            // Slot-less zero snapshot after close (e.g. ExecutionResult publish): heal balance only.
+            self.set_available_token_balance(mint.to_string(), 0);
+            return true;
+        }
+        false
     }
 
     /// True when the wallet token ATA for `mint` is known to exist on-chain.
@@ -1848,13 +1901,13 @@ mod tests {
             "set_available_token_balance(0) alone must not authorize ATA-create skip"
         );
 
-        m.apply_wallet_token_snapshot(M.to_string(), 0);
+        m.apply_wallet_token_snapshot(M.to_string(), 0, None);
         assert!(
             m.token_wallet_snapshot_seen(M),
             "Geyser snapshot with zero balance still proves ATA exists"
         );
 
-        m.clear_token_wallet_presence(M);
+        m.clear_token_wallet_presence(M, None);
         assert!(
             !m.token_wallet_snapshot_seen(M),
             "full close / ATA close must clear presence"
@@ -1871,13 +1924,34 @@ mod tests {
     fn test_clear_token_wallet_presence_removes_zero_balance_key() {
         const M: &str = "ClearMint";
         let m = LockManager::new(0);
-        m.apply_wallet_token_snapshot(M.to_string(), 0);
+        m.apply_wallet_token_snapshot(M.to_string(), 0, None);
         assert!(m.available_tokens.read().contains_key(M));
 
-        m.clear_token_wallet_presence(M);
+        m.clear_token_wallet_presence(M, None);
         assert!(!m.available_tokens.read().contains_key(M));
         assert_eq!(m.available_token_balance(M), 0);
         assert!(!m.token_wallet_snapshot_seen(M));
+    }
+
+    #[test]
+    fn test_stale_wallet_snapshot_after_full_close_does_not_restore_ata_presence() {
+        const M: &str = "StaleSnapMint";
+        let m = LockManager::new(0);
+        m.apply_wallet_token_snapshot(M.to_string(), 1_000, Some(100));
+        m.clear_token_wallet_presence(M, Some(200));
+        assert!(!m.token_wallet_snapshot_seen(M));
+
+        m.apply_wallet_token_snapshot(M.to_string(), 1_000, Some(150));
+        assert!(
+            !m.token_wallet_snapshot_seen(M),
+            "stale pre-close Geyser snapshot must not restore ATA presence"
+        );
+
+        m.apply_wallet_token_snapshot(M.to_string(), 500, Some(201));
+        assert!(
+            m.token_wallet_snapshot_seen(M),
+            "post-close Geyser snapshot newer than close must restore ATA presence"
+        );
     }
 
     #[test]

@@ -2063,9 +2063,9 @@ mod tests {
             !lm.token_wallet_snapshot_seen(mint),
             "engine bookkeeping zero must not skip ATA create"
         );
-        lm.apply_wallet_token_snapshot(mint.to_string(), 0);
+        lm.apply_wallet_token_snapshot(mint.to_string(), 0, None);
         assert!(lm.token_wallet_snapshot_seen(mint));
-        lm.clear_token_wallet_presence(mint);
+        lm.clear_token_wallet_presence(mint, None);
         assert!(!lm.token_wallet_snapshot_seen(mint));
     }
 
@@ -2073,7 +2073,7 @@ mod tests {
     async fn cross_dex_full_close_clears_ata_presence_requires_create_ix() {
         let mint = "9Pfyn4Hvbg1z9y8K9f6K9f6K9f6K9f6K9f6K9f6pump";
         let lm = LockManager::new(1_000_000_000);
-        lm.apply_wallet_token_snapshot(mint.to_string(), 1_000_000);
+        lm.apply_wallet_token_snapshot(mint.to_string(), 1_000_000, None);
         assert!(lm.token_wallet_snapshot_seen(mint));
 
         let (with_skip, _, _) = build_prod_pattern_cross_dex_plan(true).await;
@@ -2083,7 +2083,7 @@ mod tests {
             "known ATA skip removes exactly one CreateIdempotent ix"
         );
 
-        lm.clear_token_wallet_presence(mint);
+        lm.clear_token_wallet_presence(mint, None);
         assert!(!lm.token_wallet_snapshot_seen(mint));
         let skip_after_close = lm.token_wallet_snapshot_seen(mint);
         assert!(!skip_after_close);
