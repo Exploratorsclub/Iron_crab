@@ -4,7 +4,8 @@ use super::host::ColdHost;
 use crate::execution::live_pool_cache::{
     meteora_cpmm_readiness_for_pool_cache_update, meteora_dlmm_readiness_for_pool_cache_update,
     orca_readiness_for_pool_cache_update, parse_pool_account,
-    raydium_amm_readiness_for_pool_cache_update, CachedPoolState, MeteoraCpmmState, MeteoraState,
+    raydium_amm_readiness_for_pool_cache_update, raydium_amm_serum_needs_cold_backfill,
+    raydium_amm_serum_static_accounts_ready, CachedPoolState, MeteoraCpmmState, MeteoraState,
     OrcaWhirlpoolState, RaydiumAmmState, RaydiumCpmmState,
 };
 use crate::ipc::{
@@ -711,6 +712,152 @@ pub async fn cold_path_rpc_refresh_meteora_dlmm_pool_row(
     })
 }
 
+/// Cold-path only: fetch Serum/OpenBook static accounts when any field is missing (including vaults).
+///
+/// Returns `true` when the cache row now has the full static Serum layout required for swap building.
+pub async fn cold_path_backfill_raydium_serum_accounts(
+    host: &impl ColdHost,
+    rpc: &Arc<SolanaRpc>,
+    request_id: &str,
+    pool_addr: Pubkey,
+    state: &RaydiumAmmState,
+) -> bool {
+    if !raydium_amm_serum_needs_cold_backfill(state) {
+        return raydium_amm_serum_static_accounts_ready(state);
+    }
+
+    match rpc.get_account_retry(&state.market_id).await {
+        Ok(account) => {
+            if let Some((bids_o, asks_o, eq_o, bv_o, qv_o)) =
+                Raydium::parse_serum_market_accounts(&account.data)
+            {
+                if let (Some(b), Some(a), Some(e)) = (bids_o, asks_o, eq_o) {
+                    host.live_pool_cache()
+                        .set_raydium_serum_accounts(&pool_addr, b, a, e, bv_o, qv_o);
+                    if let Some(CachedPoolState::RaydiumAmm(st)) =
+                        host.live_pool_cache().get(&pool_addr)
+                    {
+                        if raydium_amm_serum_static_accounts_ready(&st) {
+                            host.raydium_serum_fetched_insert(pool_addr);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            debug!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                market_id = %state.market_id,
+                error = %e,
+                "Raydium AMM serum backfill: market fetch failed (may stay Partial)"
+            );
+        }
+    }
+
+    false
+}
+
+/// FIX-29 follow-up: one-shot serum backfill from md-sidefx / Geyser cache upsert (cold path only).
+///
+/// Dedupes via [`ColdHost::raydium_serum_fetched_try_claim`]; publishes JetStream when layout becomes
+/// usable so SLAVE caches receive serum vault pubkeys.
+pub async fn cold_path_raydium_serum_backfill_and_publish(
+    host: &impl ColdHost,
+    rpc: &Arc<SolanaRpc>,
+    run_id: &str,
+    request_id: &str,
+    pool_addr: Pubkey,
+    state: &RaydiumAmmState,
+) -> bool {
+    if !raydium_amm_serum_needs_cold_backfill(state) {
+        return false;
+    }
+    if !host.raydium_serum_fetched_try_claim(pool_addr) {
+        return false;
+    }
+
+    let backfill_ok =
+        cold_path_backfill_raydium_serum_accounts(host, rpc, request_id, pool_addr, state).await;
+    if !backfill_ok {
+        host.raydium_serum_fetched_remove(pool_addr);
+        return false;
+    }
+
+    let readiness = match host.live_pool_cache().get(&pool_addr).as_ref() {
+        Some(CachedPoolState::RaydiumAmm(st)) => raydium_amm_readiness_for_pool_cache_update(st),
+        _ => DexPoolReadiness::Observed,
+    };
+    host.live_pool_cache()
+        .merge_raydium_amm_pool_readiness(pool_addr, readiness);
+
+    let Some(nats) = host.nats() else {
+        host.raydium_serum_fetched_insert(pool_addr);
+        return true;
+    };
+    let Some((CachedPoolState::RaydiumAmm(st), pool_slot, _age_ms)) =
+        host.live_pool_cache().get_with_metadata(&pool_addr)
+    else {
+        return true;
+    };
+
+    let mut balance_update = PoolCacheUpdate::new_balance_updated(
+        "market-data",
+        BUILD_VERSION,
+        run_id,
+        pool_addr.to_string(),
+        "raydium".to_string(),
+        st.base_mint.to_string(),
+        st.quote_mint.to_string(),
+        st.coin_reserve.unwrap_or(0),
+        st.pc_reserve.unwrap_or(0),
+        pool_slot,
+    );
+    let mut meta = HashMap::new();
+    if st.market_id != Pubkey::default() {
+        meta.insert("market_id".to_string(), st.market_id.to_string());
+    }
+    if let (Some(bids), Some(asks), Some(eq)) = (st.serum_bids, st.serum_asks, st.serum_event_queue)
+    {
+        meta.insert("serum_bids".to_string(), bids.to_string());
+        meta.insert("serum_asks".to_string(), asks.to_string());
+        meta.insert("serum_event_queue".to_string(), eq.to_string());
+    }
+    if let Some(bv) = st.serum_base_vault {
+        meta.insert("serum_base_vault".to_string(), bv.to_string());
+    }
+    if let Some(qv) = st.serum_quote_vault {
+        meta.insert("serum_quote_vault".to_string(), qv.to_string());
+    }
+    if !meta.is_empty() {
+        balance_update.metadata = Some(meta);
+    }
+    balance_update.set_dex_readiness_in_metadata(readiness);
+    let subject = pool_subject(&pool_addr.to_string());
+    match nats.jetstream_publish(&subject, &balance_update).await {
+        Ok(true) => {
+            info!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                readiness = ?readiness,
+                "Raydium AMM serum backfill: published PoolCacheUpdate::BalanceUpdated to JetStream"
+            );
+            host.raydium_serum_fetched_insert(pool_addr);
+            true
+        }
+        Ok(false) | Err(_) => {
+            warn!(
+                request_id = %request_id,
+                pool = %pool_addr,
+                "Raydium AMM serum backfill: JetStream publish failed after cache update"
+            );
+            host.raydium_serum_fetched_insert(pool_addr);
+            true
+        }
+    }
+}
+
 /// Result of one cache-scoped Raydium AMM v4 RPC refresh (pool + vaults + optional Serum).
 pub struct RaydiumAmmRpcRefreshRowResult {
     pub pool_addr: Pubkey,
@@ -798,35 +945,8 @@ pub async fn cold_path_rpc_refresh_raydium_amm_pool_row(
     host.live_pool_cache()
         .upsert(pool_addr, CachedPoolState::RaydiumAmm(state.clone()), 0);
 
-    // Serum/OpenBook static accounts (same as FIX-29 one-shot path in Geyser handler).
-    if state.market_id != Pubkey::default()
-        && (state.serum_bids.is_none()
-            || state.serum_asks.is_none()
-            || state.serum_event_queue.is_none())
-    {
-        match rpc.get_account_retry(&state.market_id).await {
-            Ok(account) => {
-                if let Some((bids_o, asks_o, eq_o, _bv, _qv)) =
-                    Raydium::parse_serum_market_accounts(&account.data)
-                {
-                    if let (Some(b), Some(a), Some(e)) = (bids_o, asks_o, eq_o) {
-                        host.live_pool_cache()
-                            .set_raydium_serum_accounts(&pool_addr, b, a, e);
-                        host.raydium_serum_fetched_insert(pool_addr);
-                    }
-                }
-            }
-            Err(e) => {
-                debug!(
-                    request_id = %request_id,
-                    pool = %pool_addr,
-                    market_id = %state.market_id,
-                    error = %e,
-                    "Raydium AMM RPC refresh: serum market fetch failed (may stay Partial)"
-                );
-            }
-        }
-    }
+    // Serum/OpenBook static accounts (same as FIX-29 one-shot path in Geyser follow-up).
+    cold_path_backfill_raydium_serum_accounts(host, rpc, request_id, pool_addr, &state).await;
 
     let readiness = match host.live_pool_cache().get(&pool_addr).as_ref() {
         Some(CachedPoolState::RaydiumAmm(st)) => raydium_amm_readiness_for_pool_cache_update(st),
@@ -875,6 +995,12 @@ pub async fn cold_path_rpc_refresh_raydium_amm_pool_row(
                 meta.insert("serum_bids".to_string(), bids.to_string());
                 meta.insert("serum_asks".to_string(), asks.to_string());
                 meta.insert("serum_event_queue".to_string(), eq.to_string());
+            }
+            if let Some(bv) = st.serum_base_vault {
+                meta.insert("serum_base_vault".to_string(), bv.to_string());
+            }
+            if let Some(qv) = st.serum_quote_vault {
+                meta.insert("serum_quote_vault".to_string(), qv.to_string());
             }
             if !meta.is_empty() {
                 balance_update.metadata = Some(meta);

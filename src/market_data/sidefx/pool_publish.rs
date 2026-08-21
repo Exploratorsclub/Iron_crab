@@ -2,7 +2,7 @@
 
 use crate::execution::live_pool_cache::CachedPoolState;
 use crate::execution::live_pool_cache::{
-    MeteoraCpmmState, MeteoraState, OrcaWhirlpoolState, RaydiumCpmmState,
+    MeteoraCpmmState, MeteoraState, OrcaWhirlpoolState, RaydiumAmmState, RaydiumCpmmState,
 };
 use crate::ipc::{
     DexPoolReadiness, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY,
@@ -21,6 +21,51 @@ use crate::solana::dex::pumpfun_amm::{
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::str::FromStr;
+
+/// Raydium AMM v4: Serum/OpenBook static metadata for JetStream SLAVE bootstrap.
+pub fn raydium_amm_metadata_for_pool_cache_update(s: &RaydiumAmmState) -> HashMap<String, String> {
+    let mut meta = HashMap::new();
+    if s.market_id != Pubkey::default() {
+        meta.insert("market_id".to_string(), s.market_id.to_string());
+    }
+    if let (Some(bids), Some(asks), Some(eq)) = (s.serum_bids, s.serum_asks, s.serum_event_queue) {
+        meta.insert("serum_bids".to_string(), bids.to_string());
+        meta.insert("serum_asks".to_string(), asks.to_string());
+        meta.insert("serum_event_queue".to_string(), eq.to_string());
+    }
+    if let Some(bv) = s.serum_base_vault {
+        meta.insert("serum_base_vault".to_string(), bv.to_string());
+    }
+    if let Some(qv) = s.serum_quote_vault {
+        meta.insert("serum_quote_vault".to_string(), qv.to_string());
+    }
+    meta
+}
+
+/// Preserve Serum/OpenBook static fields when Geyser pool parse omits them.
+pub fn merge_raydium_amm_serum_fields_from_prior(
+    new_am: &mut RaydiumAmmState,
+    ex: &RaydiumAmmState,
+) {
+    if new_am.market_id == Pubkey::default() && ex.market_id != Pubkey::default() {
+        new_am.market_id = ex.market_id;
+    }
+    if new_am.serum_bids.is_none() {
+        new_am.serum_bids = ex.serum_bids;
+    }
+    if new_am.serum_asks.is_none() {
+        new_am.serum_asks = ex.serum_asks;
+    }
+    if new_am.serum_event_queue.is_none() {
+        new_am.serum_event_queue = ex.serum_event_queue;
+    }
+    if new_am.serum_base_vault.is_none() {
+        new_am.serum_base_vault = ex.serum_base_vault;
+    }
+    if new_am.serum_quote_vault.is_none() {
+        new_am.serum_quote_vault = ex.serum_quote_vault;
+    }
+}
 
 /// Raydium CPMM: vault pubkeys in normalized base/quote order for JetStream metadata.
 pub fn raydium_cpmm_vaults_for_pool_cache_update(s: &RaydiumCpmmState) -> String {
@@ -366,6 +411,8 @@ pub fn pool_cache_state_layout_significant_change(
                 || p.serum_bids != n.serum_bids
                 || p.serum_asks != n.serum_asks
                 || p.serum_event_queue != n.serum_event_queue
+                || p.serum_base_vault != n.serum_base_vault
+                || p.serum_quote_vault != n.serum_quote_vault
         }
         (CachedPoolState::RaydiumCpmm(p), CachedPoolState::RaydiumCpmm(n)) => {
             p.token_0_mint != n.token_0_mint
@@ -617,6 +664,8 @@ mod tests {
                 serum_bids,
                 serum_asks: Some(Pubkey::new_unique()),
                 serum_event_queue: Some(Pubkey::new_unique()),
+                serum_base_vault: None,
+                serum_quote_vault: None,
             })
         };
         let prev = base(Some(Pubkey::new_unique()));
@@ -646,5 +695,44 @@ mod tests {
         let prev = mk(Pubkey::new_unique());
         let next = mk(Pubkey::new_unique());
         assert!(pool_cache_state_layout_significant_change(&prev, &next));
+    }
+
+    #[test]
+    fn raydium_amm_metadata_includes_serum_vaults_when_present() {
+        use crate::execution::live_pool_cache::RaydiumAmmState;
+
+        let market_id = Pubkey::new_unique();
+        let bids = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let s = RaydiumAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            coin_vault: Pubkey::new_unique(),
+            pc_vault: Pubkey::new_unique(),
+            base_decimals: 9,
+            quote_decimals: 9,
+            coin_reserve: Some(1),
+            pc_reserve: Some(2),
+            market_id,
+            serum_bids: Some(bids),
+            serum_asks: Some(Pubkey::new_unique()),
+            serum_event_queue: Some(Pubkey::new_unique()),
+            serum_base_vault: Some(base_vault),
+            serum_quote_vault: Some(quote_vault),
+        };
+        let meta = raydium_amm_metadata_for_pool_cache_update(&s);
+        assert_eq!(
+            meta.get("market_id").map(String::as_str),
+            Some(market_id.to_string().as_str())
+        );
+        assert_eq!(
+            meta.get("serum_base_vault").map(String::as_str),
+            Some(base_vault.to_string().as_str())
+        );
+        assert_eq!(
+            meta.get("serum_quote_vault").map(String::as_str),
+            Some(quote_vault.to_string().as_str())
+        );
     }
 }

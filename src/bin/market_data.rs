@@ -42,11 +42,12 @@ use ironcrab::ipc::{
     PoolCacheUpdate, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::market_data::cold::{
-    cold_path_rpc_refresh_meteora_cpmm_pool_row, cold_path_rpc_refresh_meteora_dlmm_pool_row,
-    cold_path_rpc_refresh_orca_whirlpool_pool_row, handle_ensure_meteora_cpmm_pool_state,
-    handle_ensure_meteora_dlmm_pool_state, handle_ensure_orca_whirlpool_pool_state,
-    handle_ensure_pump_amm_pool_accounts, handle_ensure_pumpfun_bonding_curve,
-    handle_ensure_raydium_amm_pool_state, handle_ensure_raydium_cpmm_pool_state, ColdHost,
+    cold_path_raydium_serum_backfill_and_publish, cold_path_rpc_refresh_meteora_cpmm_pool_row,
+    cold_path_rpc_refresh_meteora_dlmm_pool_row, cold_path_rpc_refresh_orca_whirlpool_pool_row,
+    handle_ensure_meteora_cpmm_pool_state, handle_ensure_meteora_dlmm_pool_state,
+    handle_ensure_orca_whirlpool_pool_state, handle_ensure_pump_amm_pool_accounts,
+    handle_ensure_pumpfun_bonding_curve, handle_ensure_raydium_amm_pool_state,
+    handle_ensure_raydium_cpmm_pool_state, ColdHost,
 };
 use ironcrab::market_data::ingest::{
     handle_geyser_account_update, handle_geyser_transaction_update, try_parse_mint_account,
@@ -701,6 +702,36 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
             );
         }
     }
+
+    fn maybe_spawn_raydium_serum_cold_backfill(&self, pool: Pubkey, state: &RaydiumAmmState) {
+        use ironcrab::execution::live_pool_cache::raydium_amm_serum_needs_cold_backfill;
+
+        if !raydium_amm_serum_needs_cold_backfill(state) {
+            return;
+        }
+        if self.ctx.raydium_serum_inflight.read().contains(&pool) {
+            return;
+        }
+        let Some(rpc) = self.ctx.cold_path_rpc() else {
+            return;
+        };
+
+        let ctx = Arc::clone(&self.ctx);
+        let state = state.clone();
+        let run_id = self.ctx.run_id.clone();
+        tokio::spawn(async move {
+            let request_id = format!("fix29-serum-{}", pool);
+            let _ = cold_path_raydium_serum_backfill_and_publish(
+                ctx.as_ref(),
+                &rpc,
+                &run_id,
+                &request_id,
+                pool,
+                &state,
+            )
+            .await;
+        });
+    }
 }
 
 /// Phase 5b: md-sidefx worker (delegates to `sidefx/worker.rs`).
@@ -1280,6 +1311,8 @@ struct MarketDataContext {
     /// FIX-29: Raydium pools for which Serum accounts have already been fetched.
     /// Serum accounts are static — one RPC call per pool lifetime is sufficient.
     raydium_serum_fetched: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
+    /// In-flight FIX-29 serum backfill RPC (dedupes concurrent spawns; separate from completion).
+    raydium_serum_inflight: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
 
     /// === WsolManager Support: Wallet Balance Tracking ===
     /// Wallet pubkey to track for balance updates (for WsolManager in execution-engine).
@@ -1309,6 +1342,9 @@ struct MarketDataContext {
     /// PumpSwap / PumpFun AMM cold-path helper; set at Geyser-loop start before wallet snapshot.
     /// Used for background wallet-bootstrap DEX verification (watchdog-safe).
     pump_amm_dex: parking_lot::RwLock<Option<Arc<PumpFunAmmDex>>>,
+
+    /// Local RPC for FIX-29 Raydium serum backfill spawns (cold path only; set at Geyser-loop start).
+    cold_path_rpc: parking_lot::RwLock<Option<Arc<SolanaRpc>>>,
 
     /// Optional Helius (or other full-history) RPC — **only** for bounded PumpSwap TX-history
     /// fallback in `EnsurePumpAmmPoolAccounts` when the local validator lacks tx index (Cold Path).
@@ -2423,7 +2459,32 @@ impl ColdHost for MarketDataContext {
     }
 
     fn raydium_serum_fetched_insert(&self, pool_addr: Pubkey) {
+        self.raydium_serum_inflight.write().remove(&pool_addr);
         self.raydium_serum_fetched.write().insert(pool_addr);
+    }
+
+    fn raydium_serum_fetched_contains(&self, pool_addr: Pubkey) -> bool {
+        if let Some(CachedPoolState::RaydiumAmm(s)) = self.live_pool_cache.get(&pool_addr) {
+            return ironcrab::execution::live_pool_cache::raydium_amm_serum_static_accounts_ready(
+                &s,
+            );
+        }
+        false
+    }
+
+    fn raydium_serum_fetched_try_claim(&self, pool_addr: Pubkey) -> bool {
+        if self.raydium_serum_fetched_contains(pool_addr) {
+            return false;
+        }
+        self.raydium_serum_inflight.write().insert(pool_addr)
+    }
+
+    fn raydium_serum_fetched_remove(&self, pool_addr: Pubkey) {
+        self.raydium_serum_inflight.write().remove(&pool_addr);
+    }
+
+    fn cold_path_rpc(&self) -> Option<Arc<SolanaRpc>> {
+        self.cold_path_rpc.read().clone()
     }
 }
 
@@ -8495,6 +8556,7 @@ async fn main() -> Result<()> {
         pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
         high_priority_bonding_curves: parking_lot::RwLock::new(HashSet::new()),
         raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
+        raydium_serum_inflight: parking_lot::RwLock::new(std::collections::HashSet::new()),
         tracked_wallet,
         tracked_wallet_tx,
         tracked_wallet_token_accounts: parking_lot::RwLock::new(std::collections::HashSet::new()),
@@ -8503,6 +8565,7 @@ async fn main() -> Result<()> {
         last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
         bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
         pump_amm_dex: parking_lot::RwLock::new(None),
+        cold_path_rpc: parking_lot::RwLock::new(None),
         helius_rpc,
         geyser_sync_batch_timer: parking_lot::Mutex::new(None),
         geyser_sync_flush_timestamps: parking_lot::Mutex::new(Vec::new()),
@@ -10053,6 +10116,7 @@ async fn run_geyser_loop(
     pump_inner.set_bounded_tx_fallback_rpc(ctx.helius_rpc.clone());
     let pump_amm_dex = Arc::new(pump_inner);
     *ctx.pump_amm_dex.write() = Some(Arc::clone(&pump_amm_dex));
+    *ctx.cold_path_rpc.write() = Some(Arc::clone(&rpc));
 
     // Phase-R-R2: single-writer `md-track-worker` OS thread (before wallet snapshot — wallet path enqueues).
     let track_worker = spawn_track_worker(Arc::clone(&ctx));
@@ -11530,6 +11594,7 @@ async fn run_simulation_loop(
         std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
     let rpc = Arc::new(SolanaRpc::new(&rpc_url));
     info!(rpc_url = %rpc_url, "Simulation mode: RPC client for ControlRequest Discovery");
+    *ctx.cold_path_rpc.write() = Some(Arc::clone(&rpc));
 
     // I-24d: Subscribe to ControlRequests (same contract as Normalmodus)
     let mut control_subscription = if let Some(ref nats) = ctx.nats {
@@ -12057,6 +12122,8 @@ mod discovery_tests {
         let bids = Pubkey::new_unique();
         let asks = Pubkey::new_unique();
         let eq = Pubkey::new_unique();
+        let serum_base_vault = Pubkey::new_unique();
+        let serum_quote_vault = Pubkey::new_unique();
 
         const DISCOVERY_SLOT: u64 = 100;
         const VAULT_SLOT: u64 = 9_999;
@@ -12076,12 +12143,21 @@ mod discovery_tests {
                 serum_bids: None,
                 serum_asks: None,
                 serum_event_queue: None,
+                serum_base_vault: None,
+                serum_quote_vault: None,
             }),
             DISCOVERY_SLOT,
         );
         cache.update_vault_balance(&coin_vault, 10, VAULT_SLOT);
         cache.update_vault_balance(&pc_vault, 20, VAULT_SLOT);
-        cache.set_raydium_serum_accounts(&pool, bids, asks, eq);
+        cache.set_raydium_serum_accounts(
+            &pool,
+            bids,
+            asks,
+            eq,
+            Some(serum_base_vault),
+            Some(serum_quote_vault),
+        );
 
         let (_, cache_slot, _) = cache.get_with_metadata(&pool).expect("pool in cache");
         assert_eq!(
@@ -13078,6 +13154,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             high_priority_bonding_curves: parking_lot::RwLock::new(HashSet::new()),
             raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            raydium_serum_inflight: parking_lot::RwLock::new(std::collections::HashSet::new()),
             tracked_wallet: None,
             tracked_wallet_tx,
             tracked_wallet_token_accounts: parking_lot::RwLock::new(
@@ -13088,6 +13165,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
             bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
             pump_amm_dex: parking_lot::RwLock::new(None),
+            cold_path_rpc: parking_lot::RwLock::new(None),
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
             geyser_sync_flush_timestamps: parking_lot::Mutex::new(Vec::new()),
@@ -13312,6 +13390,7 @@ mod wallet_tx_meta_balance_tests {
             pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             high_priority_bonding_curves: parking_lot::RwLock::new(HashSet::new()),
             raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            raydium_serum_inflight: parking_lot::RwLock::new(std::collections::HashSet::new()),
             tracked_wallet: Some(tracked),
             tracked_wallet_tx,
             tracked_wallet_token_accounts: parking_lot::RwLock::new(
@@ -13322,6 +13401,7 @@ mod wallet_tx_meta_balance_tests {
             last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
             bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
             pump_amm_dex: parking_lot::RwLock::new(None),
+            cold_path_rpc: parking_lot::RwLock::new(None),
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
             geyser_sync_flush_timestamps: parking_lot::Mutex::new(Vec::new()),
@@ -14920,6 +15000,7 @@ mod pr_b_geyser_tracking_tests {
             pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             high_priority_bonding_curves: parking_lot::RwLock::new(HashSet::new()),
             raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            raydium_serum_inflight: parking_lot::RwLock::new(std::collections::HashSet::new()),
             tracked_wallet,
             tracked_wallet_tx,
             tracked_wallet_token_accounts: parking_lot::RwLock::new(wallet_token_accounts),
@@ -14928,6 +15009,7 @@ mod pr_b_geyser_tracking_tests {
             last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
             bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
             pump_amm_dex: parking_lot::RwLock::new(None),
+            cold_path_rpc: parking_lot::RwLock::new(None),
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
             geyser_sync_flush_timestamps: parking_lot::Mutex::new(Vec::new()),
@@ -15004,6 +15086,7 @@ mod pr_b_geyser_tracking_tests {
             pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             high_priority_bonding_curves: parking_lot::RwLock::new(HashSet::new()),
             raydium_serum_fetched: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            raydium_serum_inflight: parking_lot::RwLock::new(std::collections::HashSet::new()),
             tracked_wallet: None,
             tracked_wallet_tx,
             tracked_wallet_token_accounts: parking_lot::RwLock::new(
@@ -15014,6 +15097,7 @@ mod pr_b_geyser_tracking_tests {
             last_emitted_curve_progress: parking_lot::RwLock::new(std::collections::HashMap::new()),
             bonding_curve_publish_times: parking_lot::Mutex::new(BondingCurvePublishTimes::new()),
             pump_amm_dex: parking_lot::RwLock::new(None),
+            cold_path_rpc: parking_lot::RwLock::new(None),
             helius_rpc: None,
             geyser_sync_batch_timer: parking_lot::Mutex::new(None),
             geyser_sync_flush_timestamps: parking_lot::Mutex::new(Vec::new()),
@@ -21149,8 +21233,8 @@ mod pr_b_geyser_tracking_tests {
             .next()
             .expect("production + inline helpers before test modules");
         assert!(
-            !code_src.contains("cold_path_rpc: parking_lot::RwLock"),
-            "MarketDataContext must not carry arb-pin cold_path_rpc"
+            code_src.contains("cold_path_rpc: parking_lot::RwLock"),
+            "FIX-29 serum backfill requires cold_path_rpc on MarketDataContext"
         );
         assert!(
             !code_src.contains("arb_pin_ensure_debounce"),

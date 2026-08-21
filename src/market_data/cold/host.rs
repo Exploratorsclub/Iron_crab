@@ -4,6 +4,7 @@ use crate::execution::live_pool_cache::LivePoolCache;
 use crate::ipc::{ControlResponse, ControlResponseStatus};
 use crate::nats::topics::TOPIC_CONTROL_RESPONSES;
 use crate::nats::NatsClient;
+use crate::solana::rpc::SolanaRpc;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -17,6 +18,13 @@ pub trait ColdHost: Send + Sync {
     fn live_pool_cache(&self) -> &LivePoolCache;
     fn live_pool_cache_arc(&self) -> Arc<LivePoolCache>;
     fn raydium_serum_fetched_insert(&self, pool_addr: Pubkey);
+    /// True when a prior backfill completed with full static Serum layout in cache.
+    fn raydium_serum_fetched_contains(&self, pool_addr: Pubkey) -> bool;
+    /// Claim one in-flight serum backfill for `pool_addr` (false if already claimed or complete).
+    fn raydium_serum_fetched_try_claim(&self, pool_addr: Pubkey) -> bool;
+    /// Release claim after incomplete backfill so a later upsert can retry.
+    fn raydium_serum_fetched_remove(&self, pool_addr: Pubkey);
+    fn cold_path_rpc(&self) -> Option<Arc<SolanaRpc>>;
 }
 
 pub(crate) async fn publish_control_response(

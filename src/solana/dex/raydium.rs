@@ -7,11 +7,13 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::{Dex, Quote};
-use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
+use crate::execution::live_pool_cache::{CachedPoolState, RaydiumAmmState, SharedLivePoolCache};
 
 /// Re-export: conservative [`crate::ipc::DexPoolReadiness`] for Raydium AMM v4 pool cache / JetStream
 /// (static Serum accounts + both-side liquidity; reserves alone are never `Ready`).
-pub use crate::execution::live_pool_cache::raydium_amm_readiness_for_pool_cache_update;
+pub use crate::execution::live_pool_cache::{
+    raydium_amm_readiness_for_pool_cache_update, raydium_amm_serum_static_accounts_ready,
+};
 use crate::solana::rpc::SolanaRpc;
 use dashmap::DashMap;
 #[cfg(feature = "rpc_fallback")]
@@ -111,6 +113,9 @@ pub struct PoolSnapshot {
     pub serum_base_vault: Option<Pubkey>,
     pub serum_quote_vault: Option<Pubkey>,
 }
+
+/// Serum/OpenBook static accounts for a Raydium AMM pool.
+pub type RaydiumSerumAccounts = (Pubkey, Pubkey, Pubkey, Option<Pubkey>, Option<Pubkey>);
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -306,6 +311,10 @@ impl Raydium {
     /// Serum accounts are optional - if not provided, they'll be fetched via RPC.
     /// Vault reserves (`coin_reserve` / `pc_reserve`) populate `SimplePool` for `quote_exact_in`;
     /// use `None` when unknown (quotes skip zero-reserve pools).
+    ///
+    /// Stable 13-arg surface for Eval / external call sites; serum market vault pubkeys
+    /// default to `None`. Use [`Self::inject_cached_amm_state_with_serum_vaults`] or
+    /// [`Self::inject_raydium_amm_from_live_cache`] when vaults are known from cache.
     #[allow(clippy::too_many_arguments)]
     pub fn inject_cached_amm_state(
         &self,
@@ -322,6 +331,45 @@ impl Raydium {
         serum_bids: Option<Pubkey>,
         serum_asks: Option<Pubkey>,
         serum_event_queue: Option<Pubkey>,
+    ) {
+        self.inject_cached_amm_state_with_serum_vaults(
+            pool_address,
+            base_mint,
+            quote_mint,
+            base_vault,
+            quote_vault,
+            _base_decimals,
+            _quote_decimals,
+            coin_reserve,
+            pc_reserve,
+            market_id,
+            serum_bids,
+            serum_asks,
+            serum_event_queue,
+            None,
+            None,
+        );
+    }
+
+    /// Like [`Self::inject_cached_amm_state`] but also injects optional Serum market vault pubkeys.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inject_cached_amm_state_with_serum_vaults(
+        &self,
+        pool_address: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        base_vault: Pubkey,
+        quote_vault: Pubkey,
+        _base_decimals: u8,
+        _quote_decimals: u8,
+        coin_reserve: Option<u64>,
+        pc_reserve: Option<u64>,
+        market_id: Pubkey,
+        serum_bids: Option<Pubkey>,
+        serum_asks: Option<Pubkey>,
+        serum_event_queue: Option<Pubkey>,
+        serum_base_vault: Option<Pubkey>,
+        serum_quote_vault: Option<Pubkey>,
     ) {
         // Derive PDAs (same as load_pool_from_rpc_fallback)
         let (amm_auth, _) = Self::derive_amm_authority();
@@ -354,8 +402,8 @@ impl Raydium {
             serum_bids,
             serum_asks,
             serum_event_queue,
-            serum_base_vault: None, // Will be fetched if needed
-            serum_quote_vault: None,
+            serum_base_vault,
+            serum_quote_vault,
         };
 
         // Insert into pools cache
@@ -380,11 +428,40 @@ impl Raydium {
         );
     }
 
+    /// Inject full Raydium AMM row from LivePoolCache (Cross-DEX / EE hot path).
+    pub fn inject_raydium_amm_from_live_cache(&self, pool_address: Pubkey, s: &RaydiumAmmState) {
+        self.inject_cached_amm_state_with_serum_vaults(
+            pool_address,
+            s.base_mint,
+            s.quote_mint,
+            s.coin_vault,
+            s.pc_vault,
+            s.base_decimals,
+            s.quote_decimals,
+            s.coin_reserve,
+            s.pc_reserve,
+            s.market_id,
+            s.serum_bids,
+            s.serum_asks,
+            s.serum_event_queue,
+            s.serum_base_vault,
+            s.serum_quote_vault,
+        );
+    }
+
+    /// Returns true when static Serum/OpenBook accounts required for swap IX building
+    /// are present in LivePoolCache (matches `build_swap_ix` serum account requirements).
+    pub fn raydium_amm_serum_accounts_ready_in_cache(s: &RaydiumAmmState) -> bool {
+        raydium_amm_serum_static_accounts_ready(s)
+    }
+
     /// Get Serum/OpenBook accounts for a cached pool (if populated).
-    pub fn get_serum_accounts(&self, pool_address: &Pubkey) -> Option<(Pubkey, Pubkey, Pubkey)> {
+    pub fn get_serum_accounts(&self, pool_address: &Pubkey) -> Option<RaydiumSerumAccounts> {
         let pool = self.pools.get(pool_address)?;
         match (pool.serum_bids, pool.serum_asks, pool.serum_event_queue) {
-            (Some(b), Some(a), Some(eq)) => Some((b, a, eq)),
+            (Some(b), Some(a), Some(eq)) => {
+                Some((b, a, eq, pool.serum_base_vault, pool.serum_quote_vault))
+            }
             _ => None,
         }
     }
@@ -666,7 +743,12 @@ impl Raydium {
                 .get(&pool_addr)
                 .ok_or_else(|| anyhow!("pool snapshot missing"))?;
             (
-                pool.serum_bids.is_none() || pool.serum_asks.is_none(),
+                pool.market_id.filter(|m| *m != Pubkey::default()).is_some()
+                    && (pool.serum_bids.is_none()
+                        || pool.serum_asks.is_none()
+                        || pool.serum_event_queue.is_none()
+                        || pool.serum_base_vault.is_none()
+                        || pool.serum_quote_vault.is_none()),
                 pool.reserve_base == 0 || pool.reserve_quote == 0,
             )
         };

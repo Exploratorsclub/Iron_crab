@@ -1,4 +1,6 @@
-use crate::execution::live_pool_cache::{CachedPoolState, MeteoraState, SharedLivePoolCache};
+use crate::execution::live_pool_cache::{
+    raydium_amm_serum_static_accounts_ready, CachedPoolState, MeteoraState, SharedLivePoolCache,
+};
 use crate::ipc::{RejectReason, SwapHop, TradeIntent, TradeSide, NATIVE_SOL_MINT};
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
 use crate::solana::dex::orca::Orca;
@@ -625,7 +627,7 @@ pub async fn build_tx_plan(
             if let Some((state, slot, age_ms)) = cache.get_with_metadata(&pool_id) {
                 match state {
                     CachedPoolState::RaydiumAmm(amm_state) => {
-                        has_serum_from_cache = amm_state.serum_bids.is_some();
+                        has_serum_from_cache = raydium_amm_serum_static_accounts_ready(&amm_state);
                         tracing::debug!(
                             pool = %pool_id,
                             slot,
@@ -633,21 +635,7 @@ pub async fn build_tx_plan(
                             has_serum = has_serum_from_cache,
                             "raydium: using cached pool state"
                         );
-                        raydium.inject_cached_amm_state(
-                            pool_id,
-                            amm_state.base_mint,
-                            amm_state.quote_mint,
-                            amm_state.coin_vault,
-                            amm_state.pc_vault,
-                            amm_state.base_decimals,
-                            amm_state.quote_decimals,
-                            amm_state.coin_reserve,
-                            amm_state.pc_reserve,
-                            amm_state.market_id,
-                            amm_state.serum_bids,
-                            amm_state.serum_asks,
-                            amm_state.serum_event_queue,
-                        );
+                        raydium.inject_raydium_amm_from_live_cache(pool_id, &amm_state);
                         used_cache = true;
                     }
                     _ => {
@@ -692,8 +680,8 @@ pub async fn build_tx_plan(
             }
             // Write back to SLAVE LivePoolCache for subsequent trades
             if let Some(cache) = cache {
-                if let Some((b, a, eq)) = raydium.get_serum_accounts(&pool_id) {
-                    cache.set_raydium_serum_accounts(&pool_id, b, a, eq);
+                if let Some((b, a, eq, bv, qv)) = raydium.get_serum_accounts(&pool_id) {
+                    cache.set_raydium_serum_accounts(&pool_id, b, a, eq, bv, qv);
                 }
             }
         }
@@ -2087,27 +2075,13 @@ async fn build_hop_raydium(
     let mut has_serum_from_cache = false;
     if let Some(cache) = cache {
         if let Some(CachedPoolState::RaydiumAmm(amm_state)) = cache.get(pool_address) {
-            has_serum_from_cache = amm_state.serum_bids.is_some();
+            has_serum_from_cache = raydium_amm_serum_static_accounts_ready(&amm_state);
             tracing::debug!(
                 pool = %pool_address,
                 has_serum = has_serum_from_cache,
                 "multi-hop raydium: using cached pool state"
             );
-            raydium.inject_cached_amm_state(
-                *pool_address,
-                amm_state.base_mint,
-                amm_state.quote_mint,
-                amm_state.coin_vault,
-                amm_state.pc_vault,
-                amm_state.base_decimals,
-                amm_state.quote_decimals,
-                amm_state.coin_reserve,
-                amm_state.pc_reserve,
-                amm_state.market_id,
-                amm_state.serum_bids,
-                amm_state.serum_asks,
-                amm_state.serum_event_queue,
-            );
+            raydium.inject_raydium_amm_from_live_cache(*pool_address, &amm_state);
             used_cache = true;
         }
     }
@@ -2148,8 +2122,8 @@ async fn build_hop_raydium(
         }
         // Write back to SLAVE LivePoolCache for subsequent trades
         if let Some(cache) = cache {
-            if let Some((b, a, eq)) = raydium.get_serum_accounts(pool_address) {
-                cache.set_raydium_serum_accounts(pool_address, b, a, eq);
+            if let Some((b, a, eq, bv, qv)) = raydium.get_serum_accounts(pool_address) {
+                cache.set_raydium_serum_accounts(pool_address, b, a, eq, bv, qv);
             }
         }
     }

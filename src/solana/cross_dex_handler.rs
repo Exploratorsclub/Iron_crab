@@ -178,6 +178,8 @@ pub struct CrossDexHandler {
     rpc: Arc<SolanaRpc>,
     /// DEX connectors by name - used ONLY for build_swap_ix()
     dexes: HashMap<String, Arc<dyn Dex>>,
+    /// Typed Raydium connector for LivePoolCache serum injection (Cross-DEX hot path).
+    raydium: Option<Arc<Raydium>>,
     /// Wallet pubkey (used as user authority / payer)
     wallet_pubkey: Option<Pubkey>,
     /// RPC URL for DEXes that need it directly
@@ -192,6 +194,7 @@ impl CrossDexHandler {
         Self {
             rpc,
             dexes: HashMap::new(),
+            raydium: None,
             wallet_pubkey,
             rpc_url: None,
             pool_cache: None,
@@ -225,7 +228,9 @@ impl CrossDexHandler {
         if let Some(pk) = self.wallet_pubkey {
             raydium.set_user_authority(pk);
         }
-        self.dexes.insert("raydium".to_string(), Arc::new(raydium));
+        let raydium = Arc::new(raydium);
+        self.raydium = Some(Arc::clone(&raydium));
+        self.dexes.insert("raydium".to_string(), raydium);
         info!("Initialized Raydium DEX connector (for IX building only)");
 
         // PumpFun Bonding Curve: EXCLUDED from arb (arb-strategy rejects it).
@@ -696,13 +701,31 @@ impl CrossDexHandler {
                     return true;
                 }
             }
-            ("raydium", CachedPoolState::RaydiumAmm(_)) => {
-                // Raydium uses inject_cached_amm_state via tx_builder
-                // For cross_dex_handler, we just mark as cache available
-                debug!(
+            ("raydium", CachedPoolState::RaydiumAmm(ref amm_state)) => {
+                let Some(raydium) = self.raydium.as_ref() else {
+                    warn!(pool = %pool_pk, "Raydium connector not initialized");
+                    return false;
+                };
+                if !Raydium::raydium_amm_serum_accounts_ready_in_cache(amm_state) {
+                    warn!(
+                        pool = %pool_pk,
+                        dex = %dex,
+                        market_id = %amm_state.market_id,
+                        has_serum_bids = amm_state.serum_bids.is_some(),
+                        has_serum_asks = amm_state.serum_asks.is_some(),
+                        has_serum_event_queue = amm_state.serum_event_queue.is_some(),
+                        "Raydium pool in LivePoolCache but serum layout incomplete — not injecting"
+                    );
+                    return false;
+                }
+                raydium.inject_raydium_amm_from_live_cache(*pool_pk, amm_state);
+                info!(
                     pool = %pool_pk,
                     dex = %dex,
-                    "Raydium pool in cache (injection via tx_builder)"
+                    market_id = %amm_state.market_id,
+                    has_serum_vaults = amm_state.serum_base_vault.is_some()
+                        && amm_state.serum_quote_vault.is_some(),
+                    "Injected Raydium AMM pool state from LivePoolCache (no RPC)"
                 );
                 return true;
             }
@@ -1431,7 +1454,7 @@ impl CrossDexHandler {
                             e
                         )
                     })?;
-            } else if !buy_pool.is_empty() {
+            } else if !buy_pool.is_empty() && buy_dex != "raydium" {
                 let pool_pk = Pubkey::from_str(&buy_pool)
                     .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
 
@@ -1441,6 +1464,17 @@ impl CrossDexHandler {
                          arb-strategy should require DexPoolAccounts before generating intents.",
                         buy_pool,
                         buy_dex
+                    ));
+                }
+            }
+
+            if buy_dex == "raydium" && !buy_pool.is_empty() {
+                let pool_pk = Pubkey::from_str(&buy_pool)
+                    .map_err(|_| anyhow!("Invalid buy pool address: {}", buy_pool))?;
+                if !self.try_inject_from_cache("raydium", &pool_pk, buy_connector) {
+                    return Err(anyhow!(
+                        "RAYDIUM_LAYOUT_NOT_READY: buy pool {} — LivePoolCache miss or serum accounts incomplete in cache",
+                        buy_pool
                     ));
                 }
             }
@@ -1518,7 +1552,7 @@ impl CrossDexHandler {
                             e
                         )
                     })?;
-            } else if !sell_pool.is_empty() {
+            } else if !sell_pool.is_empty() && sell_dex != "raydium" {
                 let pool_pk = Pubkey::from_str(&sell_pool)
                     .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
 
@@ -1528,6 +1562,17 @@ impl CrossDexHandler {
                          arb-strategy should require DexPoolAccounts before generating intents.",
                         sell_pool,
                         sell_dex
+                    ));
+                }
+            }
+
+            if sell_dex == "raydium" && !sell_pool.is_empty() {
+                let pool_pk = Pubkey::from_str(&sell_pool)
+                    .map_err(|_| anyhow!("Invalid sell pool address: {}", sell_pool))?;
+                if !self.try_inject_from_cache("raydium", &pool_pk, sell_connector) {
+                    return Err(anyhow!(
+                        "RAYDIUM_LAYOUT_NOT_READY: sell pool {} — LivePoolCache miss or serum accounts incomplete in cache",
+                        sell_pool
                     ));
                 }
             }
@@ -1603,6 +1648,7 @@ mod tests {
     use super::*;
     use crate::execution::live_pool_cache::{
         CachedPoolState, LivePoolCache, MeteoraState, OrcaWhirlpoolState, PumpAmmState,
+        RaydiumAmmState,
     };
     use crate::ipc::{
         ExplicitAmount, IntentOrigin, IntentTier, RecordHeader, TradeIntent, TradeResources,
@@ -2657,5 +2703,126 @@ mod tests {
     fn cross_dex_non_orca_route_uses_baseline_cu() {
         let cu = CrossDexHandler::estimate_cross_dex_compute_units("meteora_dlmm", "pump_amm");
         assert_eq!(cu, 450_000);
+    }
+
+    fn raydium_amm_cache_state(
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        with_serum: bool,
+    ) -> RaydiumAmmState {
+        RaydiumAmmState {
+            base_mint,
+            quote_mint,
+            coin_vault: Pubkey::new_unique(),
+            pc_vault: Pubkey::new_unique(),
+            base_decimals: 9,
+            quote_decimals: 9,
+            coin_reserve: Some(10_000_000_000),
+            pc_reserve: Some(50_000_000_000),
+            market_id: Pubkey::new_unique(),
+            serum_bids: with_serum.then(Pubkey::new_unique),
+            serum_asks: with_serum.then(Pubkey::new_unique),
+            serum_event_queue: with_serum.then(Pubkey::new_unique),
+            serum_base_vault: with_serum.then(Pubkey::new_unique),
+            serum_quote_vault: with_serum.then(Pubkey::new_unique),
+        }
+    }
+
+    async fn cross_dex_handler_with_raydium(
+        cache: Arc<LivePoolCache>,
+        wallet: Pubkey,
+    ) -> CrossDexHandler {
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mut handler = CrossDexHandler::new(rpc, Some(wallet)).with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes");
+        handler
+    }
+
+    #[tokio::test]
+    async fn cross_dex_raydium_try_inject_with_serum_populates_connector_for_build_swap_ix() {
+        let wallet = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let cache = Arc::new(LivePoolCache::new());
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(raydium_amm_cache_state(token_mint, sol_mint, true)),
+            100,
+        );
+
+        let handler = cross_dex_handler_with_raydium(Arc::clone(&cache), wallet).await;
+        let connector = handler
+            .get_dex("raydium")
+            .expect("raydium connector initialized");
+
+        assert!(
+            handler.try_inject_from_cache("raydium", &pool, &connector),
+            "expected cache hit with serum to inject"
+        );
+
+        let build_err = connector
+            .build_swap_ix_async(SOL_MINT, &token_mint.to_string(), 1_000_000, 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !build_err.contains("serum market accounts not populated"),
+            "inject must populate serum accounts; got: {build_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_dex_raydium_try_inject_without_serum_returns_false() {
+        let wallet = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let cache = Arc::new(LivePoolCache::new());
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(raydium_amm_cache_state(token_mint, sol_mint, false)),
+            100,
+        );
+
+        let handler = cross_dex_handler_with_raydium(cache, wallet).await;
+        let connector = handler.get_dex("raydium").expect("raydium connector");
+
+        assert!(
+            !handler.try_inject_from_cache("raydium", &pool, &connector),
+            "must not fake-hit when serum accounts missing in cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_dex_raydium_inject_path_does_not_use_rpc_serum_fetch() {
+        let wallet = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let cache = Arc::new(LivePoolCache::new());
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(raydium_amm_cache_state(token_mint, sol_mint, true)),
+            100,
+        );
+
+        let handler = cross_dex_handler_with_raydium(cache, wallet).await;
+        let connector = handler.get_dex("raydium").expect("raydium connector");
+        assert!(handler.try_inject_from_cache("raydium", &pool, &connector));
+
+        let build_err = connector
+            .build_swap_ix_async(SOL_MINT, &token_mint.to_string(), 1_000_000, 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !build_err.contains("serum market accounts not populated"),
+            "hot-path inject must not leave serum unpopulated; got: {build_err}"
+        );
+        assert!(
+            !build_err.contains("fetch them first"),
+            "hot-path inject must not defer serum to RPC fetch; got: {build_err}"
+        );
     }
 }

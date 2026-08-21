@@ -4382,21 +4382,7 @@ impl ExecutionContext {
                         }
                     }
                     CachedPoolState::RaydiumAmm(ref s) => {
-                        raydium.inject_cached_amm_state(
-                            pool_addr,
-                            s.base_mint,
-                            s.quote_mint,
-                            s.coin_vault,
-                            s.pc_vault,
-                            s.base_decimals,
-                            s.quote_decimals,
-                            s.coin_reserve,
-                            s.pc_reserve,
-                            s.market_id,
-                            s.serum_bids,
-                            s.serum_asks,
-                            s.serum_event_queue,
-                        );
+                        raydium.inject_raydium_amm_from_live_cache(pool_addr, s);
                         raydium_amm_count += 1;
                     }
                     _ => {}
@@ -4743,21 +4729,8 @@ impl ExecutionContext {
                                         for (pool_addr, st) in
                                             cache.raydium_amm_pools_for_mint(&mint)
                                         {
-                                            raydium.inject_cached_amm_state(
-                                                pool_addr,
-                                                st.base_mint,
-                                                st.quote_mint,
-                                                st.coin_vault,
-                                                st.pc_vault,
-                                                st.base_decimals,
-                                                st.quote_decimals,
-                                                st.coin_reserve,
-                                                st.pc_reserve,
-                                                st.market_id,
-                                                st.serum_bids,
-                                                st.serum_asks,
-                                                st.serum_event_queue,
-                                            );
+                                            raydium
+                                                .inject_raydium_amm_from_live_cache(pool_addr, &st);
                                         }
                                         info!(
                                             mint = %mint,
@@ -6150,21 +6123,7 @@ impl ExecutionContext {
                                 .await
                                 {
                                     for (pool_addr, st) in cache.raydium_amm_pools_for_mint(&mint) {
-                                        raydium.inject_cached_amm_state(
-                                            pool_addr,
-                                            st.base_mint,
-                                            st.quote_mint,
-                                            st.coin_vault,
-                                            st.pc_vault,
-                                            st.base_decimals,
-                                            st.quote_decimals,
-                                            st.coin_reserve,
-                                            st.pc_reserve,
-                                            st.market_id,
-                                            st.serum_bids,
-                                            st.serum_asks,
-                                            st.serum_event_queue,
-                                        );
+                                        raydium.inject_raydium_amm_from_live_cache(pool_addr, &st);
                                     }
                                     info!(
                                         request_id = %request_id,
