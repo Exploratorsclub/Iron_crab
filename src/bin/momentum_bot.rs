@@ -465,6 +465,8 @@ struct MomentumConfig {
     dev_sell_revalidation_delay_secs: u64,
     /// Max seconds in `WaitHotSet` awaiting fresh vault reserves before unpin (I-MD-9). Default: 45
     wait_hot_set_timeout_secs: u64,
+    /// Additional bounded hold while hot-set registration is incomplete (I-MD-9). Default: 30
+    wait_hot_set_incomplete_grace_secs: u64,
 
     // === Token Safety: Mint/Freeze Authority ===
     /// Require mint authority to be renounced (mint_authority == None) before entering.
@@ -591,6 +593,7 @@ impl Default for MomentumConfig {
             // Dev-Sell Re-Validation
             dev_sell_revalidation_delay_secs: 30,
             wait_hot_set_timeout_secs: 45,
+            wait_hot_set_incomplete_grace_secs: 30,
 
             // Token Safety
             require_mint_authority_renounced: false,
@@ -681,6 +684,7 @@ impl MomentumConfig {
             max_single_dump_lamports: cfg.max_single_dump_lamports,
             dev_sell_revalidation_delay_secs: cfg.dev_sell_revalidation_delay_secs,
             wait_hot_set_timeout_secs: cfg.wait_hot_set_timeout_secs,
+            wait_hot_set_incomplete_grace_secs: cfg.wait_hot_set_incomplete_grace_secs,
             require_mint_authority_renounced: cfg.require_mint_authority_renounced,
             require_freeze_authority_none: cfg.require_freeze_authority_none,
             top1_buyer_share_cap: cfg.top1_buyer_share_cap,
@@ -4140,6 +4144,25 @@ impl MomentumContext {
         }
     }
 
+    /// I-MD-9: vault/layout registration still in flight (no usable hot-set quote yet).
+    fn wait_hot_registration_incomplete(&self, pool: &str, probe_lamports: u64) -> bool {
+        matches!(
+            self.entry_hot_set_fresh_reason(pool, probe_lamports),
+            Err(ironcrab::metrics::MomentumEntryHotFreshFailReason::Missing
+                | ironcrab::metrics::MomentumEntryHotFreshFailReason::Quote)
+        )
+    }
+
+    fn wait_hot_set_effective_timeout_secs(config: &MomentumConfig, incomplete: bool) -> u64 {
+        if incomplete {
+            config
+                .wait_hot_set_timeout_secs
+                .saturating_add(config.wait_hot_set_incomplete_grace_secs)
+        } else {
+            config.wait_hot_set_timeout_secs
+        }
+    }
+
     /// A.2: Normalize DEX names for execution-engine compatibility (pumpswap/PumpFunAmm → pump_amm)
     fn normalize_dex_for_execution_engine(dex: &str) -> String {
         match dex {
@@ -5815,18 +5838,27 @@ impl MomentumContext {
                     let tracker = trackers.get_mut(key).expect("tracker key from iteration");
                     let was_wait_hot_set = matches!(tracker.state, TrackerState::WaitHotSet { .. });
                     let was_not_rejected = tracker.was_not_rejected();
+                    let registration_incomplete =
+                        self.wait_hot_registration_incomplete(tracker.pool.as_str(), probe_sol);
+                    let effective_timeout_secs =
+                        Self::wait_hot_set_effective_timeout_secs(config, registration_incomplete);
                     let wait_hot_timed_out = matches!(
                         tracker.state,
                         TrackerState::WaitHotSet { entered_at }
                             if wall_now.duration_since(entered_at)
-                                > Duration::from_secs(config.wait_hot_set_timeout_secs)
+                                > Duration::from_secs(effective_timeout_secs)
                     );
                     if wait_hot_timed_out {
                         if let TrackerState::WaitHotSet { entered_at } = tracker.state {
                             let duration_ms =
                                 wall_now.duration_since(entered_at).as_millis() as u64;
+                            let exit_reason = if registration_incomplete {
+                                ironcrab::metrics::MomentumWaitHotSetExitReason::TimeoutIncompleteGrace
+                            } else {
+                                ironcrab::metrics::MomentumWaitHotSetExitReason::Timeout
+                            };
                             ironcrab::metrics::record_momentum_wait_hot_set_exit(
-                                ironcrab::metrics::MomentumWaitHotSetExitReason::Timeout,
+                                exit_reason,
                                 duration_ms,
                             );
                         }
@@ -21057,6 +21089,7 @@ mod tests {
             c.small_buy_ratio_cap = 1.0;
             c.min_token_age_secs = 0;
             c.wait_hot_set_timeout_secs = 1;
+            c.wait_hot_set_incomplete_grace_secs = 0;
             c
         };
 
@@ -21130,13 +21163,196 @@ mod tests {
         );
         assert_eq!(
             wait_hot_set_test_counters::wait_hot_set_exit_timeout_total(),
+            0,
+            "timeout without hot cache must not use plain timeout reason"
+        );
+        assert_eq!(
+            wait_hot_set_test_counters::wait_hot_set_exit_timeout_incomplete_grace_total(),
             1,
-            "timeout must record wait_hot_set exit reason=timeout"
+            "timeout without hot cache must record incomplete grace exit"
         );
         assert_eq!(
             wait_hot_set_test_counters::wait_hot_set_duration_count(),
             1,
             "timeout must record wait_hot_set duration histogram sample"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wait_hot_set_incomplete_grace_holds_pin_before_expiry() {
+        use ironcrab::metrics::wait_hot_set_test_counters;
+        wait_hot_set_test_counters::reset();
+
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_min = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
+            c.wait_hot_set_timeout_secs = 2;
+            c.wait_hot_set_incomplete_grace_secs = 30;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintWaitHotGraceHold888888888888888888888888";
+        let pool = "poolWaitHotGraceHold888888888888888888888888";
+        let sk = MomentumContext::tracker_storage_key(mint, pool);
+
+        assert!(ctx.get_or_create_tracker(mint, pool, "raydium", 1, 10_000_000_000));
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers.get_mut(&sk).expect("tracker");
+            for i in 0..20 {
+                tr.record_trade(
+                    &format!("buy{i:03}"),
+                    true,
+                    200_000_000,
+                    2_000_000,
+                    &format!("sig{i:03}"),
+                    1 + i as u64,
+                    &cfg,
+                );
+            }
+        }
+
+        let _ = ctx.check_for_signals();
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers.get_mut(&sk).expect("tracker");
+            if let TrackerState::WaitHotSet { entered_at } = &mut tr.state {
+                *entered_at = Instant::now() - Duration::from_secs(5);
+            }
+        }
+
+        let signals = ctx.check_for_signals();
+        assert!(signals.is_empty(), "incomplete grace must not emit intent");
+        assert!(
+            ctx.token_trackers
+                .read()
+                .get(&sk)
+                .is_some_and(|t| matches!(t.state, TrackerState::WaitHotSet { .. })),
+            "incomplete registration must hold WaitHotSet before grace expiry"
+        );
+        assert!(
+            ctx.momentum_active_pool_publish_queue
+                .lock()
+                .removed
+                .is_empty(),
+            "incomplete grace must not unpin before expiry"
+        );
+        assert_eq!(
+            wait_hot_set_test_counters::wait_hot_set_exit_timeout_total(),
+            0,
+            "must not record timeout before grace expiry"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wait_hot_set_incomplete_grace_expires_unpins() {
+        use ironcrab::metrics::wait_hot_set_test_counters;
+        wait_hot_set_test_counters::reset();
+
+        let cfg = {
+            let mut c = MomentumConfig::default();
+            c.default_position_lamports = 1_000;
+            c.probe_buy_pct = 0.25;
+            c.early_min_liquidity_sol = 0.0;
+            c.min_unique_buyers = 0;
+            c.min_trades_per_min = 0.0;
+            c.min_buy_dominance = 0.0;
+            c.min_sol_inflow_lamports = 0;
+            c.require_mint_authority_renounced = false;
+            c.require_freeze_authority_none = false;
+            c.top1_buyer_share_cap = 1.0;
+            c.top3_buyer_share_cap = 1.0;
+            c.repeat_buyer_min_ratio = 0.0;
+            c.min_trade_size_lamports = 0;
+            c.small_buy_ratio_cap = 1.0;
+            c.min_token_age_secs = 0;
+            c.wait_hot_set_timeout_secs = 1;
+            c.wait_hot_set_incomplete_grace_secs = 2;
+            c
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let jsonl_writer = test_queued_jsonl_writer(tmp.path());
+        let ctx = empty_test_context(jsonl_writer);
+        *ctx.config.write() = cfg.clone();
+
+        let mint = "MintWaitHotGraceExp88888888888888888888888888";
+        let pool = "poolWaitHotGraceExp88888888888888888888888888";
+        let sk = MomentumContext::tracker_storage_key(mint, pool);
+
+        assert!(ctx.get_or_create_tracker(mint, pool, "raydium", 1, 10_000_000_000));
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers.get_mut(&sk).expect("tracker");
+            for i in 0..20 {
+                tr.record_trade(
+                    &format!("buy{i:03}"),
+                    true,
+                    200_000_000,
+                    2_000_000,
+                    &format!("sig{i:03}"),
+                    1 + i as u64,
+                    &cfg,
+                );
+            }
+        }
+
+        let _ = ctx.check_for_signals();
+        {
+            let mut trackers = ctx.token_trackers.write();
+            let tr = trackers.get_mut(&sk).expect("tracker");
+            if let TrackerState::WaitHotSet { entered_at } = &mut tr.state {
+                *entered_at = Instant::now() - Duration::from_secs(5);
+            }
+        }
+
+        let signals = ctx.check_for_signals();
+        assert!(signals.is_empty(), "grace expiry must not emit intent");
+        assert!(
+            ctx.token_trackers
+                .read()
+                .get(&sk)
+                .is_some_and(|t| matches!(t.state, TrackerState::Validation)),
+            "grace expiry should revert to Validation"
+        );
+        assert!(
+            ctx.momentum_active_pool_publish_queue
+                .lock()
+                .removed
+                .iter()
+                .any(|r| r.reason == "hot_set_timeout"),
+            "grace expiry must publish removed hot_set_timeout"
+        );
+        assert_eq!(
+            wait_hot_set_test_counters::wait_hot_set_exit_timeout_total(),
+            0,
+            "grace expiry must not use plain timeout reason"
+        );
+        assert_eq!(
+            wait_hot_set_test_counters::wait_hot_set_exit_timeout_incomplete_grace_total(),
+            1,
+            "grace expiry must record timeout_incomplete_grace reason"
         );
     }
 

@@ -1318,6 +1318,9 @@ pub static MARKET_DATA_ARB_ADMISSION_REJECTED_TOTAL: Lazy<AtomicU64> =
 /// C1b: arb pins with incomplete vault/bin Geyser registration (gauge).
 pub static MARKET_DATA_ARB_PIN_REGISTRATION_INCOMPLETE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// C1b: momentum pins with incomplete vault/bin Geyser registration (gauge).
+pub static MARKET_DATA_MOMENTUM_PIN_REGISTRATION_INCOMPLETE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// C1b: arb shed skipped Must-hot (quote_ready / executable) owner groups.
 pub static MARKET_DATA_ARB_SHED_SKIPPED_MUST_HOT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1662,6 +1665,11 @@ pub fn inc_market_data_arb_admission_rejected_total() {
 #[inline]
 pub fn set_market_data_arb_pin_registration_incomplete_gauge(n: usize) {
     MARKET_DATA_ARB_PIN_REGISTRATION_INCOMPLETE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_momentum_pin_registration_incomplete_gauge(n: usize) {
+    MARKET_DATA_MOMENTUM_PIN_REGISTRATION_INCOMPLETE.store(n as u64, Ordering::Relaxed);
 }
 
 #[inline]
@@ -3978,6 +3986,7 @@ pub fn inc_momentum_wait_hot_set_enter_total() {
 pub enum MomentumWaitHotSetExitReason {
     Intent,
     Timeout,
+    TimeoutIncompleteGrace,
     FilterFailed,
 }
 
@@ -3986,6 +3995,9 @@ pub fn record_momentum_wait_hot_set_exit(reason: MomentumWaitHotSetExitReason, d
     let counter = match reason {
         MomentumWaitHotSetExitReason::Intent => &*MOMENTUM_WAIT_HOT_SET_EXIT_INTENT,
         MomentumWaitHotSetExitReason::Timeout => &*MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT,
+        MomentumWaitHotSetExitReason::TimeoutIncompleteGrace => {
+            &*MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT_INCOMPLETE_GRACE
+        }
         MomentumWaitHotSetExitReason::FilterFailed => &*MOMENTUM_WAIT_HOT_SET_EXIT_FILTER_FAILED,
     };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -4052,6 +4064,8 @@ static MOMENTUM_ENTRY_HOT_FRESH_FAIL_TOTAL: Lazy<RwLock<HashMap<String, u64>>> =
 static MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 static MOMENTUM_WAIT_HOT_SET_EXIT_INTENT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 static MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT_INCOMPLETE_GRACE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 static MOMENTUM_WAIT_HOT_SET_EXIT_FILTER_FAILED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 static MOMENTUM_WAIT_HOT_SET_DURATION_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
     EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS
@@ -4085,6 +4099,7 @@ pub mod wait_hot_set_test_counters {
         MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL.store(0, Ordering::Relaxed);
         MOMENTUM_WAIT_HOT_SET_EXIT_INTENT.store(0, Ordering::Relaxed);
         MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT.store(0, Ordering::Relaxed);
+        MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT_INCOMPLETE_GRACE.store(0, Ordering::Relaxed);
         MOMENTUM_WAIT_HOT_SET_EXIT_FILTER_FAILED.store(0, Ordering::Relaxed);
         MOMENTUM_WAIT_HOT_SET_DURATION_MS_COUNT.store(0, Ordering::Relaxed);
         MOMENTUM_INTENT_PATH_IMMEDIATE_HOT.store(0, Ordering::Relaxed);
@@ -4118,6 +4133,10 @@ pub mod wait_hot_set_test_counters {
 
     pub fn wait_hot_set_exit_timeout_total() -> u64 {
         MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT.load(Ordering::Relaxed)
+    }
+
+    pub fn wait_hot_set_exit_timeout_incomplete_grace_total() -> u64 {
+        MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT_INCOMPLETE_GRACE.load(Ordering::Relaxed)
     }
 
     pub fn wait_hot_set_duration_count() -> u64 {
@@ -8679,6 +8698,10 @@ async fn metrics_response() -> Response<Body> {
         MARKET_DATA_ARB_PIN_REGISTRATION_INCOMPLETE.load(Ordering::Relaxed)
     );
     line!(
+        "market_data_momentum_pin_registration_incomplete",
+        MARKET_DATA_MOMENTUM_PIN_REGISTRATION_INCOMPLETE.load(Ordering::Relaxed)
+    );
+    line!(
         "market_data_arb_shed_skipped_must_hot_total{reason=\"must_hot\"}",
         MARKET_DATA_ARB_SHED_SKIPPED_MUST_HOT_TOTAL.load(Ordering::Relaxed)
     );
@@ -10211,6 +10234,13 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("momentum_wait_hot_set_exit_total{reason=\"timeout\"} ");
     out.push_str(
         &MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_wait_hot_set_exit_total{reason=\"timeout_incomplete_grace\"} ");
+    out.push_str(
+        &MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT_INCOMPLETE_GRACE
             .load(Ordering::Relaxed)
             .to_string(),
     );

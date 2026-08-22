@@ -172,6 +172,7 @@ use ironcrab::metrics::{
     set_market_data_geyser_explicit_cap_overflow, set_market_data_geyser_explicit_set_size,
     set_market_data_geyser_merge_pending, set_market_data_geyser_sync_pending,
     set_market_data_hot_pool_registry_pools_gauge, set_market_data_momentum_active_pool_pins_gauge,
+    set_market_data_momentum_pin_registration_incomplete_gauge,
     set_market_data_tracked_bin_arrays_arb_gauge, set_market_data_tracked_bin_arrays_gauge,
     set_market_data_tracked_bin_arrays_momentum_gauge, set_market_data_tx_broadcast_queue_depth,
     set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
@@ -689,18 +690,40 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
     }
 
     fn maybe_retry_deferred_hot_pool_reserves_on_cache_fill(&self, pool: &Pubkey) {
-        if self
+        if !self.ctx.hot_pool_registry.is_hot_pool(*pool) {
+            return;
+        }
+        if self.ctx.live_pool_cache.get(pool).is_none() {
+            return;
+        }
+        if self.ctx.hot_pool_reserve_registration_satisfied(*pool) {
+            let _ = self
+                .ctx
+                .maybe_clear_deferred_hot_pool_reserve_if_satisfied(*pool);
+            return;
+        }
+        if !self
             .ctx
             .deferred_hot_pool_reserve_pins
             .read()
             .contains_key(pool)
         {
-            ironcrab::metrics::inc_market_data_deferred_retry_pool_state_fill_total();
-            let _ = track_worker_try_enqueue(
-                &self.track_worker,
-                TrackWorkerCommand::RetryDeferredHotPoolReserves,
+            let pin = if self.ctx.hot_pool_registry.pool_has_momentum(*pool) {
+                GeyserPinReason::MomentumActive
+            } else {
+                GeyserPinReason::ArbMultiDex
+            };
+            self.ctx.note_deferred_hot_pool_reserve_registration(
+                *pool,
+                pin,
+                "live_pool_cache_fill",
             );
         }
+        ironcrab::metrics::inc_market_data_deferred_retry_pool_state_fill_total();
+        let _ = track_worker_try_enqueue(
+            &self.track_worker,
+            TrackWorkerCommand::RetryDeferredHotPoolReserves,
+        );
     }
 
     fn maybe_spawn_raydium_serum_cold_backfill(&self, pool: Pubkey, state: &RaydiumAmmState) {
@@ -4153,6 +4176,8 @@ impl MarketDataContext {
         set_market_data_hot_pool_registry_pools_gauge("both", 0);
         set_market_data_momentum_active_pool_pins_gauge(self.hot_pool_registry.pair_count());
         set_market_data_arb_pinned_pools_gauge(arb);
+        self.refresh_arb_pin_registration_incomplete_gauge();
+        self.refresh_momentum_pin_registration_incomplete_gauge();
         self.refresh_enrichment_registry_gauge();
         self.hot_pool_registry.refresh_hot_pool_pubkeys_snapshot();
         self.refresh_exec_hot_membership_snapshot();
@@ -5546,6 +5571,20 @@ impl MarketDataContext {
         set_market_data_arb_pin_registration_incomplete_gauge(incomplete);
     }
 
+    /// C1b (momentum): gauge momentum pins with incomplete vault/bin Geyser registration.
+    fn refresh_momentum_pin_registration_incomplete_gauge(&self) {
+        let incomplete = self
+            .hot_pool_registry
+            .snapshot_hot_pool_pubkeys()
+            .into_iter()
+            .filter(|pool| {
+                self.hot_pool_registry.pool_has_momentum(*pool)
+                    && !self.hot_pool_reserve_registration_satisfied(*pool)
+            })
+            .count();
+        set_market_data_momentum_pin_registration_incomplete_gauge(incomplete);
+    }
+
     /// C1c: gauge vault rows pinned for arb multi-dex tracking.
     fn refresh_arb_tracked_vaults_gauge(&self) {
         let count = self
@@ -6032,6 +6071,7 @@ impl MarketDataContext {
             self.refresh_geyser_pins_gauge();
         }
         set_market_data_momentum_active_pool_pins_gauge(self.hot_pool_registry.pair_count());
+        self.refresh_momentum_pin_registration_incomplete_gauge();
         batch_dirty
     }
 
@@ -21972,6 +22012,24 @@ mod pr_b_geyser_tracking_tests {
         let host = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
 
         let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve: pool,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                real_sol_reserves: 10_000_000_000,
+                real_token_reserves: 500_000_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: false,
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(mint, pool);
         ctx.deferred_hot_pool_reserve_pins.write().insert(
             pool,
             DeferredHotPoolReserve {
@@ -21985,6 +22043,63 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL.load(Ordering::Relaxed) > retry_before,
             "fill-wake must increment deferred_retry_pool_state_fill for deferred pools"
+        );
+    }
+
+    /// Fill-wake: hot-pinned pool with cache layout but no deferred row still enqueues retry.
+    #[test]
+    fn fill_wake_enqueues_retry_for_hot_pool_without_deferred_entry() {
+        use ironcrab::market_data::sidefx::SidefxWorkerHost;
+        use ironcrab::metrics::MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = Arc::new(minimal_market_data_context_for_pr_d_tests(jsonl));
+        let (md_state, _, _) = test_md_state_sender_no_worker();
+        let host = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpFun(PumpFunState {
+                token_mint: mint,
+                bonding_curve: pool,
+                associated_bonding_curve: Pubkey::new_unique(),
+                virtual_sol_reserves: 30_000_000_000,
+                virtual_token_reserves: 1_073_000_000_000_000,
+                real_sol_reserves: 10_000_000_000,
+                real_token_reserves: 500_000_000_000_000,
+                complete: false,
+                creator: Pubkey::new_unique(),
+                cashback_enabled: false,
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(mint, pool);
+        assert!(
+            !ctx.deferred_hot_pool_reserve_pins
+                .read()
+                .contains_key(&pool),
+            "test precond: no deferred row before fill-wake"
+        );
+        assert!(
+            !ctx.hot_pool_reserve_registration_satisfied(pool),
+            "test precond: registration incomplete before explicit sync"
+        );
+
+        let retry_before = MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL.load(Ordering::Relaxed);
+        host.maybe_retry_deferred_hot_pool_reserves_on_cache_fill(&pool);
+        assert!(
+            MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL.load(Ordering::Relaxed) > retry_before,
+            "fill-wake must enqueue retry for hot pool with cache layout even without deferred row"
+        );
+        assert!(
+            ctx.deferred_hot_pool_reserve_pins
+                .read()
+                .contains_key(&pool),
+            "fill-wake must note deferred registration for retry worker"
         );
     }
 
