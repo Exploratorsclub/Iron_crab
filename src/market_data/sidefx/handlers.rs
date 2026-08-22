@@ -1088,6 +1088,16 @@ pub fn md_sidefx_process_pump_amm_trade(host: &dyn SidefxWorkerHost, job: &MdSid
             );
         }
     }
+    if host.is_hot_pool(pool_address) {
+        host.apply_tx_pool_accounts_for_hot_pool(
+            *pool_address,
+            DexType::PumpFunAmm,
+            *base_mint_pk,
+            Pubkey::from_str(&quote_mint).unwrap_or_default(),
+            pool_accounts,
+            *slot,
+        );
+    }
 }
 
 pub fn md_sidefx_process_generic_dex_first_trade(
@@ -1111,7 +1121,7 @@ pub fn md_sidefx_process_generic_dex_first_trade(
         return;
     }
     let is_first_trade = host.known_trade_dex_pools_insert(*pool_address);
-    if !is_first_trade {
+    if !is_first_trade && !host.is_hot_pool(pool_address) {
         return;
     }
     let accounts_event = MarketEvent::new(
@@ -1140,6 +1150,16 @@ pub fn md_sidefx_process_generic_dex_first_trade(
                 cold_path: false,
                 segment: MarketDataLatencySegment::Other,
             }),
+        );
+    }
+    if host.is_hot_pool(pool_address) {
+        host.apply_tx_pool_accounts_for_hot_pool(
+            *pool_address,
+            *dex,
+            *mint,
+            *quote_mint,
+            pool_accounts,
+            *slot,
         );
     }
 }

@@ -314,6 +314,15 @@ static MARKET_DATA_TRADE_PATH_VAULT_REGISTER_MOMENTUM: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_TRADE_PATH_VAULT_REGISTER_SKIPPED_NOT_HOT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Hot-gated TX `pool_accounts` apply outcomes (`result=upsert|register|skip_not_hot|skip_unparseable`).
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_UPSERT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_NOT_HOT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_UNPARSEABLE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Account worker dispatch: tracked vault pubkey classified HIGH.
 pub static MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -744,6 +753,29 @@ pub fn inc_market_data_trade_path_vault_register_total(pin: TradePathVaultRegist
         TradePathVaultRegisterPin::Momentum => &*MARKET_DATA_TRADE_PATH_VAULT_REGISTER_MOMENTUM,
         TradePathVaultRegisterPin::SkippedNotHot => {
             &*MARKET_DATA_TRADE_PATH_VAULT_REGISTER_SKIPPED_NOT_HOT
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxPoolAccountsHotApplyResult {
+    Upsert,
+    Register,
+    SkipNotHot,
+    SkipUnparseable,
+}
+
+#[inline]
+pub fn inc_market_data_tx_pool_accounts_hot_apply_total(result: TxPoolAccountsHotApplyResult) {
+    let counter = match result {
+        TxPoolAccountsHotApplyResult::Upsert => &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_UPSERT,
+        TxPoolAccountsHotApplyResult::Register => &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER,
+        TxPoolAccountsHotApplyResult::SkipNotHot => {
+            &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_NOT_HOT
+        }
+        TxPoolAccountsHotApplyResult::SkipUnparseable => {
+            &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_UNPARSEABLE
         }
     };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -9130,6 +9162,34 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("market_data_trade_path_vault_register_total{pin=\"skipped_not_hot\"} ");
     out.push_str(
         &MARKET_DATA_TRADE_PATH_VAULT_REGISTER_SKIPPED_NOT_HOT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"upsert\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_UPSERT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"register\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"skip_not_hot\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_NOT_HOT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"skip_unparseable\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_UNPARSEABLE
             .load(Ordering::Relaxed)
             .to_string(),
     );
