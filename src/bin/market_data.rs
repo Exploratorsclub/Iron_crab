@@ -1997,8 +1997,7 @@ fn note_trade_pool_lru_touches_from_cache(
     }
 
     // Sustained JetStream SLAVE refresh during WaitHotSet (I-MD-9): trade → cache-first publish.
-    if ctx.hot_pool_registry.pool_has_momentum(pool) && cached_pool_has_fresh_reserve_basis(&state)
-    {
+    if ctx.hot_pool_registry.is_hot_pool(pool) {
         ctx.register_geyser_reserves_after_trade(pool);
     }
 }
@@ -5263,21 +5262,44 @@ impl MarketDataContext {
 
     /// PR-B: after a parsed swap trade — cache-first BalanceUpdated; vault/bin registration only for hot pools.
     fn register_geyser_reserves_after_trade(&self, pool: Pubkey) -> bool {
-        self.try_publish_balance_updated_from_cache(pool, false);
-        if !self.hot_pool_registry.pool_has_momentum(pool) {
+        let is_arb_only = self.hot_pool_registry.pool_has_arb(pool)
+            && !self.hot_pool_registry.pool_has_momentum(pool);
+        self.try_publish_balance_updated_from_cache(pool, is_arb_only);
+        if !self.hot_pool_registry.is_hot_pool(pool) {
+            ironcrab::metrics::inc_market_data_trade_path_vault_register_total(
+                ironcrab::metrics::TradePathVaultRegisterPin::SkippedNotHot,
+            );
             return false;
         }
+        let Some(pin) = self.geyser_pin_for_hot_dlmm_pool(pool) else {
+            return false;
+        };
         let Some(state) = self.live_pool_cache.get(&pool) else {
+            self.note_deferred_hot_pool_reserve_registration(pool, pin, "live_pool_cache_miss");
             return false;
         };
         let Some((base_mint, quote_mint)) = pool_mints_for_geyser_explicit_tracking(&state) else {
             return false;
         };
         if !self.admit_geyser_explicit_pool_assets(pool, base_mint, quote_mint) {
+            self.note_deferred_hot_pool_reserve_registration(pool, pin, "admit_fail");
             return false;
         }
         let before_keys = self.snapshot_explicit_demand_pubkeys();
-        self.register_geyser_reserves_impl(pool, GeyserPinReason::MomentumActive);
+        self.register_geyser_reserves_impl(pool, pin);
+        let metric_pin = match pin {
+            GeyserPinReason::MomentumActive => {
+                ironcrab::metrics::TradePathVaultRegisterPin::Momentum
+            }
+            GeyserPinReason::ArbMultiDex => ironcrab::metrics::TradePathVaultRegisterPin::Arb,
+            GeyserPinReason::Wallet => {
+                return explicit_subscription_has_new_keys(
+                    &before_keys,
+                    &self.snapshot_explicit_demand_pubkeys(),
+                )
+            }
+        };
+        ironcrab::metrics::inc_market_data_trade_path_vault_register_total(metric_pin);
         explicit_subscription_has_new_keys(&before_keys, &self.snapshot_explicit_demand_pubkeys())
     }
 
@@ -18045,7 +18067,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn trade_path_skips_balance_refresh_for_arb_only_hot_pool() {
+    fn trade_path_registers_vaults_for_arb_only_hot_pool() {
         use ironcrab::market_data::sidefx::worker::MdSidefxBurstScratch;
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -18072,14 +18094,17 @@ mod pr_b_geyser_tracking_tests {
             1,
         );
         ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_arb_pool_admitted(pool);
 
-        let vaults_before = ctx.tracked_vaults.read().len();
         let mut scratch = MdSidefxBurstScratch::default();
         note_trade_pool_lru_touches_from_cache(&ctx, pool, &mut scratch);
-        assert_eq!(
-            ctx.tracked_vaults.read().len(),
-            vaults_before,
-            "arb-only hot pool must not trigger momentum trade register path"
+        assert!(
+            ctx.tracked_vaults.read().contains_key(&coin),
+            "arb-only hot pool must register vaults from trade path"
+        );
+        assert!(
+            ctx.tracked_vaults.read()[&coin].pin == Some(GeyserPinReason::ArbMultiDex),
+            "arb-only trade register must use ArbMultiDex pin"
         );
     }
 
@@ -18273,11 +18298,88 @@ mod pr_b_geyser_tracking_tests {
         let block = &src[start..end];
         assert!(
             block.contains("register_geyser_reserves_after_trade"),
-            "trade LRU touch must wire register_geyser_reserves_after_trade for momentum-hot"
+            "trade LRU touch must wire register_geyser_reserves_after_trade for hot pools"
         );
         assert!(
-            block.contains("pool_has_momentum"),
-            "trade refresh must be gated to momentum-hot pools"
+            block.contains("is_hot_pool"),
+            "trade register must be gated to hot pools (arb or momentum)"
+        );
+    }
+
+    #[test]
+    fn register_geyser_reserves_after_trade_skips_non_hot_pool() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+
+        let demand_before = ctx.snapshot_explicit_demand_pubkeys();
+        let vaults_before = ctx.tracked_vaults.read().len();
+        assert!(!MarketDataContext::register_geyser_reserves_after_trade(
+            &ctx, pool
+        ));
+        assert_eq!(ctx.tracked_vaults.read().len(), vaults_before);
+        assert!(!explicit_subscription_has_new_keys(
+            &demand_before,
+            &ctx.snapshot_explicit_demand_pubkeys()
+        ));
+    }
+
+    #[test]
+    fn register_geyser_reserves_after_trade_dual_pin_prefers_momentum() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
+
+        assert!(MarketDataContext::register_geyser_reserves_after_trade(
+            &ctx, pool
+        ));
+        assert_eq!(
+            ctx.tracked_vaults.read()[&coin].pin,
+            Some(GeyserPinReason::MomentumActive),
+            "dual pin must keep Wallet > Momentum > Arb priority (I-MD-8)"
         );
     }
 
