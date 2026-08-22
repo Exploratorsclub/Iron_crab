@@ -308,6 +308,12 @@ pub static MARKET_DATA_ARB_TRACKED_VAULTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| 
 /// Successful arb pin vault/bin Geyser registrations (one increment per register call that changed tracking).
 pub static MARKET_DATA_ARB_PIN_VAULT_REGISTER_OK_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Trade-path vault register attempts by pin tier (`pin=arb|momentum|skipped_not_hot`).
+static MARKET_DATA_TRADE_PATH_VAULT_REGISTER_ARB: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TRADE_PATH_VAULT_REGISTER_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TRADE_PATH_VAULT_REGISTER_SKIPPED_NOT_HOT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Account worker dispatch: tracked vault pubkey classified HIGH.
 pub static MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -722,6 +728,25 @@ pub fn set_market_data_arb_tracked_vaults_gauge(n: usize) {
 #[inline]
 pub fn inc_market_data_arb_pin_vault_register_ok_total() {
     MARKET_DATA_ARB_PIN_VAULT_REGISTER_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradePathVaultRegisterPin {
+    Arb,
+    Momentum,
+    SkippedNotHot,
+}
+
+#[inline]
+pub fn inc_market_data_trade_path_vault_register_total(pin: TradePathVaultRegisterPin) {
+    let counter = match pin {
+        TradePathVaultRegisterPin::Arb => &*MARKET_DATA_TRADE_PATH_VAULT_REGISTER_ARB,
+        TradePathVaultRegisterPin::Momentum => &*MARKET_DATA_TRADE_PATH_VAULT_REGISTER_MOMENTUM,
+        TradePathVaultRegisterPin::SkippedNotHot => {
+            &*MARKET_DATA_TRADE_PATH_VAULT_REGISTER_SKIPPED_NOT_HOT
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -9088,6 +9113,27 @@ async fn metrics_response() -> Response<Body> {
         "market_data_arb_pin_vault_register_ok_total",
         MARKET_DATA_ARB_PIN_VAULT_REGISTER_OK_TOTAL.load(Ordering::Relaxed)
     );
+    out.push_str("market_data_trade_path_vault_register_total{pin=\"arb\"} ");
+    out.push_str(
+        &MARKET_DATA_TRADE_PATH_VAULT_REGISTER_ARB
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_trade_path_vault_register_total{pin=\"momentum\"} ");
+    out.push_str(
+        &MARKET_DATA_TRADE_PATH_VAULT_REGISTER_MOMENTUM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_trade_path_vault_register_total{pin=\"skipped_not_hot\"} ");
+    out.push_str(
+        &MARKET_DATA_TRADE_PATH_VAULT_REGISTER_SKIPPED_NOT_HOT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "market_data_arb_pin_deferred_cleared_total",
         MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_TOTAL.load(Ordering::Relaxed)
