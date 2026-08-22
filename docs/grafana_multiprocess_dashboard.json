@@ -1105,7 +1105,7 @@
     {
       "type": "stat",
       "title": "Geyser Reconnects (1h)",
-      "description": "Summe der Reconnect-Zuw\u00e4chse \u00fcber alle reason-Labels (1h-Fenster).",
+      "description": "Summe der Reconnect-Zuwächse über alle reason-Labels (1h-Fenster).",
       "targets": [
         {
           "expr": "sum(increase(geyser_reconnect_total{job=\"market-data\"}[1h]))",
@@ -1147,7 +1147,7 @@
     {
       "type": "timeseries",
       "title": "Geyser Reconnects (5m rate)",
-      "description": "rate() nach reason \u2014 Reconnect-Sturm (Incident: ~50/s gesamt). Summe >1/s in Explore pr\u00fcfen.",
+      "description": "rate() nach reason — Reconnect-Sturm (Incident: ~50/s gesamt). Summe >1/s in Explore prüfen.",
       "targets": [
         {
           "expr": "sum(rate(geyser_reconnect_total{job=\"market-data\"}[5m])) by (reason)",
@@ -1197,13 +1197,187 @@
       }
     },
     {
+      "type": "timeseries",
+      "title": "Active Hot Pins (Arb vs Momentum)",
+      "description": "Registry counts: market_data_hot_pool_registry_pools by reason. Pin count != vault completeness.",
+      "targets": [
+        {
+          "expr": "market_data_hot_pool_registry_pools{job=\"market-data\",reason=\"arb\"}",
+          "refId": "A",
+          "legendFormat": "arb pins"
+        },
+        {
+          "expr": "market_data_hot_pool_registry_pools{job=\"market-data\",reason=\"momentum\"}",
+          "refId": "B",
+          "legendFormat": "momentum pins"
+        },
+        {
+          "expr": "market_data_hot_pool_registry_pools{job=\"market-data\",reason=\"both\"}",
+          "refId": "C",
+          "legendFormat": "both"
+        },
+        {
+          "expr": "market_data_momentum_active_pool_pins{job=\"market-data\"}",
+          "refId": "D",
+          "legendFormat": "mom active pins"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 44
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Arb Pin Completeness",
+      "description": "Pinned vs incomplete vault/bin registration vs tracked vault rows. Complete ≈ pinned - incomplete.",
+      "targets": [
+        {
+          "expr": "market_data_arb_pinned_pools{job=\"market-data\"}",
+          "refId": "A",
+          "legendFormat": "arb pinned"
+        },
+        {
+          "expr": "market_data_arb_pin_registration_incomplete{job=\"market-data\"}",
+          "refId": "B",
+          "legendFormat": "incomplete"
+        },
+        {
+          "expr": "market_data_arb_pinned_pools{job=\"market-data\"} - market_data_arb_pin_registration_incomplete{job=\"market-data\"}",
+          "refId": "C",
+          "legendFormat": "complete (est.)"
+        },
+        {
+          "expr": "market_data_arb_tracked_vaults{job=\"market-data\"}",
+          "refId": "D",
+          "legendFormat": "tracked vaults"
+        },
+        {
+          "expr": "market_data_tracked_bin_arrays_arb{job=\"market-data\"}",
+          "refId": "E",
+          "legendFormat": "tracked bin arrays (arb)"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Arb/Mom Pin Heartbeat Publish",
+      "description": "Cache-first BalanceUpdated for pinned pools. cache_miss = pin without LivePoolCache layout.",
+      "targets": [
+        {
+          "expr": "rate(market_data_heartbeat_balance_refresh_published_total{job=\"market-data\",coverage=\"arb_pin\"}[1m])",
+          "refId": "A",
+          "legendFormat": "arb_pin published/s"
+        },
+        {
+          "expr": "rate(market_data_heartbeat_balance_refresh_published_total{job=\"market-data\",coverage=\"momentum\"}[1m])",
+          "refId": "B",
+          "legendFormat": "momentum published/s"
+        },
+        {
+          "expr": "rate(market_data_heartbeat_balance_refresh_skipped_total{job=\"market-data\",coverage=\"arb_pin\",reason=\"cache_miss\"}[1m])",
+          "refId": "C",
+          "legendFormat": "arb_pin skip cache_miss/s"
+        },
+        {
+          "expr": "rate(market_data_arb_pin_vault_published_total{job=\"market-data\"}[1m])",
+          "refId": "D",
+          "legendFormat": "arb vault published/s"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 50
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Geyser Explicit Set & Account Classes",
+      "description": "Subscription size vs classified account updates. drop = not on hot explicit path; tx listener = broad TX stream.",
+      "targets": [
+        {
+          "expr": "geyser_subscription_accounts{job=\"market-data\"}",
+          "refId": "A",
+          "legendFormat": "subscription accounts"
+        },
+        {
+          "expr": "geyser_tracked_pinned_accounts{job=\"market-data\"}",
+          "refId": "B",
+          "legendFormat": "tracked pinned accounts"
+        },
+        {
+          "expr": "rate(market_data_account_updates_total{job=\"market-data\",class=\"exec_hot\"}[1m])",
+          "refId": "C",
+          "legendFormat": "account exec_hot/s"
+        },
+        {
+          "expr": "rate(market_data_account_updates_total{job=\"market-data\",class=\"drop\"}[1m])",
+          "refId": "D",
+          "legendFormat": "account drop/s"
+        },
+        {
+          "expr": "rate(geyser_tx_listener_transactions_total{job=\"market-data\"}[1m])",
+          "refId": "E",
+          "legendFormat": "tx listener/s"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 50
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
       "type": "row",
       "title": "Momentum Bot (Port 9802) - 4-Filter Policy",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 44
+        "y": 57
       },
       "collapsed": false
     },
@@ -1221,7 +1395,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 45
+        "y": 58
       },
       "fieldConfig": {
         "defaults": {
@@ -1246,7 +1420,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 45
+        "y": 58
       },
       "fieldConfig": {
         "defaults": {
@@ -1270,7 +1444,7 @@
         "h": 4,
         "w": 2,
         "x": 8,
-        "y": 45
+        "y": 58
       },
       "fieldConfig": {
         "defaults": {
@@ -1294,7 +1468,7 @@
         "h": 4,
         "w": 2,
         "x": 10,
-        "y": 45
+        "y": 58
       },
       "fieldConfig": {
         "defaults": {
@@ -1318,7 +1492,7 @@
         "h": 4,
         "w": 2,
         "x": 12,
-        "y": 45
+        "y": 58
       },
       "fieldConfig": {
         "defaults": {
@@ -1342,7 +1516,7 @@
         "h": 4,
         "w": 2,
         "x": 14,
-        "y": 45
+        "y": 58
       },
       "fieldConfig": {
         "defaults": {
@@ -1366,7 +1540,7 @@
         "h": 4,
         "w": 2,
         "x": 16,
-        "y": 45
+        "y": 58
       },
       "fieldConfig": {
         "defaults": {
@@ -1391,7 +1565,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 45
+        "y": 58
       },
       "options": {
         "legend": {
@@ -1419,7 +1593,7 @@
         "h": 4,
         "w": 18,
         "x": 0,
-        "y": 49
+        "y": 62
       },
       "fieldConfig": {
         "defaults": {
@@ -1437,7 +1611,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 66
       },
       "collapsed": false
     },
@@ -1454,7 +1628,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 54
+        "y": 67
       },
       "fieldConfig": {
         "defaults": {
@@ -1478,7 +1652,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 54
+        "y": 67
       },
       "fieldConfig": {
         "defaults": {
@@ -1514,7 +1688,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 54
+        "y": 67
       },
       "fieldConfig": {
         "defaults": {
@@ -1559,7 +1733,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 58
+        "y": 71
       },
       "collapsed": false
     },
@@ -1576,7 +1750,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 59
+        "y": 72
       },
       "fieldConfig": {
         "defaults": {
@@ -1600,7 +1774,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 59
+        "y": 72
       },
       "fieldConfig": {
         "defaults": {
@@ -1624,7 +1798,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 59
+        "y": 72
       },
       "fieldConfig": {
         "defaults": {
@@ -1648,7 +1822,7 @@
         "h": 4,
         "w": 4,
         "x": 12,
-        "y": 59
+        "y": 72
       },
       "fieldConfig": {
         "defaults": {
@@ -1672,7 +1846,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 59
+        "y": 72
       },
       "fieldConfig": {
         "defaults": {
@@ -1694,7 +1868,7 @@
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 59
+        "y": 72
       }
     },
     {
@@ -1711,7 +1885,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 63
+        "y": 76
       },
       "fieldConfig": {
         "defaults": {
@@ -1752,7 +1926,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 63
+        "y": 76
       },
       "fieldConfig": {
         "defaults": {
@@ -1775,7 +1949,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 63
+        "y": 76
       },
       "fieldConfig": {
         "defaults": {
@@ -1831,7 +2005,7 @@
         "h": 4,
         "w": 4,
         "x": 12,
-        "y": 63
+        "y": 76
       },
       "fieldConfig": {
         "defaults": {
@@ -1904,7 +2078,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 63
+        "y": 76
       },
       "fieldConfig": {
         "defaults": {
@@ -1926,7 +2100,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 67
+        "y": 80
       },
       "options": {
         "legend": {
@@ -1954,7 +2128,7 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 67
+        "y": 80
       },
       "fieldConfig": {
         "defaults": {
@@ -1986,7 +2160,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 67
+        "y": 80
       },
       "fieldConfig": {
         "defaults": {
@@ -2055,7 +2229,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 73
+        "y": 86
       },
       "fieldConfig": {
         "defaults": {
@@ -2070,7 +2244,7 @@
         "h": 2,
         "w": 24,
         "x": 0,
-        "y": 79
+        "y": 92
       },
       "options": {
         "content": "**Time mode:** Grafana shows dashboard variables in the **top bar**; this JSON model cannot place the `time_mode` control between panels. Use the **Trades: Zeit (Recent Trades)** dropdown at the top to switch Relativ/UTC. The table column arrows **only** control sort order.",
@@ -2085,7 +2259,7 @@
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 81
+        "y": 94
       },
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
@@ -2531,7 +2705,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 93
+        "y": 106
       },
       "collapsed": false
     },
@@ -2564,7 +2738,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 94
+        "y": 107
       },
       "fieldConfig": {
         "defaults": {
@@ -2585,7 +2759,7 @@
         "h": 3,
         "w": 4,
         "x": 12,
-        "y": 94
+        "y": 107
       },
       "fieldConfig": {
         "defaults": {
@@ -2625,7 +2799,7 @@
         "h": 3,
         "w": 4,
         "x": 16,
-        "y": 94
+        "y": 107
       },
       "fieldConfig": {
         "defaults": {
@@ -2661,7 +2835,7 @@
         "h": 3,
         "w": 4,
         "x": 20,
-        "y": 94
+        "y": 107
       }
     }
   ]
