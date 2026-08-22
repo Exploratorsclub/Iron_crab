@@ -19,7 +19,7 @@ Dieses File beschreibt die **Momentum-State-Machine** (Tracker, Probe/Scale-In, 
 | Explicit State Machine | ✅ | `TrackerState` enum with 7 states |
 | Reason Codes | ✅ | `REJECT_*`, `WAIT_*`, `EXIT_*` |
 | fill_in/fill_out Position Accounting | ✅ | From `ExecutionResult` |
-| DexPoolAccounts (14 accounts) | ✅ | PumpSwap deterministic routing |
+| DexPoolAccounts (DEX-spezifisch) | ✅ | PumpSwap u. a. über Intent/`pool_accounts`; Layout nicht fest 14 Accounts |
 | TokenMintInfo Gates | ✅ | `mint_authority`, `freeze_authority` |
 | Dev-Sell Re-Validation | ✅ | `dev_sell_revalidation_delay_secs`, `WAIT_DEV_SELL_REVALIDATION` |
 | Buyer Quality / Anti-Bot | ✅ | `top1_buyer_share_cap`, `small_buy_ratio_cap` |
@@ -170,10 +170,7 @@ Soft gates (WAIT until sufficient data):
 - Net SOL inflow below threshold.
 - **Filter 5 — Price trend / downtrend** (`WAIT_DOWNTREND`): trade-implied `tokens_per_sol` from Geyser `TradeEvent` prints (no RPC). Multi-bucket lower-highs (default 5 sub-windows) blocks structural downtrend; drawdown-from-session-high with rising short slope blocks unless recovery is confirmed (≥2 late buckets with falling median_tps, flow thresholds, ≥15s chain-slot duration, and no strict lower-highs structure). Runs **before** dump-recovery (Filter 3b).
 
-CTO behavior (pre-entry only):
-- If dev sells early and we do **not** hold a position:
-  - If CTO mode enabled: transition to **CTO_Candidate** instead of hard reject.
-  - If CTO mode disabled: treat as reject.
+CTO-Keys sind **deprecated** (ignoriert, Warn-Log). Pre-entry Dev-Sell: `dev_sell_revalidation_delay_secs` / `WAIT_DEV_SELL_REVALIDATION` — siehe `CONFIG_SCHEMA.md`.
 
 ### Post-entry (position open)
 **Primary objective:** protect capital.

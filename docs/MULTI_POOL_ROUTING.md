@@ -1,7 +1,8 @@
-# Multi-Pool Routing
+# Multi-Pool Routing (Momentum Overlay)
 
-**Status**: ✅ Complete (SELL + BUY Optimization + Reserve-Based Quoting)  
-**Implemented**: Januar 2025, aktualisiert Feb 2026 (FIX-20 + FIX-21)  
+**Stand:** 2026-08-22. Momentum wählt den besten bekannten Pool für SELL und Scale-In-BUY. Positionsbuchhaltung ist **nicht** dieses File — KV `POSITION_AUTHORITY` / `position-manager`.
+
+**Status:** Implementiert (SELL + Scale-In BUY; Probe bleibt am Original-Pool).
 
 ---
 

@@ -107,7 +107,7 @@ Repo-Stand `docs/geyser-grpc-plugin-config.json`:
 - **Keine** Owner-/Account-Listen in der Plugin-JSON. Yellowstone filtert das hier nicht server-seitig.
 - Filtering und Membership liegen in **market-data** (explizites Account-Set, Track-Requests, Wallet-/Momentum-/Arb-Pins). Neue DEXes: Code + `market-data`-Deploy, **kein** Validator-Restart nur wegen eines Program-IDs.
 
-Bot-Config: `[geyser] url` / `--geyser-url http://127.0.0.1:10000`. Caps: `[market_data_geyser] max_tracked_accounts`, `geyser_full_reconnect_threshold` — siehe `docs/CONFIG_SCHEMA.md`.
+Bot: market-data `--geyser-url` / `GEYSER_URL` (Default `http://127.0.0.1:10000`). execution-engine: `[solana] geyser_grpc_url`. Es gibt **kein** Config-Key `[geyser] url`. Caps: `[market_data_geyser] max_tracked_accounts`, `geyser_full_reconnect_threshold` — `docs/CONFIG_SCHEMA.md`.
 
 `market-data.service` setzt `CPUAffinity=48-55` und `Nice=10`, damit der Validator die restlichen Kerne behält.
 

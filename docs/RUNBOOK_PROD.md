@@ -50,7 +50,7 @@ market-data ── MarketEvents ──► momentum-bot ── TradeIntents ─�
 | `deploy.sh` | Wrapper-Script → ruft `deploy_new.sh` auf |
 | `deploy_new.sh` | Build + Systemd Install + Restart |
 | `docs/systemd/*.service` | Service-Files (inkl. `position-manager.service`) |
-| `docs/systemd/ironcrab.target` | Orchestriert die Kern-Services (`Wants=` ohne position-manager; Deploy startet ihn extra) |
+| `docs/systemd/ironcrab.target` | Orchestriert die Services inkl. `position-manager` |
 | `docs/grafana_*.json` | Grafana Dashboards |
 
 ## Einmalige Konfiguration
@@ -58,12 +58,10 @@ market-data ── MarketEvents ──► momentum-bot ── TradeIntents ─�
 1) **Config anpassen** (`my_config.server.toml`):
    ```toml
    [solana]
-   rpc_url = "http://127.0.0.1:8899"      # Lokaler Validator
-   ws_url = "ws://127.0.0.1:8900"         # Lokaler Validator WS
+   rpc_url = "http://127.0.0.1:8899"
+   ws_url = "ws://127.0.0.1:8900"
    keypair_path = "/home/ironcrab/.config/solana/id.json"
-   
-   [geyser]
-   url = "http://127.0.0.1:10000"         # Yellowstone gRPC
+   geyser_grpc_url = "http://127.0.0.1:10000"  # EE; market-data: GEYSER_URL / --geyser-url
    
    [nats]
    url = "nats://127.0.0.1:4222"
@@ -109,8 +107,7 @@ Dies führt automatisch aus:
 
 ### Alle Services starten/stoppen
 ```bash
-sudo systemctl start ironcrab.target   # Kern-Services laut target
-sudo systemctl start position-manager  # falls nicht in target Wants=
+sudo systemctl start ironcrab.target   # inkl. position-manager
 sudo systemctl stop ironcrab.target
 sudo systemctl restart ironcrab.target
 ```

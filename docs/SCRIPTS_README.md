@@ -30,7 +30,7 @@ Das Haupt-Deployment-Script für den Production-Server.
 4. Installiert systemd-Units inkl. `position-manager`
 5. Startet die Trading-Services (siehe Tabelle unten)
 
-`docs/systemd/ironcrab.target` listet in `Wants=` derzeit sechs Units **ohne** `position-manager`; `deploy_new.sh` startet `position-manager` trotzdem. Live-Status immer per `systemctl` prüfen.
+`docs/systemd/ironcrab.target` listet in `Wants=` alle Trading-Services **inkl.** `position-manager`. Live-Status immer per `systemctl` prüfen.
 
 ### Service Management (Server)
 ```bash

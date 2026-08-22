@@ -26,6 +26,8 @@ uvicorn control_plane.main:app --host 0.0.0.0 --port 8080 --reload
 | `EXECUTION_ENGINE_URL` | `http://127.0.0.1:9804` | execution-engine metrics endpoint |
 | `CONTROL_PLANE_PORT` | `8080` | Control plane HTTP port |
 
+`/metrics` and `/status` scrape **9801–9804**. `position-manager` (:9805) is a separate Prometheus target. Control Plane systemd start/stop currently lists market-data, momentum-bot, arb-strategy, execution-engine — not position-manager.
+
 ## Endpoints
 
 ### Health & Status

@@ -5,11 +5,16 @@
 # This config is used by ALL services. Each service reads only its relevant
 # sections. Copy to config.toml and adjust for your environment.
 #
-# Architecture (per docs/TARGET_ARCHITECTURE.md):
-#   - market-data:      Geyser ingest → MarketEvents (KEYLESS)
-#   - momentum-bot:     MarketEvents → TradeIntents (KEYLESS)
-#   - arb-strategy:     MarketEvents → TradeIntents (KEYLESS)
-#   - execution-engine: TradeIntents → Transactions (HAS KEYS)
+# Config::load liest: [app], [solana], [[markets]], [allocator], [strategies.*],
+# plus optional [momentum], [execution_engine], [position_manager], [market_data_geyser].
+# Extra-Tabellen ([nats], [market_data], [arb_strategy], [risk], …) ignoriert serde.
+#
+# Architecture (Eval spec TARGET_ARCHITECTURE.md):
+#   - market-data:       Geyser ingest → MarketEvents + POOL_CACHE MASTER (KEYLESS)
+#   - momentum-bot:      MarketEvents → TradeIntents (KEYLESS)
+#   - arb-strategy:      MarketEvents → TradeIntents (KEYLESS)
+#   - execution-engine:  TradeIntents → Transactions (HAS KEYS)
+#   - position-manager:  sole writer of JetStream KV POSITION_AUTHORITY (KEYLESS)
 #
 # =============================================================================
 
@@ -19,7 +24,7 @@
 [app]
 name = "ironcrab"
 log_level = "info"              # trace, debug, info, warn, error
-run_id_prefix = "prod"          # Prefix for run IDs (useful for log correlation)
+autosave_state_secs = 30
 
 # -----------------------------------------------------------------------------
 # NATS Messaging (IPC between services)
@@ -31,31 +36,44 @@ reconnect_delay_ms = 1000
 max_reconnects = -1             # -1 = infinite
 
 # -----------------------------------------------------------------------------
-# Geyser gRPC Connection (market-data only)
-# -----------------------------------------------------------------------------
-[geyser]
-url = "http://127.0.0.1:10000"
-# x_token = "your-auth-token"   # If Geyser requires authentication
-reconnect_delay_ms = 2000
-# Accounts to subscribe (DEX program IDs)
-subscribe_programs = [
-    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM V4
-    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  # Orca Whirlpool
-    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # PumpFun
-]
-
-# -----------------------------------------------------------------------------
-# Solana RPC (fallback when Geyser unavailable)
+# Solana RPC + Geyser URL for binaries that read Config
 # -----------------------------------------------------------------------------
 [solana]
 rpc_url = "http://127.0.0.1:8899"
 ws_url = "ws://127.0.0.1:8900"
+# Used by execution-engine (optional cache_geyser / listeners). market-data
+# uses --geyser-url or env GEYSER_URL (default http://127.0.0.1:10000).
+geyser_grpc_url = "http://127.0.0.1:10000"
+keypair_path = "~/.config/solana/id.json"
 # Helius RPC for mint validation (local validator lacks tx history)
 # helius_rpc_url = "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
 
 # Adaptive RPC settings
 rpc_timeout_ms = 10000
 rpc_max_retries = 3
+
+[[markets]]
+name = "momentum"
+allocation_pct = 50
+strategy = "momentum-default"
+
+[[markets]]
+name = "arb"
+allocation_pct = 50
+strategy = "arb-default"
+
+[allocator]
+mode = "static_pct"
+rebalance_secs = 86400
+min_transfer_sol = 0.05
+
+[strategies.momentum-default]
+kind = "rust"
+params = { }
+
+[strategies.arb-default]
+kind = "rust"
+params = { }
 
 # -----------------------------------------------------------------------------
 # Market Data Service (market-data binary)
@@ -175,35 +193,11 @@ dex_pairs = [
 ]
 
 # -----------------------------------------------------------------------------
-# Execution Engine (execution-engine binary) - ONLY SERVICE WITH KEYS
-# -----------------------------------------------------------------------------
-[execution]
-# Wallet configuration (ONLY execution-engine reads this!)
-keypair_path = "~/.config/solana/id.json"
-# Alternative: keypair_json or keypair_b64 env vars
-
-# Dry run mode (simulate but don't send)
-dry_run = true
-
-# Simulation gate (CRITICAL: always simulate before send)
-simulate_before_send = true
-
-# Transaction settings
-priority_fee_micro_lamports = 1000
-max_retries = 3
-confirmation_timeout_ms = 30000
-
-# Jito bundle settings (for atomic arb execution)
-[execution.jito]
-enabled = false
-# block_engine_url = "https://mainnet.block-engine.jito.wtf"
-# tip_lamports = 10000
-
-# Metrics
-metrics_port = 9804
+# Keys: IRONCRAB_KEYPAIR_PATH (env) oder [solana].keypair_path — nicht [execution].
+# Runtime-Parameter: [execution_engine] weiter unten.
 
 # -----------------------------------------------------------------------------
-# Risk Management (Global)
+# Risk Management (Global) — illustrative; not a Config struct field
 # -----------------------------------------------------------------------------
 [risk]
 # Global position limits
@@ -261,6 +255,14 @@ host = "127.0.0.1"
 port = 8080
 # API key for authentication (generate with: openssl rand -hex 32)
 # api_key = "your-secret-key"
+
+# -----------------------------------------------------------------------------
+# Position Manager (position-manager binary) — sole POSITION_AUTHORITY KV writer
+# -----------------------------------------------------------------------------
+[position_manager]
+enabled = true
+metrics_port = 9805
+# wallet_pubkey = ""   # or env IRONCRAB_WALLET_PUBKEY (pubkey only, never a secret)
 
 # -----------------------------------------------------------------------------
 # Execution Engine (execution-engine binary)

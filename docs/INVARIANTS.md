@@ -48,7 +48,7 @@
 | I-13 | **Pool-Matching**: Position-Preis-Updates (Trade, PoolCacheUpdate) nur anwenden wenn source_pool == position.pool. Bei Multi-Pool-Tokens sonst falsche PnL und TAKE_PROFIT bei Verlust. | FIX-38 |
 | I-14 | **tokens_per_sol** Konvention: LOWER = token wertvoller. pnl_pct = (entry/current - 1)*100. highest_price = niedrigster tps (bester Preis für Holder). | Invertierte Exit-Signale |
 | I-15 | **Amounts explizit**: Jede Zahl hat raw vs ui und decimals. Keine impliziten Konventionen. | Falsche Slippage/Quotes |
-| I-16 | **Geyser/LivePoolCache** ist autoritativ im Hot Path. RPC/WS nur Fallback (Cold Path). | Latenz + Cache-Inkonsistenz |
+| I-16 | **Geyser MASTER in market-data + JetStream `POOL_CACHE` → SLAVE `LivePoolCache`** ist autoritativ im Hot Path. RPC/WS nur Cold Path. | Latenz + Cache-Inkonsistenz |
 
 ---
 

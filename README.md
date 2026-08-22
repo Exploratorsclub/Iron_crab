@@ -89,7 +89,9 @@ Hilfs-Tools (Cargo): `raydium-pools`, `sell-all`, `latency-stress`, `pump-amm-tx
 
 ```powershell
 cp config.example.toml config.toml
-# config.toml anpassen: [solana].rpc_url, [geyser].url, [execution].keypair_path
+# Anpassen: [solana].rpc_url, [solana].geyser_grpc_url, [solana].keypair_path
+# market-data Geyser: --geyser-url oder GEYSER_URL (Default :10000)
+# execution-engine Keys: IRONCRAB_KEYPAIR_PATH (nicht [execution].keypair_path)
 ```
 
 ### Build & Run
@@ -98,11 +100,12 @@ cp config.example.toml config.toml
 cargo build --release
 
 # Services einzeln starten (in getrennten Terminals):
-cargo run --release --bin market-data    -- --config config.toml
-cargo run --release --bin momentum-bot    -- --config config.toml
-cargo run --release --bin arb-strategy    -- --config config.toml
-cargo run --release --bin execution-engine -- --config config.toml
-cargo run --release --bin control-plane  -- --config config.toml
+cargo run --release --bin market-data       -- --config config.toml
+cargo run --release --bin momentum-bot      -- --config config.toml
+cargo run --release --bin arb-strategy      -- --config config.toml
+cargo run --release --bin execution-engine  -- --config config.toml
+cargo run --release --bin position-manager  -- --config config.toml
+# control-plane ist Python: uvicorn / python control_plane/main.py (Port 8080)
 ```
 
 Oder über Skripte: `run_new.ps1` / `run_new.sh` (siehe `docs/SCRIPTS_README.md`).
