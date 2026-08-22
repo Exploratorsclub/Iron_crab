@@ -1,12 +1,18 @@
-//! Phase 5b: `md-sidefx` OS thread — bounded enqueue, burst coalesce, deferred publish.
+//! Phase 5b: `md-sidefx` OS threads — physically split Account-Quote vs TX-Discovery pipelines.
 
 use super::handlers::md_sidefx_process_job;
 use super::host::SidefxWorkerHost;
 use crate::market_data::ingest::AccountUpdateClass;
 use crate::metrics::{
+    inc_market_data_account_sidefx_backpressure_total,
+    inc_market_data_account_sidefx_jobs_processed_total,
     inc_market_data_md_sidefx_enqueue_dropped_total,
     inc_market_data_md_sidefx_enrich_enqueue_dropped_total,
-    inc_market_data_md_sidefx_jobs_processed_total, set_market_data_md_sidefx_queue_depth,
+    inc_market_data_md_sidefx_jobs_processed_total,
+    inc_market_data_tx_sidefx_enqueue_dropped_total,
+    inc_market_data_tx_sidefx_jobs_processed_total,
+    refresh_market_data_md_sidefx_deprecated_metrics, set_market_data_account_sidefx_queue_depth,
+    set_market_data_tx_sidefx_queue_depth,
 };
 use crate::solana::dex_parser::DexType;
 use solana_sdk::pubkey::Pubkey;
@@ -49,13 +55,25 @@ impl From<AccountUpdateClass> for SidefxUpdateClass {
     }
 }
 
-/// Reserve headroom for EXEC_HOT when the sidefx queue is under pressure.
-const MARKET_DATA_MD_SIDEFX_ENRICH_HEADROOM: usize = 512;
+/// Physically separated sidefx pipelines (P0: Account-Quote must not starve under TX load).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MdSidefxPipeline {
+    AccountQuote,
+    TxDiscovery,
+}
 
-/// Phase-R-R4: bounded queue for deferred pool_mint_map / publish / live_pool_cache side-effects.
-pub const MARKET_DATA_MD_SIDEFX_QUEUE_CAP: usize = 4096;
-/// Phase-R-R4: max jobs drained per `md-sidefx` burst before coalesce pass.
+/// Account-Quote pipeline: no-drop (quotes/reserves SSOT for hot path).
+pub const MARKET_DATA_MD_ACCOUNT_SIDEFX_QUEUE_CAP: usize = 16_384;
+/// TX-Discovery pipeline: bounded try_send + drop OK.
+pub const MARKET_DATA_MD_TX_SIDEFX_QUEUE_CAP: usize = 4096;
+/// Deprecated alias — TX queue cap (kept for existing call sites / docs).
+pub const MARKET_DATA_MD_SIDEFX_QUEUE_CAP: usize = MARKET_DATA_MD_TX_SIDEFX_QUEUE_CAP;
+
+/// Max jobs drained per sidefx burst before coalesce pass (per pipeline).
 pub const MARKET_DATA_MD_SIDEFX_BURST_MAX: usize = 128;
+
+/// Reserve headroom for EXEC_HOT when the **TX** sidefx queue is under pressure (legacy TX-only).
+const MARKET_DATA_MD_SIDEFX_ENRICH_HEADROOM: usize = 512;
 
 pub enum MdSidefxCommand {
     PumpFunPoolMintMapInsert {
@@ -161,12 +179,27 @@ pub enum MdSidefxCommand {
     LivePoolCacheMintDecimals { mint: Pubkey, decimals: u8 },
 }
 
-/// Bounded enqueue handle for the `md-sidefx` OS thread (non-Tokio).
+/// Bounded enqueue handle for Account-Quote `md-account-sidefx` OS thread.
 #[derive(Clone)]
-pub struct MdSidefxSender {
+pub struct MdAccountSidefxSender {
     tx: std_mpsc::SyncSender<MdSidefxCommand>,
     queue_depth: Arc<AtomicUsize>,
     pub queue_capacity: usize,
+}
+
+/// Bounded enqueue handle for TX-Discovery `md-tx-sidefx` OS thread (drop OK).
+#[derive(Clone)]
+pub struct MdTxSidefxSender {
+    tx: std_mpsc::SyncSender<MdSidefxCommand>,
+    queue_depth: Arc<AtomicUsize>,
+    pub queue_capacity: usize,
+}
+
+/// Both physically separated sidefx pipelines (spawned together).
+#[derive(Clone)]
+pub struct MdSidefxWorkers {
+    pub account: MdAccountSidefxSender,
+    pub tx: MdTxSidefxSender,
 }
 
 /// Per-burst coalesced DLMM pool-state publish signal (latest slot wins per pool).
@@ -277,6 +310,24 @@ pub fn md_sidefx_flush_pending_md_state_jobs(
     host.flush_lru_touches(scratch);
 }
 
+/// Canonical routing: each command variant belongs to exactly one pipeline.
+pub fn md_sidefx_command_pipeline(job: &MdSidefxCommand) -> MdSidefxPipeline {
+    match job {
+        MdSidefxCommand::LivePoolCacheAccountUpdate { .. }
+        | MdSidefxCommand::VaultBalanceTick { .. }
+        | MdSidefxCommand::TouchBinArrayTick { .. }
+        | MdSidefxCommand::DlmmPoolStatePublishSignal { .. }
+        | MdSidefxCommand::LivePoolCacheMintDecimals { .. }
+        | MdSidefxCommand::BondingCurveDevWallet { .. } => MdSidefxPipeline::AccountQuote,
+        MdSidefxCommand::PumpFunPoolMintMapInsert { .. }
+        | MdSidefxCommand::PumpFunDevWalletFromPoolCreated { .. }
+        | MdSidefxCommand::PumpAmmCreatePoolObserved { .. }
+        | MdSidefxCommand::PumpAmmTradeWithAccounts { .. }
+        | MdSidefxCommand::GenericDexFirstTradeAccounts { .. }
+        | MdSidefxCommand::TradePoolLruTouch { .. } => MdSidefxPipeline::TxDiscovery,
+    }
+}
+
 /// Read propagated ingest class from account-path sidefx commands (TX-path defaults to EXEC_HOT).
 pub fn md_sidefx_job_update_class(job: &MdSidefxCommand) -> SidefxUpdateClass {
     match job {
@@ -298,34 +349,105 @@ fn md_sidefx_apply_update_class(job: &mut MdSidefxCommand, class: SidefxUpdateCl
     }
 }
 
-fn md_sidefx_dec_queue_depth(queue_depth: &AtomicUsize) {
+fn md_sidefx_inc_queue_depth(queue_depth: &AtomicUsize, pipeline: MdSidefxPipeline) {
+    let new_depth = queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+    match pipeline {
+        MdSidefxPipeline::AccountQuote => set_market_data_account_sidefx_queue_depth(new_depth),
+        MdSidefxPipeline::TxDiscovery => set_market_data_tx_sidefx_queue_depth(new_depth),
+    }
+    refresh_market_data_md_sidefx_deprecated_metrics();
+}
+
+fn md_sidefx_dec_queue_depth(queue_depth: &AtomicUsize, pipeline: MdSidefxPipeline) {
     let mut cur = queue_depth.load(Ordering::Relaxed);
     while cur > 0 {
         match queue_depth.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
         {
             Ok(_) => {
-                set_market_data_md_sidefx_queue_depth(cur - 1);
+                let new_depth = cur - 1;
+                match pipeline {
+                    MdSidefxPipeline::AccountQuote => {
+                        set_market_data_account_sidefx_queue_depth(new_depth)
+                    }
+                    MdSidefxPipeline::TxDiscovery => {
+                        set_market_data_tx_sidefx_queue_depth(new_depth)
+                    }
+                }
+                refresh_market_data_md_sidefx_deprecated_metrics();
                 return;
             }
             Err(actual) => cur = actual,
         }
     }
-    set_market_data_md_sidefx_queue_depth(0);
+    match pipeline {
+        MdSidefxPipeline::AccountQuote => set_market_data_account_sidefx_queue_depth(0),
+        MdSidefxPipeline::TxDiscovery => set_market_data_tx_sidefx_queue_depth(0),
+    }
+    refresh_market_data_md_sidefx_deprecated_metrics();
 }
 
-pub fn md_sidefx_try_enqueue(sender: &MdSidefxSender, job: MdSidefxCommand) {
+fn md_sidefx_inc_processed(pipeline: MdSidefxPipeline) {
+    match pipeline {
+        MdSidefxPipeline::AccountQuote => inc_market_data_account_sidefx_jobs_processed_total(),
+        MdSidefxPipeline::TxDiscovery => inc_market_data_tx_sidefx_jobs_processed_total(),
+    }
+    inc_market_data_md_sidefx_jobs_processed_total();
+}
+
+/// Account-Quote enqueue: no silent drop — try_send then blocking send on account ingest only.
+pub fn md_account_sidefx_try_enqueue_classed(
+    sender: &MdAccountSidefxSender,
+    _class: SidefxUpdateClass,
+    job: MdSidefxCommand,
+) {
+    debug_assert_eq!(
+        md_sidefx_command_pipeline(&job),
+        MdSidefxPipeline::AccountQuote,
+        "account sidefx enqueue called with TX-discovery job"
+    );
+    match sender.tx.try_send(job) {
+        Ok(()) => {
+            md_sidefx_inc_queue_depth(&sender.queue_depth, MdSidefxPipeline::AccountQuote);
+        }
+        Err(err) => {
+            inc_market_data_account_sidefx_backpressure_total();
+            let job = match err {
+                std_mpsc::TrySendError::Full(j) => j,
+                std_mpsc::TrySendError::Disconnected(j) => j,
+            };
+            sender
+                .tx
+                .send(job)
+                .expect("md-account-sidefx worker disconnected");
+            md_sidefx_inc_queue_depth(&sender.queue_depth, MdSidefxPipeline::AccountQuote);
+        }
+    }
+}
+
+pub fn md_account_sidefx_try_enqueue(sender: &MdAccountSidefxSender, job: MdSidefxCommand) {
     let class = md_sidefx_job_update_class(&job);
-    md_sidefx_try_enqueue_classed(sender, class, job);
+    md_account_sidefx_try_enqueue_classed(sender, class, job);
 }
 
-pub fn md_sidefx_try_enqueue_classed(
-    sender: &MdSidefxSender,
+/// TX-Discovery enqueue: bounded try_send + drop counters (existing behaviour).
+pub fn md_tx_sidefx_try_enqueue(sender: &MdTxSidefxSender, job: MdSidefxCommand) {
+    debug_assert_eq!(
+        md_sidefx_command_pipeline(&job),
+        MdSidefxPipeline::TxDiscovery,
+        "tx sidefx enqueue called with account-quote job"
+    );
+    md_tx_sidefx_try_enqueue_classed(sender, SidefxUpdateClass::ExecHot, job);
+}
+
+pub fn md_tx_sidefx_try_enqueue_classed(
+    sender: &MdTxSidefxSender,
     class: SidefxUpdateClass,
     job: MdSidefxCommand,
 ) {
     let depth = sender.queue_depth.load(Ordering::Relaxed);
     if depth >= sender.queue_capacity {
         if class.is_exec_hot() {
+            inc_market_data_tx_sidefx_enqueue_dropped_total();
             inc_market_data_md_sidefx_enqueue_dropped_total();
         } else {
             inc_market_data_md_sidefx_enrich_enqueue_dropped_total();
@@ -339,12 +461,34 @@ pub fn md_sidefx_try_enqueue_classed(
         return;
     }
     if sender.tx.try_send(job).is_ok() {
-        let new_depth = sender.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
-        set_market_data_md_sidefx_queue_depth(new_depth);
+        md_sidefx_inc_queue_depth(&sender.queue_depth, MdSidefxPipeline::TxDiscovery);
     } else if class.is_exec_hot() {
+        inc_market_data_tx_sidefx_enqueue_dropped_total();
         inc_market_data_md_sidefx_enqueue_dropped_total();
     } else {
         inc_market_data_md_sidefx_enrich_enqueue_dropped_total();
+    }
+}
+
+/// Deprecated: routes to the correct pipeline by command variant.
+pub fn md_sidefx_try_enqueue(workers: &MdSidefxWorkers, job: MdSidefxCommand) {
+    match md_sidefx_command_pipeline(&job) {
+        MdSidefxPipeline::AccountQuote => md_account_sidefx_try_enqueue(&workers.account, job),
+        MdSidefxPipeline::TxDiscovery => md_tx_sidefx_try_enqueue(&workers.tx, job),
+    }
+}
+
+/// Deprecated: routes to the correct pipeline by command variant.
+pub fn md_sidefx_try_enqueue_classed(
+    workers: &MdSidefxWorkers,
+    class: SidefxUpdateClass,
+    job: MdSidefxCommand,
+) {
+    match md_sidefx_command_pipeline(&job) {
+        MdSidefxPipeline::AccountQuote => {
+            md_account_sidefx_try_enqueue_classed(&workers.account, class, job)
+        }
+        MdSidefxPipeline::TxDiscovery => md_tx_sidefx_try_enqueue_classed(&workers.tx, class, job),
     }
 }
 
@@ -402,19 +546,20 @@ fn md_sidefx_worker_loop(
     worker: Arc<dyn SidefxWorkerHost>,
     rx: std_mpsc::Receiver<MdSidefxCommand>,
     queue_depth: Arc<AtomicUsize>,
+    pipeline: MdSidefxPipeline,
 ) {
     loop {
         let Ok(first) = rx.recv() else {
             break;
         };
-        md_sidefx_dec_queue_depth(&queue_depth);
-        inc_market_data_md_sidefx_jobs_processed_total();
+        md_sidefx_dec_queue_depth(&queue_depth, pipeline);
+        md_sidefx_inc_processed(pipeline);
         let mut jobs = vec![first];
         while jobs.len() < MARKET_DATA_MD_SIDEFX_BURST_MAX {
             match rx.try_recv() {
                 Ok(job) => {
-                    md_sidefx_dec_queue_depth(&queue_depth);
-                    inc_market_data_md_sidefx_jobs_processed_total();
+                    md_sidefx_dec_queue_depth(&queue_depth, pipeline);
+                    md_sidefx_inc_processed(pipeline);
                     jobs.push(job);
                 }
                 Err(std_mpsc::TryRecvError::Empty) => break,
@@ -434,30 +579,335 @@ fn md_sidefx_worker_loop(
     }
 }
 
-pub fn spawn_md_sidefx_worker(
+fn spawn_md_sidefx_pipeline_worker(
     host: Arc<dyn SidefxWorkerHost>,
     queue_capacity: usize,
-) -> MdSidefxSender {
+    thread_name: &'static str,
+    pipeline: MdSidefxPipeline,
+) -> (std_mpsc::SyncSender<MdSidefxCommand>, Arc<AtomicUsize>) {
     let (tx, rx) = std_mpsc::sync_channel::<MdSidefxCommand>(queue_capacity);
     let queue_depth = Arc::new(AtomicUsize::new(0));
     let depth_worker = Arc::clone(&queue_depth);
+    let host_worker = Arc::clone(&host);
     let _join: JoinHandle<()> = std::thread::Builder::new()
-        .name("md-sidefx".into())
-        .spawn(move || md_sidefx_worker_loop(host, rx, depth_worker))
+        .name(thread_name.into())
+        .spawn(move || md_sidefx_worker_loop(host_worker, rx, depth_worker, pipeline))
         .expect("spawn md-sidefx thread");
-    MdSidefxSender {
-        tx,
-        queue_depth,
-        queue_capacity,
+    (tx, queue_depth)
+}
+
+/// Spawn both Account-Quote and TX-Discovery sidefx OS threads.
+pub fn spawn_md_sidefx_workers(
+    host: Arc<dyn SidefxWorkerHost>,
+    account_queue_capacity: usize,
+    tx_queue_capacity: usize,
+) -> MdSidefxWorkers {
+    let (account_tx, account_depth) = spawn_md_sidefx_pipeline_worker(
+        Arc::clone(&host),
+        account_queue_capacity,
+        "md-account-sidefx",
+        MdSidefxPipeline::AccountQuote,
+    );
+    let (tx_tx, tx_depth) = spawn_md_sidefx_pipeline_worker(
+        host,
+        tx_queue_capacity,
+        "md-tx-sidefx",
+        MdSidefxPipeline::TxDiscovery,
+    );
+    MdSidefxWorkers {
+        account: MdAccountSidefxSender {
+            tx: account_tx,
+            queue_depth: account_depth,
+            queue_capacity: account_queue_capacity,
+        },
+        tx: MdTxSidefxSender {
+            tx: tx_tx,
+            queue_depth: tx_depth,
+            queue_capacity: tx_queue_capacity,
+        },
     }
+}
+
+/// Deprecated alias: spawns both pipelines with default caps.
+pub fn spawn_md_sidefx_worker(
+    host: Arc<dyn SidefxWorkerHost>,
+    tx_queue_capacity: usize,
+) -> MdSidefxWorkers {
+    spawn_md_sidefx_workers(
+        host,
+        MARKET_DATA_MD_ACCOUNT_SIDEFX_QUEUE_CAP,
+        tx_queue_capacity,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{
+        MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL,
+        MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL,
+    };
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
 
     const RAYDIUM_CPMM_OWNER: Pubkey =
         solana_sdk::pubkey!("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
+
+    struct TestBlockingHost;
+
+    static LIVE_POOL_CACHE_TEST: Mutex<Option<crate::execution::live_pool_cache::LivePoolCache>> =
+        Mutex::new(None);
+
+    fn test_live_pool_cache() -> &'static crate::execution::live_pool_cache::LivePoolCache {
+        let mut guard = LIVE_POOL_CACHE_TEST.lock().expect("lock");
+        if guard.is_none() {
+            *guard = Some(crate::execution::live_pool_cache::LivePoolCache::new());
+        }
+        // SAFETY: test-only static, never dropped while tests run.
+        unsafe {
+            &*(guard.as_ref().expect("cache")
+                as *const crate::execution::live_pool_cache::LivePoolCache)
+        }
+    }
+
+    impl SidefxWorkerHost for TestBlockingHost {
+        fn build_version(&self) -> &'static str {
+            "test"
+        }
+        fn next_event_id(&self) -> String {
+            "e".into()
+        }
+        fn write_market_event_jsonl(&self, _event: &crate::ipc::MarketEvent) {}
+        fn nats_enabled(&self) -> bool {
+            false
+        }
+        fn enqueue_core_market_event(
+            &self,
+            _event: crate::ipc::MarketEvent,
+            _trace: Option<super::super::host::MarketEventCorePublishTrace>,
+        ) -> bool {
+            false
+        }
+        fn enqueue_jetstream(
+            &self,
+            _subject: String,
+            _payload: serde_json::Value,
+            _log_fail: &'static str,
+            _bump_market_events_published_total: bool,
+        ) {
+        }
+        fn flush_lru_touches(&self, _scratch: &mut MdSidefxBurstScratch) {}
+        fn live_pool_cache(&self) -> &crate::execution::live_pool_cache::LivePoolCache {
+            test_live_pool_cache()
+        }
+        fn pool_mint_map_insert(&self, _pool: String, _mint: String) {}
+        fn pool_mint_map_get(&self, _pool: &str) -> Option<String> {
+            None
+        }
+        fn pool_creator_cache_get(&self, _pool: &str) -> Option<String> {
+            None
+        }
+        fn pool_creator_cache_insert(&self, _pool: String, _creator: String) {}
+        fn pool_creator_cache_insert_if_absent(&self, _pool: String, _creator: String) -> bool {
+            false
+        }
+        fn creator_cache_set(&self, _mint: String, _creator: String) {}
+        fn creator_cache_insert_if_absent(&self, _mint: String, _creator: String) -> bool {
+            false
+        }
+        fn creator_cache_insert_returning_old(
+            &self,
+            _mint: String,
+            _creator: String,
+        ) -> Option<String> {
+            None
+        }
+        fn high_priority_bonding_curves_insert(&self, _pool: Pubkey) {}
+        fn known_pump_amm_pools_insert(&self, _pool: Pubkey) -> bool {
+            false
+        }
+        fn known_trade_dex_pools_insert(&self, _pool: Pubkey) -> bool {
+            false
+        }
+        fn should_emit_curve_progress(
+            &self,
+            _pool: &Pubkey,
+            _progress_bps: u32,
+            _complete: bool,
+        ) -> bool {
+            false
+        }
+        fn record_curve_progress_emitted(
+            &self,
+            _pool: Pubkey,
+            _progress_bps: u32,
+            _complete: bool,
+        ) {
+        }
+        fn vault_membership_view(
+            &self,
+            _vault: &Pubkey,
+        ) -> Option<super::super::host::SidefxVaultMembershipView> {
+            None
+        }
+        fn snapshot_vault_pair_balances(
+            &self,
+            _vault: &Pubkey,
+            _new_balance: u64,
+        ) -> Option<(u64, u64)> {
+            None
+        }
+        fn note_trade_pool_lru_touches(&self, _pool: Pubkey, _scratch: &mut MdSidefxBurstScratch) {}
+        fn is_hot_pool(&self, _pool: &Pubkey) -> bool {
+            false
+        }
+        fn is_open_position_pumpfun_pin(&self, _pool: &Pubkey) -> bool {
+            false
+        }
+        fn is_enrichment_member(&self, _pool: &Pubkey) -> bool {
+            false
+        }
+        fn pool_has_live_vault_geyser_feed(&self, _pool: Pubkey) -> bool {
+            false
+        }
+        fn maybe_refresh_arb_dlmm_bin_window(&self, _pool: Pubkey, _new_active_id: i32) -> bool {
+            false
+        }
+        fn maybe_retry_deferred_hot_pool_reserves_on_cache_fill(&self, _pool: &Pubkey) {}
+        fn maybe_spawn_raydium_serum_cold_backfill(
+            &self,
+            _pool: Pubkey,
+            _state: &crate::execution::live_pool_cache::RaydiumAmmState,
+        ) {
+        }
+        fn apply_tx_pool_accounts_for_hot_pool(
+            &self,
+            _pool: Pubkey,
+            _dex: DexType,
+            _base_mint: Pubkey,
+            _quote_mint: Pubkey,
+            _pool_accounts: &[Pubkey],
+            _slot: u64,
+        ) {
+        }
+    }
+
+    fn mk_account_job() -> MdSidefxCommand {
+        MdSidefxCommand::VaultBalanceTick {
+            run_id: "r".into(),
+            vault_pubkey: Pubkey::new_unique(),
+            balance: 1,
+            slot: 1,
+            grpc_recv_at: Instant::now(),
+            update_class: SidefxUpdateClass::ExecHot,
+        }
+    }
+
+    fn mk_tx_job() -> MdSidefxCommand {
+        MdSidefxCommand::PumpFunPoolMintMapInsert {
+            run_id: "r".into(),
+            pool_address: Pubkey::new_unique(),
+            mint_str: "m".into(),
+            slot: None,
+            tx_grpc_recv_at: Instant::now(),
+            creator_override: None,
+        }
+    }
+
+    #[test]
+    fn md_sidefx_routing_table_covers_all_variants() {
+        let variants: Vec<MdSidefxCommand> = vec![
+            mk_tx_job(),
+            MdSidefxCommand::PumpFunDevWalletFromPoolCreated {
+                run_id: "r".into(),
+                pool_address: Pubkey::new_unique(),
+                base_mint: Pubkey::new_unique(),
+                creator: Pubkey::new_unique(),
+                slot: 1,
+                tx_geyser_recv_at: Instant::now(),
+            },
+            MdSidefxCommand::PumpAmmCreatePoolObserved {
+                run_id: "r".into(),
+                pool_address: Pubkey::new_unique(),
+                base_mint: "b".into(),
+                quote_mint: "q".into(),
+                slot: 1,
+                tx_geyser_recv_at: Instant::now(),
+            },
+            MdSidefxCommand::PumpAmmTradeWithAccounts {
+                run_id: "r".into(),
+                pool_address: Pubkey::new_unique(),
+                base_mint_pk: Pubkey::new_unique(),
+                slot: 1,
+                is_buy: true,
+                pool_accounts: vec![],
+                pump_amm_sell_requires_cashback_remaining: false,
+                pump_amm_sell_cashback_third_meta: None,
+                pump_amm_sell_extended_tail_0: None,
+                pump_amm_sell_extended_tail_1: None,
+                pump_amm_sell_extended_fee_tail_0: None,
+                pump_amm_sell_extended_fee_tail_1: None,
+                pump_amm_sell_requires_fee_tail: false,
+                pump_amm_sell_requires_pre_fee_metas: false,
+                pump_amm_sell_pre_fee_meta_1: None,
+                tx_geyser_recv_at: Instant::now(),
+            },
+            MdSidefxCommand::GenericDexFirstTradeAccounts {
+                run_id: "r".into(),
+                pool_address: Pubkey::new_unique(),
+                mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                dex: DexType::RaydiumAmmV4,
+                pool_accounts: vec![],
+                slot: 1,
+                tx_geyser_recv_at: Instant::now(),
+            },
+            MdSidefxCommand::BondingCurveDevWallet {
+                run_id: "r".into(),
+                pool_address: Pubkey::new_unique(),
+                creator: Pubkey::new_unique(),
+                slot: 1,
+                grpc_recv_at: Instant::now(),
+                virtual_token_reserves: 1,
+                virtual_sol_reserves: 1,
+                real_token_reserves: 1,
+                real_sol_reserves: 1,
+                complete: false,
+                cashback_enabled: false,
+            },
+            mk_account_job(),
+            MdSidefxCommand::TouchBinArrayTick {
+                pda: Pubkey::new_unique(),
+                update_class: SidefxUpdateClass::ExecHot,
+            },
+            MdSidefxCommand::DlmmPoolStatePublishSignal {
+                run_id: "r".into(),
+                pool_address: Pubkey::new_unique(),
+                slot: 1,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
+            },
+            MdSidefxCommand::TradePoolLruTouch {
+                pool: Pubkey::new_unique(),
+            },
+            MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "r".into(),
+                pool_pubkey: Pubkey::new_unique(),
+                owner: RAYDIUM_CPMM_OWNER,
+                account_data: vec![],
+                slot: 1,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
+            },
+            MdSidefxCommand::LivePoolCacheMintDecimals {
+                mint: Pubkey::new_unique(),
+                decimals: 6,
+            },
+        ];
+        for job in variants {
+            let _ = md_sidefx_command_pipeline(&job);
+        }
+    }
 
     #[test]
     fn md_sidefx_coalesce_preserves_exec_hot_class_over_enrich() {
@@ -539,5 +989,53 @@ mod tests {
         let (hot_vaults, enrich_vaults, _, _) = scratch.drain_lru_touches();
         assert_eq!(hot_vaults, vec![vault]);
         assert!(enrich_vaults.is_empty());
+    }
+
+    #[test]
+    fn tx_flood_drops_tx_jobs_without_dropping_account_jobs() {
+        let host = Arc::new(TestBlockingHost) as Arc<dyn SidefxWorkerHost>;
+        let workers = spawn_md_sidefx_workers(host, 8, 4);
+        let tx_dropped_before = MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let account_dropped_before =
+            MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
+
+        for _ in 0..16 {
+            md_tx_sidefx_try_enqueue(&workers.tx, mk_tx_job());
+        }
+
+        md_account_sidefx_try_enqueue(&workers.account, mk_account_job());
+
+        let tx_dropped_after = MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let account_dropped_after =
+            MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
+
+        assert!(
+            tx_dropped_after > tx_dropped_before,
+            "TX queue should drop under flood"
+        );
+        assert_eq!(
+            account_dropped_after, account_dropped_before,
+            "account pipeline must never increment drop counter"
+        );
+        assert!(
+            workers.account.queue_depth.load(Ordering::Relaxed) > 0
+                || MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+                    == account_dropped_before,
+            "account job should be accepted despite TX flood"
+        );
+    }
+
+    #[test]
+    fn account_queue_never_increments_drop_counter_under_cap() {
+        let host = Arc::new(TestBlockingHost) as Arc<dyn SidefxWorkerHost>;
+        let workers = spawn_md_sidefx_workers(host, 32, 4096);
+        let dropped_before =
+            MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
+        for _ in 0..8 {
+            md_account_sidefx_try_enqueue(&workers.account, mk_account_job());
+        }
+        let dropped_after =
+            MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
+        assert_eq!(dropped_before, dropped_after);
     }
 }

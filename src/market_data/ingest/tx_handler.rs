@@ -13,8 +13,8 @@ use crate::market_data::publish::{
     try_enqueue_account_path_nats_job, AccountPathNatsJob, AccountPublishSender,
 };
 use crate::market_data::sidefx::{
-    host::market_event_should_nats_core, md_sidefx_try_enqueue, MarketEventCorePublishTrace,
-    MdSidefxCommand, MdSidefxSender,
+    host::market_event_should_nats_core, md_tx_sidefx_try_enqueue, MarketEventCorePublishTrace,
+    MdSidefxCommand, MdTxSidefxSender,
 };
 use crate::metrics::{
     market_data_bump_geyser_head_slot, record_market_data_tx_channel_lag_ms,
@@ -40,7 +40,7 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
     tx_count: &AtomicU64,
     account_publish_tx: Option<&AccountPublishSender>,
     md_state: &MdStateSender,
-    md_sidefx: &MdSidefxSender,
+    md_tx_sidefx: &MdTxSidefxSender,
 ) {
     record_market_data_tx_handler_processed();
     let recv_at = Instant::now();
@@ -117,8 +117,8 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
                 dex: DexType::PumpFun,
                 ..
             } => {
-                md_sidefx_try_enqueue(
-                    md_sidefx,
+                md_tx_sidefx_try_enqueue(
+                    md_tx_sidefx,
                     MdSidefxCommand::PumpFunPoolMintMapInsert {
                         run_id: run_id.to_string(),
                         pool_address: *pool_address,
@@ -136,8 +136,8 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
                 dex: DexType::PumpFun,
                 ..
             } => {
-                md_sidefx_try_enqueue(
-                    md_sidefx,
+                md_tx_sidefx_try_enqueue(
+                    md_tx_sidefx,
                     MdSidefxCommand::PumpFunPoolMintMapInsert {
                         run_id: run_id.to_string(),
                         pool_address: *pool_address,
@@ -214,8 +214,8 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
         ..
     }) = parsed_event.as_ref()
     {
-        md_sidefx_try_enqueue(
-            md_sidefx,
+        md_tx_sidefx_try_enqueue(
+            md_tx_sidefx,
             MdSidefxCommand::PumpAmmCreatePoolObserved {
                 run_id: run_id.to_string(),
                 pool_address: *pool_address,
@@ -245,8 +245,8 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
         ..
     }) = parsed_event.as_ref()
     {
-        md_sidefx_try_enqueue(
-            md_sidefx,
+        md_tx_sidefx_try_enqueue(
+            md_tx_sidefx,
             MdSidefxCommand::PumpAmmTradeWithAccounts {
                 run_id: run_id.to_string(),
                 pool_address: *pool_address,
@@ -279,8 +279,8 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
     }) = parsed_event.as_ref()
     {
         if !matches!(dex, DexType::PumpFunAmm) {
-            md_sidefx_try_enqueue(
-                md_sidefx,
+            md_tx_sidefx_try_enqueue(
+                md_tx_sidefx,
                 MdSidefxCommand::GenericDexFirstTradeAccounts {
                     run_id: run_id.to_string(),
                     pool_address: *pool_address,
@@ -296,8 +296,8 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
     }
 
     if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
-        md_sidefx_try_enqueue(
-            md_sidefx,
+        md_tx_sidefx_try_enqueue(
+            md_tx_sidefx,
             MdSidefxCommand::TradePoolLruTouch {
                 pool: *pool_address,
             },

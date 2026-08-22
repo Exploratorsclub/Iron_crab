@@ -1523,6 +1523,23 @@ pub static MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL: Lazy<AtomicU64> =
 /// Phase-R-R4: jobs processed by the `md-sidefx` worker.
 pub static MARKET_DATA_MD_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+
+pub static MARKET_DATA_ACCOUNT_SIDEFX_QUEUE_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_SIDEFX_BACKPRESSURE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_FAIL_LOUD_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub static MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Phase 1 P1: `DevWalletIdentified` published from TX ingest (PoolCreated / trade fast-path).
 pub static MARKET_DATA_DEVWALLET_TX_PUBLISHED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1956,6 +1973,54 @@ pub fn market_data_tracked_membership_snapshot_age_ms() -> u64 {
 #[inline]
 pub fn inc_market_data_ingest_membership_snapshot_hits_total() {
     MARKET_DATA_INGEST_MEMBERSHIP_SNAPSHOT_HITS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_account_sidefx_queue_depth(depth: usize) {
+    MARKET_DATA_ACCOUNT_SIDEFX_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_sidefx_enqueue_dropped_total() {
+    MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_sidefx_backpressure_total() {
+    MARKET_DATA_ACCOUNT_SIDEFX_BACKPRESSURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_sidefx_enqueue_fail_loud_total() {
+    MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_FAIL_LOUD_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_sidefx_jobs_processed_total() {
+    MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_tx_sidefx_queue_depth(depth: usize) {
+    MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_sidefx_enqueue_dropped_total() {
+    MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_sidefx_jobs_processed_total() {
+    MARKET_DATA_TX_SIDEFX_JOBS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Deprecated combined depth = account + tx pipeline depths.
+#[inline]
+pub fn refresh_market_data_md_sidefx_deprecated_metrics() {
+    let combined = MARKET_DATA_ACCOUNT_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
+        + MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed);
+    MARKET_DATA_MD_SIDEFX_QUEUE_DEPTH.store(combined, Ordering::Relaxed);
 }
 
 #[inline]
@@ -8939,6 +9004,38 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_md_sidefx_jobs_processed_total",
         MARKET_DATA_MD_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_sidefx_queue_depth",
+        MARKET_DATA_ACCOUNT_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_sidefx_enqueue_dropped_total",
+        MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_sidefx_backpressure_total",
+        MARKET_DATA_ACCOUNT_SIDEFX_BACKPRESSURE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_sidefx_enqueue_fail_loud_total",
+        MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_FAIL_LOUD_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_sidefx_jobs_processed_total",
+        MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_sidefx_queue_depth",
+        MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_sidefx_enqueue_dropped_total",
+        MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_sidefx_jobs_processed_total",
+        MARKET_DATA_TX_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_devwallet_tx_published_total",

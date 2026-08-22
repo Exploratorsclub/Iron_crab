@@ -13,8 +13,12 @@ pub use handlers::{
 };
 pub use host::{MarketEventCorePublishTrace, SidefxVaultMembershipView, SidefxWorkerHost};
 pub use worker::{
-    md_sidefx_coalesce_burst, md_sidefx_coalesce_key, md_sidefx_flush_pending_md_state_jobs,
+    md_account_sidefx_try_enqueue, md_account_sidefx_try_enqueue_classed, md_sidefx_coalesce_burst,
+    md_sidefx_coalesce_key, md_sidefx_command_pipeline, md_sidefx_flush_pending_md_state_jobs,
     md_sidefx_job_update_class, md_sidefx_try_enqueue, md_sidefx_try_enqueue_classed,
-    spawn_md_sidefx_worker, MdSidefxBurstScratch, MdSidefxCommand, MdSidefxSender,
-    SidefxUpdateClass, MARKET_DATA_MD_SIDEFX_BURST_MAX, MARKET_DATA_MD_SIDEFX_QUEUE_CAP,
+    md_tx_sidefx_try_enqueue, md_tx_sidefx_try_enqueue_classed, spawn_md_sidefx_worker,
+    spawn_md_sidefx_workers, MdAccountSidefxSender, MdSidefxBurstScratch, MdSidefxCommand,
+    MdSidefxPipeline, MdSidefxWorkers, MdTxSidefxSender, SidefxUpdateClass,
+    MARKET_DATA_MD_ACCOUNT_SIDEFX_QUEUE_CAP, MARKET_DATA_MD_SIDEFX_BURST_MAX,
+    MARKET_DATA_MD_SIDEFX_QUEUE_CAP, MARKET_DATA_MD_TX_SIDEFX_QUEUE_CAP,
 };
