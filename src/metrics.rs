@@ -1535,6 +1535,19 @@ pub static MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_FAIL_LOUD_TOTAL: Lazy<AtomicU64> =
 pub static MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+pub static MARKET_DATA_TX_PIN_SEED_SIDEFX_QUEUE_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_DISCOVERY_SIDEFX_QUEUE_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_DISCOVERY_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Deprecated combined TX depth/drops/processed (pin-seed + discovery); refreshed on pipeline updates.
 pub static MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -2001,6 +2014,36 @@ pub fn inc_market_data_account_sidefx_jobs_processed_total() {
 }
 
 #[inline]
+pub fn set_market_data_tx_pin_seed_sidefx_queue_depth(depth: usize) {
+    MARKET_DATA_TX_PIN_SEED_SIDEFX_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_pin_seed_sidefx_enqueue_dropped_total() {
+    MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_pin_seed_sidefx_jobs_processed_total() {
+    MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_tx_discovery_sidefx_queue_depth(depth: usize) {
+    MARKET_DATA_TX_DISCOVERY_SIDEFX_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_discovery_sidefx_enqueue_dropped_total() {
+    MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_discovery_sidefx_jobs_processed_total() {
+    MARKET_DATA_TX_DISCOVERY_SIDEFX_JOBS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
 pub fn set_market_data_tx_sidefx_queue_depth(depth: usize) {
     MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
 }
@@ -2015,11 +2058,13 @@ pub fn inc_market_data_tx_sidefx_jobs_processed_total() {
     MARKET_DATA_TX_SIDEFX_JOBS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Deprecated combined depth = account + tx pipeline depths.
+/// Deprecated combined depth = account + tx (pin-seed + discovery) pipeline depths.
 #[inline]
 pub fn refresh_market_data_md_sidefx_deprecated_metrics() {
-    let combined = MARKET_DATA_ACCOUNT_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
-        + MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed);
+    let tx_combined = MARKET_DATA_TX_PIN_SEED_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
+        + MARKET_DATA_TX_DISCOVERY_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed);
+    MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH.store(tx_combined, Ordering::Relaxed);
+    let combined = MARKET_DATA_ACCOUNT_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed) + tx_combined;
     MARKET_DATA_MD_SIDEFX_QUEUE_DEPTH.store(combined, Ordering::Relaxed);
 }
 
@@ -9024,6 +9069,30 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_account_sidefx_jobs_processed_total",
         MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_pin_seed_sidefx_queue_depth",
+        MARKET_DATA_TX_PIN_SEED_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_pin_seed_sidefx_enqueue_dropped_total",
+        MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_pin_seed_sidefx_jobs_processed_total",
+        MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_discovery_sidefx_queue_depth",
+        MARKET_DATA_TX_DISCOVERY_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_discovery_sidefx_enqueue_dropped_total",
+        MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_discovery_sidefx_jobs_processed_total",
+        MARKET_DATA_TX_DISCOVERY_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_tx_sidefx_queue_depth",
