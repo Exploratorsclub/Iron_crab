@@ -77,10 +77,10 @@ use ironcrab::market_data::sidefx::{
     md_sidefx_flush_pending_md_state_jobs as sidefx_flush_pending,
     md_sidefx_process_live_pool_cache_account_update as sidefx_process_live_pool_cache_account_update,
     md_sidefx_process_vault_balance_tick as sidefx_process_vault_balance_tick,
-    md_sidefx_try_enqueue as sidefx_try_enqueue, spawn_md_sidefx_worker as spawn_sidefx_worker,
-    MarketEventCorePublishTrace, MdSidefxBurstScratch, MdSidefxCommand, MdSidefxSender,
-    SidefxUpdateClass, SidefxVaultMembershipView, SidefxWorkerHost,
-    MARKET_DATA_MD_SIDEFX_QUEUE_CAP,
+    md_sidefx_try_enqueue as sidefx_try_enqueue, spawn_md_sidefx_workers as spawn_sidefx_workers,
+    MarketEventCorePublishTrace, MdAccountSidefxSender, MdSidefxBurstScratch, MdSidefxCommand,
+    MdSidefxWorkers, MdTxSidefxSender, SidefxUpdateClass, SidefxVaultMembershipView,
+    SidefxWorkerHost, MARKET_DATA_MD_ACCOUNT_SIDEFX_QUEUE_CAP, MARKET_DATA_MD_TX_SIDEFX_QUEUE_CAP,
 };
 use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_admitted_pool_sets_from_admission, explicit_set_snapshot_path,
@@ -777,25 +777,29 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
     }
 }
 
-/// Phase 5b: md-sidefx worker (delegates to `sidefx/worker.rs`).
+/// Phase 5b: md-sidefx workers (delegates to `sidefx/worker.rs`).
 fn spawn_md_sidefx_worker(
     ctx: Arc<MarketDataContext>,
     publish_tx: Option<mpsc::Sender<AccountPathNatsJob>>,
     md_state: MdStateSender,
     track_worker: TrackWorkerSender,
-) -> MdSidefxSender {
+) -> MdSidefxWorkers {
     let host = Arc::new(MarketDataSidefxHost {
         ctx,
         publish_tx,
         md_state,
         track_worker,
     }) as Arc<dyn SidefxWorkerHost>;
-    spawn_sidefx_worker(host, MARKET_DATA_MD_SIDEFX_QUEUE_CAP)
+    spawn_sidefx_workers(
+        host,
+        MARKET_DATA_MD_ACCOUNT_SIDEFX_QUEUE_CAP,
+        MARKET_DATA_MD_TX_SIDEFX_QUEUE_CAP,
+    )
 }
 
-/// Eval grep: bounded md-sidefx enqueue (never blocks ingest).
+/// Eval grep: bounded md-sidefx enqueue (never blocks TX ingest).
 #[cfg_attr(not(test), allow(dead_code))]
-fn md_sidefx_try_enqueue(sender: &MdSidefxSender, job: MdSidefxCommand) {
+fn md_sidefx_try_enqueue(sender: &MdSidefxWorkers, job: MdSidefxCommand) {
     sidefx_try_enqueue(sender, job);
 }
 
@@ -10431,7 +10435,7 @@ async fn handle_geyser_account(
     recv_at: Instant,
     publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
     md_state: &MdStateSender,
-    md_sidefx: &MdSidefxSender,
+    md_account_sidefx: &MdAccountSidefxSender,
     update_class: ironcrab::market_data::ingest::AccountUpdateClass,
 ) {
     handle_geyser_account_update(
@@ -10442,7 +10446,7 @@ async fn handle_geyser_account(
         recv_at,
         publish_tx,
         md_state,
-        md_sidefx,
+        md_account_sidefx,
         update_class,
     )
     .await;
@@ -10456,7 +10460,7 @@ async fn handle_geyser_transaction(
     tx_count: &AtomicU64,
     account_publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
     md_state: &MdStateSender,
-    md_sidefx: &MdSidefxSender,
+    md_tx_sidefx: &MdTxSidefxSender,
 ) {
     handle_geyser_transaction_update(
         ctx.as_ref(),
@@ -10465,7 +10469,7 @@ async fn handle_geyser_transaction(
         tx_count,
         account_publish_tx,
         md_state,
-        md_sidefx,
+        md_tx_sidefx,
     )
     .await;
 }
@@ -10887,7 +10891,7 @@ async fn run_geyser_loop(
     let tx_count_geyser_tx = Arc::clone(&tx_count);
     let account_publish_tx_geyser_tx = account_publish_tx.clone();
     let md_state_geyser_tx = md_state.clone();
-    let md_sidefx_geyser_tx = md_sidefx.clone();
+    let md_sidefx_geyser_tx = md_sidefx.tx.clone();
     let mut transaction_rx_geyser = transaction_rx;
     tokio::spawn(async move {
         loop {
@@ -10963,7 +10967,7 @@ async fn run_geyser_loop(
         let account_count_w = Arc::clone(&account_count_geyser_acc);
         let publish_tx_w = account_publish_tx.clone();
         let md_state_w = md_state.clone();
-        let md_sidefx_w = md_sidefx.clone();
+        let md_sidefx_w = md_sidefx.account.clone();
         tokio::spawn(async move {
             while let Some(work) = high_rx.recv().await {
                 dec_market_data_account_high_priority_queue_depth();
@@ -11010,7 +11014,7 @@ async fn run_geyser_loop(
         let account_count_w = Arc::clone(&account_count_geyser_acc);
         let publish_tx_w = account_publish_tx.clone();
         let md_state_w = md_state.clone();
-        let md_sidefx_w = md_sidefx.clone();
+        let md_sidefx_w = md_sidefx.account.clone();
         let low_tx_drain = low_tx.clone();
         let enrich_coalesce_drain = Arc::clone(&enrich_coalesce);
         let enrich_notify_drain = Arc::clone(&enrich_notify);
@@ -14192,7 +14196,7 @@ mod pr_b_geyser_tracking_tests {
         ctx: &Arc<MarketDataContext>,
         md_state: &MdStateSender,
         track_worker: TrackWorkerSender,
-    ) -> MdSidefxSender {
+    ) -> MdSidefxWorkers {
         spawn_md_sidefx_worker(Arc::clone(ctx), None, md_state.clone(), track_worker)
     }
 
@@ -14202,10 +14206,10 @@ mod pr_b_geyser_tracking_tests {
         }
     }
 
-    fn fill_md_sidefx_queue(md_sidefx: &MdSidefxSender) {
-        for _ in 0..md_sidefx.queue_capacity {
-            md_sidefx_try_enqueue(
-                md_sidefx,
+    fn fill_md_sidefx_queue(md_sidefx: &MdSidefxWorkers) {
+        for _ in 0..md_sidefx.tx.queue_capacity {
+            ironcrab::market_data::sidefx::md_tx_sidefx_try_enqueue(
+                &md_sidefx.tx,
                 MdSidefxCommand::PumpFunPoolMintMapInsert {
                     run_id: "test".into(),
                     pool_address: Pubkey::new_unique(),
@@ -19010,7 +19014,7 @@ mod pr_b_geyser_tracking_tests {
                 &tx_count,
                 None,
                 &md_state,
-                &md_sidefx,
+                &md_sidefx.tx,
             ),
         )
         .await;
@@ -19111,7 +19115,7 @@ mod pr_b_geyser_tracking_tests {
             Instant::now(),
             None,
             &md_state,
-            &md_sidefx,
+            &md_sidefx.account,
             AccountUpdateClass::ExecHot,
         )
         .await;
@@ -19590,7 +19594,7 @@ mod pr_b_geyser_tracking_tests {
                 &tx_count,
                 None,
                 &md_state,
-                &md_sidefx,
+                &md_sidefx.tx,
             ),
         )
         .await;
@@ -19675,7 +19679,7 @@ mod pr_b_geyser_tracking_tests {
                 &tx_count,
                 None,
                 &md_state,
-                &md_sidefx,
+                &md_sidefx.tx,
             ),
         )
         .await;
