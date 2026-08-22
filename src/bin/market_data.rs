@@ -79,8 +79,9 @@ use ironcrab::market_data::sidefx::{
     md_sidefx_process_vault_balance_tick as sidefx_process_vault_balance_tick,
     md_sidefx_try_enqueue as sidefx_try_enqueue, spawn_md_sidefx_workers as spawn_sidefx_workers,
     MarketEventCorePublishTrace, MdAccountSidefxSender, MdSidefxBurstScratch, MdSidefxCommand,
-    MdSidefxWorkers, MdTxSidefxSender, SidefxUpdateClass, SidefxVaultMembershipView,
-    SidefxWorkerHost, MARKET_DATA_MD_ACCOUNT_SIDEFX_QUEUE_CAP, MARKET_DATA_MD_TX_SIDEFX_QUEUE_CAP,
+    MdSidefxWorkers, MdTxSidefxSenders, SidefxUpdateClass, SidefxVaultMembershipView,
+    SidefxWorkerHost, MARKET_DATA_MD_ACCOUNT_SIDEFX_QUEUE_CAP,
+    MARKET_DATA_MD_TX_DISCOVERY_SIDEFX_QUEUE_CAP, MARKET_DATA_MD_TX_PIN_SEED_SIDEFX_QUEUE_CAP,
 };
 use ironcrab::market_data::track::{
     arb_coalesce_try_send, explicit_admitted_pool_sets_from_admission, explicit_set_snapshot_path,
@@ -793,7 +794,8 @@ fn spawn_md_sidefx_worker(
     spawn_sidefx_workers(
         host,
         MARKET_DATA_MD_ACCOUNT_SIDEFX_QUEUE_CAP,
-        MARKET_DATA_MD_TX_SIDEFX_QUEUE_CAP,
+        MARKET_DATA_MD_TX_PIN_SEED_SIDEFX_QUEUE_CAP,
+        MARKET_DATA_MD_TX_DISCOVERY_SIDEFX_QUEUE_CAP,
     )
 }
 
@@ -10460,7 +10462,7 @@ async fn handle_geyser_transaction(
     tx_count: &AtomicU64,
     account_publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
     md_state: &MdStateSender,
-    md_tx_sidefx: &MdTxSidefxSender,
+    md_tx_sidefx: &MdTxSidefxSenders,
 ) {
     handle_geyser_transaction_update(
         ctx.as_ref(),
@@ -10891,7 +10893,7 @@ async fn run_geyser_loop(
     let tx_count_geyser_tx = Arc::clone(&tx_count);
     let account_publish_tx_geyser_tx = account_publish_tx.clone();
     let md_state_geyser_tx = md_state.clone();
-    let md_sidefx_geyser_tx = md_sidefx.tx.clone();
+    let md_sidefx_geyser_tx = md_sidefx.tx_senders();
     let mut transaction_rx_geyser = transaction_rx;
     tokio::spawn(async move {
         loop {
@@ -14207,9 +14209,9 @@ mod pr_b_geyser_tracking_tests {
     }
 
     fn fill_md_sidefx_queue(md_sidefx: &MdSidefxWorkers) {
-        for _ in 0..md_sidefx.tx.queue_capacity {
-            ironcrab::market_data::sidefx::md_tx_sidefx_try_enqueue(
-                &md_sidefx.tx,
+        for _ in 0..md_sidefx.tx_discovery.queue_capacity {
+            ironcrab::market_data::sidefx::md_tx_discovery_sidefx_try_enqueue(
+                &md_sidefx.tx_discovery,
                 MdSidefxCommand::PumpFunPoolMintMapInsert {
                     run_id: "test".into(),
                     pool_address: Pubkey::new_unique(),
@@ -19014,7 +19016,7 @@ mod pr_b_geyser_tracking_tests {
                 &tx_count,
                 None,
                 &md_state,
-                &md_sidefx.tx,
+                &md_sidefx.tx_senders(),
             ),
         )
         .await;
@@ -19594,7 +19596,7 @@ mod pr_b_geyser_tracking_tests {
                 &tx_count,
                 None,
                 &md_state,
-                &md_sidefx.tx,
+                &md_sidefx.tx_senders(),
             ),
         )
         .await;
@@ -19679,7 +19681,7 @@ mod pr_b_geyser_tracking_tests {
                 &tx_count,
                 None,
                 &md_state,
-                &md_sidefx.tx,
+                &md_sidefx.tx_senders(),
             ),
         )
         .await;
