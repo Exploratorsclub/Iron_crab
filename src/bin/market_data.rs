@@ -3458,6 +3458,21 @@ impl MarketDataContext {
         for pk in self.tracked_wallet_token_accounts.read().iter() {
             rows.push((*pk, ConsumerId::Wallet, None));
         }
+        // Hot-pool bootstrap: pool account only while LivePoolCache layout is missing (deferred reserves).
+        for (pool, entry) in self.deferred_hot_pool_reserve_pins.read().iter() {
+            if self.live_pool_cache.get(pool).is_some()
+                || !self.hot_pool_registry.is_hot_pool(*pool)
+            {
+                continue;
+            }
+            let consumer = match entry.pin {
+                GeyserPinReason::ArbMultiDex => ConsumerId::Arb,
+                GeyserPinReason::MomentumActive | GeyserPinReason::Wallet => {
+                    consumer_id_for_pool_explicit_row(self, *pool, Some(entry.pin))
+                }
+            };
+            rows.push((*pool, consumer, Some(*pool)));
+        }
         rows
     }
 
@@ -6131,6 +6146,20 @@ impl MarketDataContext {
                 ironcrab::metrics::inc_market_data_momentum_pin_vault_register_total(
                     ironcrab::metrics::MomentumPinVaultRegisterResult::AdmissionRejected,
                 );
+                self.note_deferred_hot_pool_reserve_registration(
+                    pool_pk,
+                    GeyserPinReason::MomentumActive,
+                    "admit_suppress",
+                );
+                if self.live_pool_cache.get(&pool_pk).is_none()
+                    && self.try_admit_hot_pool_account_bootstrap(
+                        admission,
+                        pool_pk,
+                        momentum_consumer,
+                    )
+                {
+                    batch_dirty = true;
+                }
                 self.sync_explicit_pool_admitted_from_admission(
                     admission,
                     pool_pk,
