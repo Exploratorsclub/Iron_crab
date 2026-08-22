@@ -7,7 +7,7 @@ Dieses File beschreibt die **Momentum-State-Machine** (Tracker, Probe/Scale-In, 
 - Eval `docs/spec/INVARIANTS.md` (I-13/I-14, A.50 Imminent-Entry / I-MD-9)
 - Eval `docs/spec/MOMENTUM_ACTIVE_POOLS.md`
 - `docs/CONFIG_SCHEMA.md` (aktuelle Hot-Reload-Keys)
-- `momentum-bot` ist **keyless**; `position-manager` schreibt Positions-KV; Exits laufen über Intents an die Engine
+- `momentum-bot` ist **keyless**. Positions-Daten-SSOT ist KV `POSITION_AUTHORITY`; `position-manager` schreibt ihn allein. Overlay hier ist Strategiezustand. Exits laufen über Intents an die Engine.
 
 ## Implementation Status: shipped (State Machine)
 

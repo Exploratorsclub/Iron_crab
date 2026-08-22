@@ -13,7 +13,7 @@
 | ID | Invariante | Verletzung = |
 |----|------------|--------------|
 | I-1 | **Single-Signer**: Nur execution-engine lädt Keys und signiert/sendet | Architekturbruch |
-| I-2 | **Intent-only**: market-data, momentum-bot, arb-strategy, control-plane sind **keyless** — erzeugen nur TradeIntent oder MarketEvents | Key-Leak-Risiko |
+| I-2 | **Intent-only**: market-data, momentum-bot, arb-strategy, position-manager, control-plane sind **keyless** — erzeugen nur TradeIntent, MarketEvents oder Positions-KV | Key-Leak-Risiko |
 | I-3 | Prozesse außer execution-engine **crashen mit exit(1)** wenn Key-Env-Vars erkannt | DoD §A |
 
 ---
@@ -78,7 +78,7 @@
 |----|------------|--------------|
 | I-23 | Keine neuen ad-hoc NATS Topics. An versioned Topics halten oder klar dokumentieren. | Topic-Chaos |
 | I-24 | Topics: ironcrab.v1.market_events, ironcrab.v1.trade_intents, ironcrab.v1.execution_results, ironcrab.v1.decision_records (siehe src/nats/topics.rs). | — |
-| I-24a | **JetStream = SSOT für Bot-Zustand**: Wallet-Balances, Positionen, Pool-Cache, Config gehören in JetStream (persistent). Konsumenten bootstrappen und holen Live-Updates von dort. | Zustands-Drift |
+| I-24a | **JetStream = SSOT für Bot-Zustand**: Wallet-Balances, Positionen, Pool-Cache, Config gehören in JetStream (persistent). Konsumenten bootstrappen und holen Live-Updates von dort. **Positionen:** Bucket `POSITION_AUTHORITY` ist die Daten-SSOT; `position-manager` ist der einzige Writer. EE/Momentum nur lesen. | Zustands-Drift |
 | I-24b | **Core NATS = Market Events**: Chain-Daten (Trades, Blocks, Preise) als Echtzeit-Events. Kein Bot-Zustand über Core NATS — Datenflut zu hoch, keine Persistenz. | — |
 
 ---

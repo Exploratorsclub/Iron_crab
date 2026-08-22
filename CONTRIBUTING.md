@@ -38,7 +38,7 @@ Mehrere Prozesse, NATS (`ironcrab.v1.*`), JetStream für Bot-Zustand, Geyser-Fir
 - `momentum-bot` (9802) — EARLY/ESTABLISHED, nur `TradeIntent`s
 - `arb-strategy` (9803) — marktgetriebene Arbitrage, nur `TradeIntent`s (eigenes Binary, nicht optional)
 - `execution-engine` (9804) — einziger Signer; Plan → Simulate → Send → Confirm
-- `position-manager` (9805) — Positions-Pflege
+- `position-manager` (9805) — einziger Writer des KV `POSITION_AUTHORITY` (Positions-Daten-SSOT)
 - `control-plane` (8080, Python) — REST, Kill-Switch, Config (keyless)
 - `trades-server` (9899, Python) — Grafana-Datasource
 

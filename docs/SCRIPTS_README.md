@@ -127,7 +127,7 @@ Lokales manuelles Starten (für Dev/Test, nicht für Production).
 | `momentum-bot` | 9802 | EARLY + ESTABLISHED, nur TradeIntents |
 | `arb-strategy` | 9803 | Multi-Pool Arbitrage, nur TradeIntents |
 | `execution-engine` | 9804 | Single-Signer, Tx Build/Sim/Send |
-| `position-manager` | 9805 | Keyless Positions-KV / PositionAuthority |
+| `position-manager` | 9805 | Einziger Writer KV `POSITION_AUTHORITY` |
 
 Python-Services:
 - `control_plane/main.py` — REST API, Config, Kill-Switch (8080)

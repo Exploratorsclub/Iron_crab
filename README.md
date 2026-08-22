@@ -58,7 +58,7 @@ NATS (ironcrab.v1.*)
 | momentum-bot | 9802 | EARLY/ESTABLISHED Regime, TradeIntents |
 | arb-strategy | 9803 | Multi-Pool Arbitrage, TradeIntents (eigenes Binary) |
 | execution-engine | 9804 | Intent-Verarbeitung, TX-Build, Signieren, Senden (einziger mit Keys) |
-| position-manager | 9805 | Positions-Pflege |
+| position-manager | 9805 | Einziger Writer KV `POSITION_AUTHORITY` (Positions-Daten-SSOT) |
 | control-plane | 8080 | REST API, Kill-Switch, Config (**Python**, nicht Cargo) |
 | trades-server | 9899 | Grafana Infinity Datasource (**Python**, `scripts/trades_server.py`) |
 

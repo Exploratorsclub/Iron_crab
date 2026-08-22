@@ -14,7 +14,7 @@ Fünf Rust-Binaries plus zwei Python-Services:
 | `momentum-bot` | 9802 | EARLY + ESTABLISHED, TradeIntents |
 | `arb-strategy` | 9803 | Multi-Pool Arbitrage, TradeIntents |
 | `execution-engine` | 9804 | Single-Signer, Tx Build/Sim/Send |
-| `position-manager` | 9805 | Keyless Positions-KV |
+| `position-manager` | 9805 | Einziger Writer KV `POSITION_AUTHORITY` |
 | `control-plane` | 8080 | REST API, Config, Kill-Switch (Python) |
 | `trades-server` | 9899 | Grafana Infinity Datasource (Python) |
 
