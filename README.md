@@ -194,6 +194,6 @@ Prometheus-Scrape-Config: `docs/grafana_dashboard_example.json`
 
 - [CONTRIBUTING.md](CONTRIBUTING.md) – Onboarding für Mitentwickler (Code / Spec / Tests)
 - `docs/RUNBOOK_PROD.md` – Produktionsbetrieb (Maintainer)
-- `docs/VALIDATOR_SETUP.md` – Validator-Setup
+- `docs/VALIDATOR_SETUP.md` – Agave + Yellowstone Geyser (aktueller Stand, kein Januar-2026-Rollout)
 - `docs/CONFIG_SCHEMA.md` – Konfigurationsschema
 - `CHANGELOG.md` – Änderungsprotokoll

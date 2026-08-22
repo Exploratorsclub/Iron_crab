@@ -100,3 +100,4 @@ Produktions-Deploy, systemd, Server-SSH und Live-Keys. Fragen dazu an den Mainta
 | Config | `docs/CONFIG_SCHEMA.md` |
 | Bekannte Bugmuster | `docs/KNOWN_BUG_PATTERNS.md` |
 | Runbook (Betrieb, Maintainer) | `docs/RUNBOOK_PROD.md` |
+| Validator / Geyser | `docs/VALIDATOR_SETUP.md` |
