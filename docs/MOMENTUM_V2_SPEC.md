@@ -1,8 +1,17 @@
 # Momentum v2 Spec (Strategy Plane)
 
-## Implementation Status: ✅ Complete
+**Stand:** 2026-08-22
 
-**Last Verified**: Januar 2025
+Dieses File beschreibt die **Momentum-State-Machine** (Tracker, Probe/Scale-In, Reason Codes). Für neue Arbeit gelten zusätzlich:
+
+- Eval `docs/spec/INVARIANTS.md` (I-13/I-14, A.50 Imminent-Entry / I-MD-9)
+- Eval `docs/spec/MOMENTUM_ACTIVE_POOLS.md`
+- `docs/CONFIG_SCHEMA.md` (aktuelle Hot-Reload-Keys)
+- `momentum-bot` ist **keyless**; `position-manager` schreibt Positions-KV; Exits laufen über Intents an die Engine
+
+## Implementation Status: shipped (State Machine)
+
+**Last Verified**: 2026-08-22 (Header; Spec-Body nicht Zeile-für-Zeile neu geschrieben)
 
 | Feature | Status | Notes |
 |---------|--------|-------|

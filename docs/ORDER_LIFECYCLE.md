@@ -1,8 +1,14 @@
 # Order & Position Lifecycle
 
-**Zweck:** Explizite State Machines für Intent, Position und Execution. Verhindert Zustands-Chaos und falsche Annahmen über Lifecycle.
+**Stand:** 2026-08-22
 
-**Quellen:** `TARGET_ARCHITECTURE.md`, `MOMENTUM_V2_SPEC.md`, `DEFINITION_OF_DONE.md`, `src/ipc/schema.rs`
+State Machines für Intent, Position und Execution. Schema: `src/ipc/schema.rs`.
+
+`DecisionOutcome` im Code: `Rejected`, `Expired`, `SimFailed`, `Sent`, `Confirmed`, `FailedConfirmed`. Ein Intent endet in genau einem Outcome.
+
+Zusätzlich zum JSONL-Pfad: JetStream `TRADE_INTENTS` / `EXECUTION_RESULTS`. Offene Positionen: `position-manager` (KV) plus Strategy-SSOT in `momentum-bot`. Preis-Updates nur bei `source_pool == position.pool` (I-13).
+
+**Quellen:** Eval `TARGET_ARCHITECTURE.md`, `MOMENTUM_V2_SPEC.md`, `DEFINITION_OF_DONE.md` (historisch), `src/ipc/schema.rs`
 
 ---
 

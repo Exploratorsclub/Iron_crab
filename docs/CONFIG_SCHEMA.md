@@ -1,7 +1,8 @@
 # Hot-Reload Configuration Schema
 
-This document defines all runtime-configurable parameters for each IronCrab binary.
-All parameters can be updated via the Control Plane API without restarting services.
+**Stand:** 2026-08-22
+
+This document defines runtime-configurable parameters for the IronCrab binaries that consume Control-Plane reloads. Updates go to NATS `ironcrab.control.config.reload`.
 
 ## Overview
 
@@ -16,8 +17,11 @@ NATS: ironcrab.control.config.reload
     │
     ├──► execution-engine (applies ExecutionConfig)
     ├──► momentum-bot (applies MomentumConfig)
+    ├──► arb-strategy (applies ArbConfig)
     └──► market-data (applies MarketDataConfig)
 ```
+
+`position-manager` hat **kein** Hot-Reload in diesem Schema (Restart bei Config-Änderung).
 
 ### API Usage
 ```bash
@@ -69,7 +73,7 @@ Component name: `execution-engine`
 | `tier1_fee_percentile` | u8 | 50 | 25, 50, 75, 90 | Percentile base for Tier1 dynamic fee (execution-engine recomputes from NATS `PriorityFeePercentiles`; does not raise static floor) |
 | `tier1_fee_multiplier` | f64 | 1.2 | > 0 | Multiplier applied to Tier1 percentile base; effective fee remains `max(dynamic, static_floor)` |
 
-Prometheus (execution-engine `:9803/metrics`): `tx_send_to_confirm_ms`, `tx_confirmed_slot_delta_slots`, `tx_priority_fee_source_total{source}`, `tx_rebroadcast_total`, `tx_rebroadcast_method_total{method}`.
+Prometheus (execution-engine `:9804/metrics`): `tx_send_to_confirm_ms`, `tx_confirmed_slot_delta_slots`, `tx_priority_fee_source_total{source}`, `tx_rebroadcast_total`, `tx_rebroadcast_method_total{method}`.
 
 ### Validation Rules
 - `max_slippage_bps` must be between 1 and 10000 (0.01% to 100%)
@@ -368,7 +372,7 @@ curl -X POST http://localhost:8080/kill \
 ```rust
 // src/ipc/schema.rs
 pub struct ConfigUpdate {
-    pub component: String,           // "execution-engine", "momentum-bot", "market-data"
+    pub component: String,           // "execution-engine", "momentum-bot", "arb-strategy", "market-data"
     pub config: HashMap<String, Value>,  // Key-value pairs
     pub source: String,              // "control-plane"
     pub timestamp: DateTime<Utc>,

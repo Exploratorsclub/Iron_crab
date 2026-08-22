@@ -2,20 +2,23 @@
 
 Go-Live Anleitung für den Betrieb auf dem Validator-Server. Der Bot läuft auf dem gleichen Server wie der Agave Validator für minimale Latenz.
 
+**Stand:** 2026-08-22. Deploy nur mit Maintainer-Freigabe. Validator: `docs/VALIDATOR_SETUP.md`.
+
 ## Architektur-Übersicht
 
-IronCrab verwendet eine **Multi-Prozess-Architektur** mit 6 separaten Services:
+Fünf Rust-Binaries plus zwei Python-Services:
 
 | Service | Port | Funktion |
 |---------|------|----------|
 | `market-data` | 9801 | Geyser-Ingest, Pool Discovery, MarketEvents |
-| `momentum-bot` | 9802 | Strategy: EARLY + ESTABLISHED Policies |
-| `arb-strategy` | 9803 | Strategy: Multi-Pool Arbitrage |
+| `momentum-bot` | 9802 | EARLY + ESTABLISHED, TradeIntents |
+| `arb-strategy` | 9803 | Multi-Pool Arbitrage, TradeIntents |
 | `execution-engine` | 9804 | Single-Signer, Tx Build/Sim/Send |
-| `control-plane` | 8080 | REST API, Config, Kill-Switch |
-| `trades-server` | 9899 | Grafana Infinity Datasource |
+| `position-manager` | 9805 | Keyless Positions-KV |
+| `control-plane` | 8080 | REST API, Config, Kill-Switch (Python) |
+| `trades-server` | 9899 | Grafana Infinity Datasource (Python) |
 
-**NATS** ist der IPC-Layer zwischen den Prozessen.
+**NATS** ist der IPC-Layer (`ironcrab.v1.*` plus JetStream für Bot-Zustand).
 
 ```
 Geyser/RPC
@@ -46,8 +49,8 @@ market-data ── MarketEvents ──► momentum-bot ── TradeIntents ─�
 | `my_config.server.toml` | Produktions-Config (alle Rust-Binaries) |
 | `deploy.sh` | Wrapper-Script → ruft `deploy_new.sh` auf |
 | `deploy_new.sh` | Build + Systemd Install + Restart |
-| `docs/systemd/*.service` | Service-Files für alle 6 Prozesse |
-| `docs/systemd/ironcrab.target` | Orchestriert alle Services |
+| `docs/systemd/*.service` | Service-Files (inkl. `position-manager.service`) |
+| `docs/systemd/ironcrab.target` | Orchestriert die Kern-Services (`Wants=` ohne position-manager; Deploy startet ihn extra) |
 | `docs/grafana_*.json` | Grafana Dashboards |
 
 ## Einmalige Konfiguration
@@ -60,7 +63,7 @@ market-data ── MarketEvents ──► momentum-bot ── TradeIntents ─�
    keypair_path = "/home/ironcrab/.config/solana/id.json"
    
    [geyser]
-   endpoint = "http://127.0.0.1:10000"    # Lokaler Geyser gRPC
+   url = "http://127.0.0.1:10000"         # Yellowstone gRPC
    
    [nats]
    url = "nats://127.0.0.1:4222"
@@ -84,10 +87,10 @@ market-data ── MarketEvents ──► momentum-bot ── TradeIntents ─�
 
 Dies führt automatisch aus:
 1. `git pull origin architecture-rebuild`
-2. Cargo Build aller 4 Rust-Binaries (release)
+2. Cargo Build der fünf Rust-Binaries (release), inkl. `position-manager`
 3. Python venv Setup für control-plane
 4. Systemd Services installieren
-5. `ironcrab.target` starten (alle 6 Services)
+5. Services starten (target + `position-manager`)
 6. Status-Check
 
 ### Optionen
@@ -106,9 +109,10 @@ Dies führt automatisch aus:
 
 ### Alle Services starten/stoppen
 ```bash
-sudo systemctl start ironcrab.target   # Startet alle 6 Services
-sudo systemctl stop ironcrab.target    # Stoppt alle 6 Services
-sudo systemctl restart ironcrab.target # Restart alle
+sudo systemctl start ironcrab.target   # Kern-Services laut target
+sudo systemctl start position-manager  # falls nicht in target Wants=
+sudo systemctl stop ironcrab.target
+sudo systemctl restart ironcrab.target
 ```
 
 ### Einzelne Services
@@ -125,11 +129,12 @@ journalctl -u execution-engine -f
 journalctl -u market-data -f
 journalctl -u momentum-bot -f
 journalctl -u arb-strategy -f
+journalctl -u position-manager -f
 journalctl -u control-plane -f
 journalctl -u trades-server -f
 
 # Alle IronCrab Services kombiniert
-journalctl -u 'market-data' -u 'momentum-bot' -u 'arb-strategy' -u 'execution-engine' -u 'control-plane' -f
+journalctl -u 'market-data' -u 'momentum-bot' -u 'arb-strategy' -u 'execution-engine' -u 'position-manager' -u 'control-plane' -f
 
 # Letzte 100 Zeilen
 journalctl -u execution-engine -n 100 --no-pager
@@ -143,6 +148,7 @@ journalctl -u execution-engine -n 100 --no-pager
 | momentum-bot Metrics | `http://localhost:9802/metrics` | Prometheus |
 | arb-strategy Metrics | `http://localhost:9803/metrics` | Prometheus |
 | execution-engine Metrics | `http://localhost:9804/metrics` | Prometheus |
+| position-manager Metrics | `http://localhost:9805/metrics` | Prometheus |
 | Control Plane API | `http://localhost:8080` | REST API |
 | Trades API | `http://localhost:9899/trades` | Grafana Infinity |
 | Trades health | `http://localhost:9899/health` | Liveness (should stay fast under load; P172 tail-read) |

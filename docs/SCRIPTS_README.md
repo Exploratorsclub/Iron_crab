@@ -1,6 +1,8 @@
 # IronCrab Scripts & Deployment
 
-Convenience Scripts für Build, Deployment und lokale Entwicklung der Multi-Prozess-Architektur.
+Convenience Scripts für Build, Deployment und lokale Entwicklung.
+
+**Stand:** 2026-08-22. Production-Deploy bleibt Maintainer-Sache (`docs/RUNBOOK_PROD.md`). Onboarding: [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## Production Deployment (Linux Server)
 
@@ -21,12 +23,14 @@ Das Haupt-Deployment-Script für den Production-Server.
 ./deploy.sh --legacy
 ```
 
-`deploy.sh` ist ein Wrapper, der `deploy_new.sh` aufruft. Das Script:
-1. Pullt von `architecture-rebuild` Branch
-2. Baut alle 4 Rust-Binaries (release)
+`deploy.sh` ist ein Wrapper um `deploy_new.sh`. Das Script:
+1. Pullt von `architecture-rebuild`
+2. Baut die **fünf** Rust-Binaries (release): `market-data`, `momentum-bot`, `arb-strategy`, `execution-engine`, `position-manager`
 3. Setzt Python venv für control-plane auf
-4. Installiert alle systemd Services
-5. Startet `ironcrab.target` (alle 6 Services)
+4. Installiert systemd-Units inkl. `position-manager`
+5. Startet die Trading-Services (siehe Tabelle unten)
+
+`docs/systemd/ironcrab.target` listet in `Wants=` derzeit sechs Units **ohne** `position-manager`; `deploy_new.sh` startet `position-manager` trotzdem. Live-Status immer per `systemctl` prüfen.
 
 ### Service Management (Server)
 ```bash
@@ -65,7 +69,7 @@ SSH-Tunnel zum Server + optionales lokales UI.
 
 Forwarded Ports:
 - `8080` → Control Plane API
-- `9801-9804` → Prometheus Metrics
+- `9801-9805` → Prometheus Metrics (inkl. position-manager)
 - `3000` → Grafana
 - `9090` → Prometheus
 
@@ -117,18 +121,17 @@ Lokales manuelles Starten (für Dev/Test, nicht für Production).
 
 ## Built Binaries (Multi-Process)
 
-Nach dem Build sind folgende Binaries verfügbar:
+| Binary | Port | Zweck |
+|--------|------|-------|
+| `market-data` | 9801 | Geyser-Ingest, Pool Discovery, MarketEvents |
+| `momentum-bot` | 9802 | EARLY + ESTABLISHED, nur TradeIntents |
+| `arb-strategy` | 9803 | Multi-Pool Arbitrage, nur TradeIntents |
+| `execution-engine` | 9804 | Single-Signer, Tx Build/Sim/Send |
+| `position-manager` | 9805 | Keyless Positions-KV / PositionAuthority |
 
-| Binary | Zweck |
-|--------|-------|
-| `market-data` | Geyser-Ingest, Pool Discovery, MarketEvents |
-| `momentum-bot` | Strategy: EARLY + ESTABLISHED Policies |
-| `arb-strategy` | Strategy: Multi-Pool Arbitrage |
-| `execution-engine` | Single-Signer, Tx Build/Sim/Send |
-
-Plus Python-Services:
-- `control_plane/main.py` — REST API, Config, Kill-Switch
-- `scripts/trades_server.py` — Grafana Infinity Datasource
+Python-Services:
+- `control_plane/main.py` — REST API, Config, Kill-Switch (8080)
+- `scripts/trades_server.py` — Grafana Infinity Datasource (9899)
 
 ### trades_server Run-Mode Performance (P174)
 
@@ -189,6 +192,7 @@ Env vars: `IRONCRAB_TRADES_CACHE_TTL_SEC` (default 15), `IRONCRAB_TRADES_RUN_PRE
 | momentum-bot | 9802 | http://localhost:9802/metrics |
 | arb-strategy | 9803 | http://localhost:9803/metrics |
 | execution-engine | 9804 | http://localhost:9804/metrics |
+| position-manager | 9805 | http://localhost:9805/metrics |
 | Control Plane | 8080 | http://localhost:8080 |
 | Trades API | 9899 | http://localhost:9899/trades |
 
@@ -210,6 +214,7 @@ Import aus `docs/`:
 
 ## Siehe auch
 
-- [RUNBOOK_PROD.md](RUNBOOK_PROD.md) — Vollständige Production-Anleitung
-- [TARGET_ARCHITECTURE.md](TARGET_ARCHITECTURE.md) — Architektur-Dokumentation
-- [LOCAL_SETUP.md](LOCAL_SETUP.md) — Lokale Entwicklungsumgebung
+- [RUNBOOK_PROD.md](RUNBOOK_PROD.md) — Production (Maintainer)
+- [VALIDATOR_SETUP.md](VALIDATOR_SETUP.md) — Agave + Geyser
+- [LOCAL_SETUP.md](LOCAL_SETUP.md) — Lokale Entwicklung
+- Spec: Iron_crab-eval `docs/spec/TARGET_ARCHITECTURE.md`
