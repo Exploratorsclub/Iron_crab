@@ -4,6 +4,7 @@ use super::worker::MdSidefxBurstScratch;
 use crate::execution::live_pool_cache::{LivePoolCache, RaydiumAmmState};
 use crate::ipc::{MarketEvent, MarketEventKind};
 use crate::metrics::MarketDataLatencySegment;
+use crate::solana::dex_parser::DexType;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -92,6 +93,17 @@ pub trait SidefxWorkerHost: Send + Sync {
 
     /// FIX-29: spawn cold-path Serum backfill when Geyser/cache row has bids but missing vaults.
     fn maybe_spawn_raydium_serum_cold_backfill(&self, pool: Pubkey, state: &RaydiumAmmState);
+
+    /// Teil B: hot-gated TX `pool_accounts` → LivePoolCache seed + trade-path vault register.
+    fn apply_tx_pool_accounts_for_hot_pool(
+        &self,
+        pool: Pubkey,
+        dex: DexType,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        pool_accounts: &[Pubkey],
+        slot: u64,
+    );
 }
 
 #[inline]

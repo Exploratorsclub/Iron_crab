@@ -152,15 +152,6 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
         }
     }
 
-    if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
-        md_sidefx_try_enqueue(
-            md_sidefx,
-            MdSidefxCommand::TradePoolLruTouch {
-                pool: *pool_address,
-            },
-        );
-    }
-
     let wallet_events = if let Some(ref parsed) = parsed_event {
         match parsed {
             ParsedDexEvent::PoolCreated { base_mint, .. } => {
@@ -302,6 +293,15 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
                 },
             );
         }
+    }
+
+    if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
+        md_sidefx_try_enqueue(
+            md_sidefx,
+            MdSidefxCommand::TradePoolLruTouch {
+                pool: *pool_address,
+            },
+        );
     }
 
     let Some(parsed) = parsed_event else {

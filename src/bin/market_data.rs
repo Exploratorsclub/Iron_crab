@@ -198,7 +198,7 @@ use ironcrab::position_authority::is_sol_or_wsol_mint;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use ironcrab::solana::dex::pumpfun::PumpFunDex;
 use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
-use ironcrab::solana::dex_parser::OrcaPoolInfo;
+use ironcrab::solana::dex_parser::{DexType, OrcaPoolInfo};
 use ironcrab::solana::geyser_pool_discovery::{
     DexType as PoolDexType, PoolDiscoveryEvent, PoolDiscoveryIngest,
 };
@@ -754,6 +754,26 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
             )
             .await;
         });
+    }
+
+    fn apply_tx_pool_accounts_for_hot_pool(
+        &self,
+        pool: Pubkey,
+        dex: DexType,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        pool_accounts: &[Pubkey],
+        slot: u64,
+    ) {
+        apply_tx_pool_accounts_for_hot_pool(
+            &self.ctx,
+            pool,
+            dex,
+            base_mint,
+            quote_mint,
+            pool_accounts,
+            slot,
+        );
     }
 }
 
@@ -1960,6 +1980,213 @@ fn pool_vaults_fully_tracked_for_cache_inner(
         && tracked_vaults
             .get(&quote_vault)
             .is_some_and(|v| v.pool_address == pool && v.sibling_vault == Some(base_vault))
+}
+
+fn non_default_pk(pk: Pubkey) -> Option<Pubkey> {
+    (pk != Pubkey::default()).then_some(pk)
+}
+
+/// DEX-safe layout extraction from parsed trade `pool_accounts` (hot-path seed only).
+fn cache_state_from_tx_pool_accounts(
+    pool: Pubkey,
+    dex: DexType,
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    accounts: &[Pubkey],
+) -> Option<CachedPoolState> {
+    match dex {
+        DexType::PumpFunAmm if accounts.len() >= 6 => {
+            let base = non_default_pk(accounts[2]).unwrap_or(base_mint);
+            let quote = non_default_pk(accounts[3]).unwrap_or(quote_mint);
+            let base_vault = non_default_pk(accounts[4])?;
+            let quote_vault = non_default_pk(accounts[5])?;
+            let pool_accounts = if accounts.len() >= 14 {
+                accounts.to_vec()
+            } else {
+                Vec::new()
+            };
+            Some(CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: base,
+                quote_mint: quote,
+                pool_base_token_account: base_vault,
+                pool_quote_token_account: quote_vault,
+                base_reserve: None,
+                quote_reserve: None,
+                pool_accounts,
+                creator: None,
+            }))
+        }
+        DexType::OrcaWhirlpool if accounts.len() >= 5 && accounts[0] == pool => {
+            let token_mint_a = non_default_pk(accounts[1])?;
+            let token_mint_b = non_default_pk(accounts[2])?;
+            let token_vault_a = non_default_pk(accounts[3])?;
+            let token_vault_b = non_default_pk(accounts[4])?;
+            Some(CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a,
+                token_mint_b,
+                token_vault_a,
+                token_vault_b,
+                tick_current_index: 0,
+                sqrt_price: 0,
+                liquidity: 0,
+                fee_rate: 0,
+                protocol_fee_rate: 0,
+                tick_spacing: 0,
+                vault_a_balance: None,
+                vault_b_balance: None,
+                token_a_program: None,
+                token_b_program: None,
+            }))
+        }
+        DexType::RaydiumCpmm if accounts.len() >= 12 && accounts[3] == pool => {
+            let token_0_vault = non_default_pk(accounts[6])?;
+            let token_1_vault = non_default_pk(accounts[7])?;
+            let token_0_mint = non_default_pk(accounts[10]).unwrap_or(base_mint);
+            let token_1_mint = non_default_pk(accounts[11]).unwrap_or(quote_mint);
+            Some(CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint,
+                token_1_mint,
+                token_0_vault,
+                token_1_vault,
+                reserve_0: None,
+                reserve_1: None,
+            }))
+        }
+        DexType::MeteoraDlmm if accounts.len() >= 3 && accounts[0] == pool => {
+            let reserve_x = non_default_pk(accounts[1])?;
+            let reserve_y = non_default_pk(accounts[2])?;
+            Some(CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: base_mint,
+                token_y_mint: quote_mint,
+                reserve_x,
+                reserve_y,
+                active_id: 0,
+                bin_step: 0,
+                reserve_x_balance: None,
+                reserve_y_balance: None,
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn merge_tx_pool_accounts_into_existing(
+    existing: &CachedPoolState,
+    incoming: &CachedPoolState,
+) -> CachedPoolState {
+    match (existing, incoming) {
+        (CachedPoolState::PumpAmm(ex), CachedPoolState::PumpAmm(inc)) => {
+            let mut out = ex.clone();
+            if out.pool_base_token_account == Pubkey::default() {
+                out.pool_base_token_account = inc.pool_base_token_account;
+            }
+            if out.pool_quote_token_account == Pubkey::default() {
+                out.pool_quote_token_account = inc.pool_quote_token_account;
+            }
+            if out.base_mint == Pubkey::default() {
+                out.base_mint = inc.base_mint;
+            }
+            if out.quote_mint == Pubkey::default() {
+                out.quote_mint = inc.quote_mint;
+            }
+            if out.pool_accounts.is_empty() && !inc.pool_accounts.is_empty() {
+                out.pool_accounts = inc.pool_accounts.clone();
+            }
+            CachedPoolState::PumpAmm(out)
+        }
+        (CachedPoolState::Orca(ex), CachedPoolState::Orca(inc)) => {
+            let mut out = ex.clone();
+            if out.token_vault_a == Pubkey::default() {
+                out.token_vault_a = inc.token_vault_a;
+            }
+            if out.token_vault_b == Pubkey::default() {
+                out.token_vault_b = inc.token_vault_b;
+            }
+            if out.token_mint_a == Pubkey::default() {
+                out.token_mint_a = inc.token_mint_a;
+            }
+            if out.token_mint_b == Pubkey::default() {
+                out.token_mint_b = inc.token_mint_b;
+            }
+            CachedPoolState::Orca(out)
+        }
+        (CachedPoolState::RaydiumCpmm(ex), CachedPoolState::RaydiumCpmm(inc)) => {
+            let mut out = ex.clone();
+            if out.token_0_vault == Pubkey::default() {
+                out.token_0_vault = inc.token_0_vault;
+            }
+            if out.token_1_vault == Pubkey::default() {
+                out.token_1_vault = inc.token_1_vault;
+            }
+            if out.token_0_mint == Pubkey::default() {
+                out.token_0_mint = inc.token_0_mint;
+            }
+            if out.token_1_mint == Pubkey::default() {
+                out.token_1_mint = inc.token_1_mint;
+            }
+            CachedPoolState::RaydiumCpmm(out)
+        }
+        (CachedPoolState::Meteora(ex), CachedPoolState::Meteora(inc)) => {
+            let mut out = ex.clone();
+            if out.reserve_x == Pubkey::default() {
+                out.reserve_x = inc.reserve_x;
+            }
+            if out.reserve_y == Pubkey::default() {
+                out.reserve_y = inc.reserve_y;
+            }
+            if out.token_x_mint == Pubkey::default() {
+                out.token_x_mint = inc.token_x_mint;
+            }
+            if out.token_y_mint == Pubkey::default() {
+                out.token_y_mint = inc.token_y_mint;
+            }
+            CachedPoolState::Meteora(out)
+        }
+        _ => existing.clone(),
+    }
+}
+
+/// Teil B: hot-gated TX `pool_accounts` → LivePoolCache seed + trade-path vault register.
+fn apply_tx_pool_accounts_for_hot_pool(
+    ctx: &MarketDataContext,
+    pool: Pubkey,
+    dex: DexType,
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    pool_accounts: &[Pubkey],
+    slot: u64,
+) {
+    if !ctx.hot_pool_registry.is_hot_pool(pool) {
+        ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(
+            ironcrab::metrics::TxPoolAccountsHotApplyResult::SkipNotHot,
+        );
+        return;
+    }
+    let Some(incoming) =
+        cache_state_from_tx_pool_accounts(pool, dex, base_mint, quote_mint, pool_accounts)
+    else {
+        ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(
+            ironcrab::metrics::TxPoolAccountsHotApplyResult::SkipUnparseable,
+        );
+        return;
+    };
+    let merged = match ctx.live_pool_cache.get(&pool) {
+        Some(existing) => merge_tx_pool_accounts_into_existing(&existing, &incoming),
+        None => incoming,
+    };
+    ctx.live_pool_cache.upsert(pool, merged, slot);
+    if matches!(dex, DexType::PumpFunAmm) && pool_accounts.len() >= 14 {
+        ctx.live_pool_cache
+            .set_pump_amm_pool_accounts(&pool, pool_accounts.to_vec());
+    }
+    ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(
+        ironcrab::metrics::TxPoolAccountsHotApplyResult::Upsert,
+    );
+    if ctx.register_geyser_reserves_after_trade(pool) {
+        ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(
+            ironcrab::metrics::TxPoolAccountsHotApplyResult::Register,
+        );
+    }
 }
 
 /// PR237: cache-first vault/bin pubkeys for trade-path LRU touch (no full-map scan).
@@ -18380,6 +18607,165 @@ mod pr_b_geyser_tracking_tests {
             ctx.tracked_vaults.read()[&coin].pin,
             Some(GeyserPinReason::MomentumActive),
             "dual pin must keep Wallet > Momentum > Arb priority (I-MD-8)"
+        );
+    }
+
+    fn test_pump_amm_v14_pool_accounts(
+        pool: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+    ) -> Vec<Pubkey> {
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let mut accounts = vec![
+            pool,
+            Pubkey::new_unique(),
+            base_mint,
+            quote_mint,
+            base_vault,
+            quote_vault,
+        ];
+        accounts.extend((0..8).map(|_| Pubkey::new_unique()));
+        accounts
+    }
+
+    #[test]
+    fn tx_pool_accounts_hot_apply_skips_non_hot_pool() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let accounts = test_pump_amm_v14_pool_accounts(pool, base, quote);
+        let vaults_before = ctx.tracked_vaults.read().len();
+        let demand_before = ctx.snapshot_explicit_demand_pubkeys();
+
+        apply_tx_pool_accounts_for_hot_pool(
+            &ctx,
+            pool,
+            DexType::PumpFunAmm,
+            base,
+            quote,
+            &accounts,
+            1,
+        );
+
+        assert!(ctx.live_pool_cache.get(&pool).is_none());
+        assert_eq!(ctx.tracked_vaults.read().len(), vaults_before);
+        assert_eq!(ctx.snapshot_explicit_demand_pubkeys(), demand_before);
+    }
+
+    #[test]
+    fn tx_pool_accounts_hot_apply_seeds_empty_cache_for_arb_hot_pool() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let accounts = test_pump_amm_v14_pool_accounts(pool, base, quote);
+        let base_vault = accounts[4];
+        let quote_vault = accounts[5];
+
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_arb_pool_admitted(pool);
+
+        apply_tx_pool_accounts_for_hot_pool(
+            &ctx,
+            pool,
+            DexType::PumpFunAmm,
+            base,
+            quote,
+            &accounts,
+            1,
+        );
+
+        let state = ctx
+            .live_pool_cache
+            .get(&pool)
+            .expect("cache seeded from TX accounts");
+        let CachedPoolState::PumpAmm(s) = state else {
+            panic!("expected PumpAmm cache row");
+        };
+        assert_eq!(s.pool_base_token_account, base_vault);
+        assert_eq!(s.pool_quote_token_account, quote_vault);
+        assert_eq!(s.pool_accounts.len(), 14);
+        let vs = ctx.tracked_vaults.read();
+        assert!(vs.contains_key(&base_vault));
+        assert!(vs.contains_key(&quote_vault));
+        assert_eq!(vs[&base_vault].pin, Some(GeyserPinReason::ArbMultiDex));
+    }
+
+    #[test]
+    fn tx_pool_accounts_hot_apply_seeds_empty_cache_for_momentum_hot_pool() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let accounts = test_pump_amm_v14_pool_accounts(pool, base, quote);
+        let base_vault = accounts[4];
+
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
+
+        apply_tx_pool_accounts_for_hot_pool(
+            &ctx,
+            pool,
+            DexType::PumpFunAmm,
+            base,
+            quote,
+            &accounts,
+            1,
+        );
+
+        assert!(ctx.live_pool_cache.get(&pool).is_some());
+        assert!(ctx.tracked_vaults.read().contains_key(&base_vault));
+        assert_eq!(
+            ctx.tracked_vaults.read()[&base_vault].pin,
+            Some(GeyserPinReason::MomentumActive)
+        );
+    }
+
+    #[test]
+    fn tx_pool_accounts_hot_apply_dual_pin_prefers_momentum() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let accounts = test_pump_amm_v14_pool_accounts(pool, base, quote);
+        let base_vault = accounts[4];
+
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_momentum_pool_admitted(pool);
+
+        apply_tx_pool_accounts_for_hot_pool(
+            &ctx,
+            pool,
+            DexType::PumpFunAmm,
+            base,
+            quote,
+            &accounts,
+            1,
+        );
+
+        assert_eq!(
+            ctx.tracked_vaults.read()[&base_vault].pin,
+            Some(GeyserPinReason::MomentumActive),
+            "dual pin must prefer Momentum over Arb (I-MD-8)"
         );
     }
 
