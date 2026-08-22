@@ -870,6 +870,7 @@ mod tests {
             vault_b_balance: Some(1_000_000_000_000), // 1000 tokens
             token_a_program: None,
             token_b_program: None,
+            whirlpool_quote_account_seeded: true,
         };
 
         let intent = create_test_intent(mint_a, mint_b, 10_000_000_000); // 10 token_a
@@ -895,6 +896,7 @@ mod tests {
             bin_step: 20,                                // 0.2% per bin
             reserve_x_balance: Some(5_000_000_000_000),  // 5000 tokens
             reserve_y_balance: Some(10_000_000_000_000), // 10000 tokens
+            dlmm_bin_params_account_seeded: true,
         };
 
         let intent = create_test_intent(token_x, token_y, 50_000_000_000); // 50 token_x

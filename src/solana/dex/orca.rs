@@ -1787,6 +1787,7 @@ mod tests {
                 vault_b_balance: None,
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             },
         )
         .expect("inject");

@@ -2027,22 +2027,14 @@ fn cache_state_from_tx_pool_accounts(
             let token_mint_b = non_default_pk(accounts[2])?;
             let token_vault_a = non_default_pk(accounts[3])?;
             let token_vault_b = non_default_pk(accounts[4])?;
-            Some(CachedPoolState::Orca(OrcaWhirlpoolState {
-                token_mint_a,
-                token_mint_b,
-                token_vault_a,
-                token_vault_b,
-                tick_current_index: 0,
-                sqrt_price: 0,
-                liquidity: 0,
-                fee_rate: 0,
-                protocol_fee_rate: 0,
-                tick_spacing: 0,
-                vault_a_balance: None,
-                vault_b_balance: None,
-                token_a_program: None,
-                token_b_program: None,
-            }))
+            Some(CachedPoolState::Orca(
+                ironcrab::execution::live_pool_cache::orca_whirlpool_tx_layout_seed(
+                    token_mint_a,
+                    token_mint_b,
+                    token_vault_a,
+                    token_vault_b,
+                ),
+            ))
         }
         DexType::RaydiumCpmm if accounts.len() >= 12 && accounts[3] == pool => {
             let token_0_vault = non_default_pk(accounts[6])?;
@@ -2061,18 +2053,39 @@ fn cache_state_from_tx_pool_accounts(
         DexType::MeteoraDlmm if accounts.len() >= 3 && accounts[0] == pool => {
             let reserve_x = non_default_pk(accounts[1])?;
             let reserve_y = non_default_pk(accounts[2])?;
-            Some(CachedPoolState::Meteora(MeteoraState {
-                token_x_mint: base_mint,
-                token_y_mint: quote_mint,
-                reserve_x,
-                reserve_y,
-                active_id: 0,
-                bin_step: 0,
-                reserve_x_balance: None,
-                reserve_y_balance: None,
-            }))
+            Some(CachedPoolState::Meteora(
+                ironcrab::execution::live_pool_cache::meteora_dlmm_tx_layout_seed(
+                    base_mint, quote_mint, reserve_x, reserve_y,
+                ),
+            ))
         }
         _ => None,
+    }
+}
+
+/// True when TX layout-only incoming would overwrite account-authoritative quote fields on merge.
+fn tx_layout_seed_preserves_account_quote(
+    existing: &CachedPoolState,
+    incoming: &CachedPoolState,
+) -> bool {
+    match (existing, incoming) {
+        (CachedPoolState::Orca(ex), CachedPoolState::Orca(inc)) => {
+            ex.whirlpool_quote_account_seeded && !inc.whirlpool_quote_account_seeded
+        }
+        (CachedPoolState::Meteora(ex), CachedPoolState::Meteora(inc)) => {
+            ex.dlmm_bin_params_account_seeded && !inc.dlmm_bin_params_account_seeded
+        }
+        (CachedPoolState::PumpAmm(ex), CachedPoolState::PumpAmm(inc)) => {
+            (ex.base_reserve.is_some() || ex.quote_reserve.is_some())
+                && inc.base_reserve.is_none()
+                && inc.quote_reserve.is_none()
+        }
+        (CachedPoolState::RaydiumCpmm(ex), CachedPoolState::RaydiumCpmm(inc)) => {
+            (ex.reserve_0.is_some() || ex.reserve_1.is_some())
+                && inc.reserve_0.is_none()
+                && inc.reserve_1.is_none()
+        }
+        _ => false,
     }
 }
 
@@ -2177,7 +2190,12 @@ fn apply_tx_pool_accounts_for_hot_pool(
         return;
     };
     let merged = match ctx.live_pool_cache.get(&pool) {
-        Some(existing) => merge_tx_pool_accounts_into_existing(&existing, &incoming),
+        Some(existing) => {
+            if tx_layout_seed_preserves_account_quote(&existing, &incoming) {
+                ironcrab::metrics::inc_market_data_tx_layout_seed_preserve_quote_total();
+            }
+            merge_tx_pool_accounts_into_existing(&existing, &incoming)
+        }
         None => incoming,
     };
     ctx.live_pool_cache.upsert(pool, merged, slot);
@@ -2219,11 +2237,14 @@ fn note_trade_pool_lru_touches_from_cache(
     }
     if enable_meteora_dlmm {
         if let CachedPoolState::Meteora(s) = &state {
-            let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
-            for offset in -3i64..=3i64 {
-                let index = active_array_index + offset;
-                if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index) {
-                    scratch.note_bin_array_touch(pda, SidefxUpdateClass::ExecHot);
+            if s.dlmm_bin_params_account_seeded {
+                let active_array_index =
+                    MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
+                for offset in -3i64..=3i64 {
+                    let index = active_array_index + offset;
+                    if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index) {
+                        scratch.note_bin_array_touch(pda, SidefxUpdateClass::ExecHot);
+                    }
                 }
             }
         }
@@ -2305,11 +2326,14 @@ fn planned_explicit_pubkeys_for_pool_from_cache(
     }
     if enable_meteora_dlmm {
         if let CachedPoolState::Meteora(s) = state {
-            let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
-            for offset in -3i64..=3i64 {
-                let index = active_array_index + offset;
-                if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index) {
-                    set.insert(pda);
+            if s.dlmm_bin_params_account_seeded {
+                let active_array_index =
+                    MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
+                for offset in -3i64..=3i64 {
+                    let index = active_array_index + offset;
+                    if let Ok(pda) = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, index) {
+                        set.insert(pda);
+                    }
                 }
             }
         }
@@ -2332,6 +2356,9 @@ fn planned_meteora_dlmm_bin_pubkeys_for_cache(
     let CachedPoolState::Meteora(s) = state else {
         return Vec::new();
     };
+    if !s.dlmm_bin_params_account_seeded {
+        return Vec::new();
+    }
     let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
     let mut out = Vec::new();
     for offset in -3i64..=3i64 {
@@ -2865,7 +2892,7 @@ impl IngestHost for MarketDataContext {
 
     fn ingest_pool_dlmm_active_id(&self, pool: &Pubkey) -> Option<i32> {
         match self.live_pool_cache.get(pool)? {
-            CachedPoolState::Meteora(s) => Some(s.active_id),
+            CachedPoolState::Meteora(s) => s.dlmm_bin_params_account_seeded.then_some(s.active_id),
             _ => None,
         }
     }
@@ -6235,7 +6262,7 @@ impl MarketDataContext {
         let mut bins_changed = false;
 
         match &state {
-            CachedPoolState::Meteora(s) if enable_dlmm => {
+            CachedPoolState::Meteora(s) if enable_dlmm && s.dlmm_bin_params_account_seeded => {
                 bins_changed =
                     self.register_meteora_dlmm_bin_arrays(pool, s.active_id, s.bin_step, pin, now);
             }
@@ -13054,6 +13081,7 @@ mod discovery_tests {
             vault_b_balance: None,
             token_a_program: None,
             token_b_program: None,
+            whirlpool_quote_account_seeded: true,
         };
         cache.upsert(p1, CachedPoolState::Orca(on_a), 0);
         let on_b = OrcaWhirlpoolState {
@@ -13071,6 +13099,7 @@ mod discovery_tests {
             vault_b_balance: None,
             token_a_program: None,
             token_b_program: None,
+            whirlpool_quote_account_seeded: true,
         };
         cache.upsert(p2, CachedPoolState::Orca(on_b), 0);
         cache.upsert(
@@ -13090,6 +13119,7 @@ mod discovery_tests {
                 vault_b_balance: None,
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             }),
             0,
         );
@@ -13118,6 +13148,7 @@ mod discovery_tests {
             bin_step: 4,
             reserve_x_balance: None,
             reserve_y_balance: None,
+            dlmm_bin_params_account_seeded: false,
         };
         cache.upsert(p1, CachedPoolState::Meteora(on_x), 0);
         let on_y = MeteoraState {
@@ -13129,6 +13160,7 @@ mod discovery_tests {
             bin_step: 0,
             reserve_x_balance: None,
             reserve_y_balance: None,
+            dlmm_bin_params_account_seeded: false,
         };
         cache.upsert(p2, CachedPoolState::Meteora(on_y), 0);
         cache.upsert(
@@ -13142,6 +13174,7 @@ mod discovery_tests {
                 bin_step: 1,
                 reserve_x_balance: None,
                 reserve_y_balance: None,
+                dlmm_bin_params_account_seeded: false,
             }),
             0,
         );
@@ -13174,6 +13207,7 @@ mod discovery_tests {
             vault_b_balance: Some(50_000_000_000),
             token_a_program: None,
             token_b_program: None,
+            whirlpool_quote_account_seeded: true,
         };
         assert_eq!(
             orca_readiness_for_pool_cache_update(&s),
@@ -13228,6 +13262,7 @@ mod discovery_tests {
             bin_step: 0,
             reserve_x_balance: Some(1_000_000),
             reserve_y_balance: Some(50_000_000_000),
+            dlmm_bin_params_account_seeded: true,
         };
         assert_eq!(
             meteora_dlmm_readiness_for_pool_cache_update(&s),
@@ -13315,6 +13350,7 @@ mod discovery_tests {
                 bin_step: 0,
                 reserve_x_balance: Some(1),
                 reserve_y_balance: Some(2),
+                dlmm_bin_params_account_seeded: true,
             }),
             0,
         );
@@ -18775,6 +18811,224 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
+    fn test_orca_whirlpool_tx_pool_accounts(
+        pool: Pubkey,
+        mint_a: Pubkey,
+        mint_b: Pubkey,
+    ) -> Vec<Pubkey> {
+        vec![
+            pool,
+            mint_a,
+            mint_b,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ]
+    }
+
+    fn test_meteora_dlmm_tx_pool_accounts(pool: Pubkey) -> Vec<Pubkey> {
+        vec![pool, Pubkey::new_unique(), Pubkey::new_unique()]
+    }
+
+    #[test]
+    fn tx_layout_seed_hot_apply_preserves_account_orca_quote_on_merge() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let vault_a = Pubkey::new_unique();
+        let vault_b = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: base,
+                token_mint_b: quote,
+                token_vault_a: vault_a,
+                token_vault_b: vault_b,
+                tick_current_index: -42,
+                sqrt_price: 1u128 << 64,
+                liquidity: 5_000_000,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 64,
+                vault_a_balance: Some(1_000_000),
+                vault_b_balance: Some(2_000_000),
+                token_a_program: None,
+                token_b_program: None,
+                whirlpool_quote_account_seeded: true,
+            }),
+            10,
+        );
+
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_arb_pool_admitted(pool);
+
+        let accounts = test_orca_whirlpool_tx_pool_accounts(pool, base, quote);
+        apply_tx_pool_accounts_for_hot_pool(
+            &ctx,
+            pool,
+            DexType::OrcaWhirlpool,
+            base,
+            quote,
+            &accounts,
+            20,
+        );
+
+        let state = ctx.live_pool_cache.get(&pool).expect("orca row");
+        let CachedPoolState::Orca(s) = state else {
+            panic!("expected Orca cache row");
+        };
+        assert_eq!(s.sqrt_price, 1u128 << 64);
+        assert_eq!(s.tick_current_index, -42);
+        assert_eq!(s.liquidity, 5_000_000);
+        assert!(s.whirlpool_quote_account_seeded);
+        assert_eq!(s.vault_a_balance, Some(1_000_000));
+        assert_eq!(s.vault_b_balance, Some(2_000_000));
+        assert_eq!(s.token_vault_a, vault_a);
+    }
+
+    #[test]
+    fn tx_layout_seed_empty_cache_orca_not_account_quote_ready() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let accounts = test_orca_whirlpool_tx_pool_accounts(pool, base, quote);
+
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_arb_pool_admitted(pool);
+
+        apply_tx_pool_accounts_for_hot_pool(
+            &ctx,
+            pool,
+            DexType::OrcaWhirlpool,
+            base,
+            quote,
+            &accounts,
+            1,
+        );
+
+        let state = ctx.live_pool_cache.get(&pool).expect("orca layout seed");
+        let CachedPoolState::Orca(ref s) = state else {
+            panic!("expected Orca cache row");
+        };
+        assert!(!s.whirlpool_quote_account_seeded);
+        assert_eq!(s.sqrt_price, 0);
+        assert_eq!(s.tick_spacing, 0);
+        assert_eq!(
+            ironcrab::execution::live_pool_cache::orca_readiness_for_pool_cache_update(s),
+            ironcrab::ipc::schema::DexPoolReadiness::Observed,
+            "TX layout-only seed must not imply account quote readiness"
+        );
+        assert!(!ironcrab::execution::live_pool_cache::pool_state_has_reserve_basis(&state));
+    }
+
+    #[test]
+    fn tx_layout_seed_empty_cache_meteora_skips_bin_params_and_registers_vaults() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let accounts = test_meteora_dlmm_tx_pool_accounts(pool);
+        let reserve_x = accounts[1];
+        let reserve_y = accounts[2];
+
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_arb_pool_admitted(pool);
+
+        apply_tx_pool_accounts_for_hot_pool(
+            &ctx,
+            pool,
+            DexType::MeteoraDlmm,
+            base,
+            quote,
+            &accounts,
+            1,
+        );
+
+        let state = ctx.live_pool_cache.get(&pool).expect("meteora layout seed");
+        let CachedPoolState::Meteora(s) = state else {
+            panic!("expected Meteora cache row");
+        };
+        assert!(!s.dlmm_bin_params_account_seeded);
+        assert_eq!(s.active_id, 0);
+        assert_eq!(s.bin_step, 0);
+        assert!(s.reserve_x_balance.is_none());
+        assert!(s.reserve_y_balance.is_none());
+        let vs = ctx.tracked_vaults.read();
+        assert!(vs.contains_key(&reserve_x));
+        assert!(vs.contains_key(&reserve_y));
+        assert_eq!(vs[&reserve_x].pin, Some(GeyserPinReason::ArbMultiDex));
+    }
+
+    #[test]
+    fn tx_layout_seed_hot_apply_preserves_account_meteora_bin_params_on_merge() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let reserve_x = Pubkey::new_unique();
+        let reserve_y = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: base,
+                token_y_mint: quote,
+                reserve_x,
+                reserve_y,
+                active_id: -281,
+                bin_step: 10,
+                reserve_x_balance: Some(1_000_000),
+                reserve_y_balance: Some(2_000_000),
+                dlmm_bin_params_account_seeded: true,
+            }),
+            10,
+        );
+
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_arb_pool_admitted(pool);
+
+        let accounts = test_meteora_dlmm_tx_pool_accounts(pool);
+        apply_tx_pool_accounts_for_hot_pool(
+            &ctx,
+            pool,
+            DexType::MeteoraDlmm,
+            base,
+            quote,
+            &accounts,
+            20,
+        );
+
+        let state = ctx.live_pool_cache.get(&pool).expect("meteora row");
+        let CachedPoolState::Meteora(s) = state else {
+            panic!("expected Meteora cache row");
+        };
+        assert_eq!(s.active_id, -281);
+        assert_eq!(s.bin_step, 10);
+        assert!(s.dlmm_bin_params_account_seeded);
+        assert_eq!(s.reserve_x_balance, Some(1_000_000));
+        assert_eq!(s.reserve_y_balance, Some(2_000_000));
+        assert_eq!(s.reserve_x, reserve_x);
+        assert_eq!(s.reserve_y, reserve_y);
+    }
+
     #[test]
     fn hot_pool_trade_flood_coalesced_no_new_subscription_keys() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -20269,6 +20523,7 @@ mod pr_b_geyser_tracking_tests {
                 bin_step: 20,
                 reserve_x_balance: Some(500_000),
                 reserve_y_balance: Some(1_500_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             99,
         );
@@ -20324,6 +20579,7 @@ mod pr_b_geyser_tracking_tests {
                 bin_step: 15,
                 reserve_x_balance: Some(1),
                 reserve_y_balance: Some(1),
+                dlmm_bin_params_account_seeded: true,
             }),
             1,
         );
@@ -22780,6 +23036,7 @@ mod pr_b_geyser_tracking_tests {
             bin_step: 15,
             reserve_x_balance: Some(1),
             reserve_y_balance: Some(1),
+            dlmm_bin_params_account_seeded: true,
         })
     }
 

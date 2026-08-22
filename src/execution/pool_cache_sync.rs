@@ -204,6 +204,12 @@ fn build_minimal_pool_state_with_reserves(
                 vault_b_balance,
                 token_a_program,
                 token_b_program,
+                whirlpool_quote_account_seeded: meta.is_some_and(|m| {
+                    m.contains_key(POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY)
+                        || m.contains_key(POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY)
+                        || m.contains_key(POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY)
+                        || m.contains_key(POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY)
+                }),
             })
         }
         "raydium" => {
@@ -314,6 +320,10 @@ fn build_minimal_pool_state_with_reserves(
                 bin_step,
                 reserve_x_balance: Some(reserve_x_balance),
                 reserve_y_balance: Some(reserve_y_balance),
+                dlmm_bin_params_account_seeded: meta.is_some_and(|m| {
+                    m.contains_key(POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY)
+                        || m.contains_key(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY)
+                }),
             })
         }
         "meteora_cpmm" => {
@@ -1099,6 +1109,9 @@ fn apply_pool_cache_update_outcome_inner(
                             {
                                 new_o.token_b_program = ex.token_b_program;
                             }
+                            if ex.whirlpool_quote_account_seeded {
+                                new_o.whirlpool_quote_account_seeded = true;
+                            }
                         }
                     }
                 }
@@ -1156,6 +1169,9 @@ fn apply_pool_cache_update_outcome_inner(
                                 .is_none()
                             {
                                 new_m.bin_step = ex.bin_step;
+                            }
+                            if ex.dlmm_bin_params_account_seeded {
+                                new_m.dlmm_bin_params_account_seeded = true;
                             }
                         }
                     }
@@ -3089,6 +3105,7 @@ mod tests {
                 vault_b_balance: Some(20),
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             }),
             1,
         );
@@ -3271,6 +3288,7 @@ mod tests {
                 vault_b_balance: Some(65_000_000),
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             }),
             1,
         );
