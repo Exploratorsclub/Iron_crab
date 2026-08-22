@@ -4,15 +4,18 @@ Version: **0.4.0** (Agave / Solana 3.x)
 
 Multi-Process-Architektur mit NATS IPC, JetStream State Recovery und Geyser-First Data Plane.
 
+**Mitentwickeln:** [CONTRIBUTING.md](CONTRIBUTING.md) — gemeinsamer Branch ist **`architecture-rebuild`**. Spec und Eval-Tests: [Iron_crab-eval](https://github.com/Exploratorsclub/Iron_crab-eval) (`main`). `architecture-rebuild-next` ist nur die aktive Maintainer-Entwicklung.
+
 ## Spezifikation & Regeln
 
 | Dokument | Ort |
 |----------|-----|
-| TARGET_ARCHITECTURE | [Iron_crab-eval/docs/spec/](https://github.com/Exploratorsclub/Iron_crab-eval) |
+| **CONTRIBUTING** | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| TARGET_ARCHITECTURE | [Iron_crab-eval/docs/spec/](https://github.com/Exploratorsclub/Iron_crab-eval/blob/main/docs/spec/TARGET_ARCHITECTURE.md) |
 | DEFINITION_OF_DONE | Iron_crab-eval/docs/spec/ |
-| **INVARIANTS** | `docs/INVARIANTS.md` (niemals verletzen) |
+| **INVARIANTS** | `docs/INVARIANTS.md` (P0) und [Eval-Spec](https://github.com/Exploratorsclub/Iron_crab-eval/blob/main/docs/spec/INVARIANTS.md) |
 | **KNOWN_BUG_PATTERNS** | `docs/KNOWN_BUG_PATTERNS.md` (bei Bugs prüfen) |
-| RUNBOOK_PROD | `docs/RUNBOOK_PROD.md` |
+| RUNBOOK_PROD | `docs/RUNBOOK_PROD.md` (Maintainer) |
 
 Die vollständige Spec liegt im [Iron_crab-eval](https://github.com/Exploratorsclub/Iron_crab-eval)-Repo; siehe `docs/SPEC_LOCATION.md`.
 
@@ -53,12 +56,13 @@ NATS (ironcrab.v1.*)
 |--------|------|---------|
 | market-data | 9801 | Geyser Ingest, Pool Discovery, MarketEvents, WalletBalanceUpdates |
 | momentum-bot | 9802 | EARLY/ESTABLISHED Regime, TradeIntents |
-| arb-strategy | 9803 | Multi-Pool Arbitrage, TradeIntents |
+| arb-strategy | 9803 | Multi-Pool Arbitrage, TradeIntents (eigenes Binary) |
 | execution-engine | 9804 | Intent-Verarbeitung, TX-Build, Signieren, Senden (einziger mit Keys) |
-| control-plane | 8080 | REST API, Kill-Switch, Config |
-| trades-server | 9899 | Grafana Infinity Datasource |
+| position-manager | 9805 | Positions-Pflege |
+| control-plane | 8080 | REST API, Kill-Switch, Config (**Python**, nicht Cargo) |
+| trades-server | 9899 | Grafana Infinity Datasource (**Python**, `scripts/trades_server.py`) |
 
-Hilfs-Tools: `raydium_pools`, `sell-all`, `latency_stress`, `pump-amm-tx-probe`, `manual-swap`, `burn-manual-keyless`, `setup-alt`.
+Hilfs-Tools (Cargo): `raydium-pools`, `sell-all`, `latency-stress`, `pump-amm-tx-probe`, `manual-swap`, `burn-manual-keyless`, `setup-alt`.
 
 ## DEX-Unterstützung (Geyser-First)
 
@@ -68,6 +72,7 @@ Hilfs-Tools: `raydium_pools`, `sell-all`, `latency_stress`, `pump-amm-tx-probe`,
 | Raydium CPMM | Geyser Account | Geyser Account | ✅ |
 | Orca Whirlpool | Geyser Account | Geyser Account | ✅ |
 | Meteora DLMM | Geyser Account | Geyser + PDA | ✅ |
+| Meteora CPMM | Geyser Account | Geyser Account | ✅ |
 | PumpFun | Geyser TX | Geyser TX | ✅ |
 | PumpSwap (PumpFun AMM) | Geyser TX | Geyser Account | ✅ |
 
@@ -104,7 +109,10 @@ Oder über Skripte: `run_new.ps1` / `run_new.sh` (siehe `docs/SCRIPTS_README.md`
 
 ## Eval-Tests (Level 5)
 
-Eval-Tests liegen im Sibling-Repo [Iron_crab-eval](https://github.com/Exploratorsclub/Iron_crab-eval). CI cloned es als `Iron_crab-eval` und führt `cargo test` aus.
+Eval-Tests liegen im Sibling-Repo [Iron_crab-eval](https://github.com/Exploratorsclub/Iron_crab-eval).
+
+- **Impl-CI** führt nach `fmt`/`clippy`/`cargo test` den Job **Eval (Level 5)** aus: volle Suite gegen den PR-Checkout.
+- Das Eval-Repo selbst hat auf `main` nur ein **schlankes** Gate (fmt/check/build/clippy **ohne** Tests) — Details in `docs/LEVEL5_EVAL_WORKFLOW.md` und [Iron_crab-eval/CONTRIBUTING.md](https://github.com/Exploratorsclub/Iron_crab-eval/blob/main/CONTRIBUTING.md).
 
 ```powershell
 cd ..\Iron_crab-eval
@@ -169,6 +177,7 @@ Ergebnisse in `/tmp/entrypoints_latency.csv`; Top-Einträge als `--entrypoint ho
 | momentum-bot | 9802 | `/metrics` |
 | arb-strategy | 9803 | `/metrics` |
 | execution-engine | 9804 | `/metrics` |
+| position-manager | 9805 | `/metrics` |
 
 Prometheus-Scrape-Config: `docs/grafana_dashboard_example.json`
 
@@ -183,7 +192,8 @@ Prometheus-Scrape-Config: `docs/grafana_dashboard_example.json`
 
 ## Weitere Dokumentation
 
-- `docs/RUNBOOK_PROD.md` – Produktionsbetrieb
+- [CONTRIBUTING.md](CONTRIBUTING.md) – Onboarding für Mitentwickler (Code / Spec / Tests)
+- `docs/RUNBOOK_PROD.md` – Produktionsbetrieb (Maintainer)
 - `docs/VALIDATOR_SETUP.md` – Validator-Setup
 - `docs/CONFIG_SCHEMA.md` – Konfigurationsschema
 - `CHANGELOG.md` – Änderungsprotokoll

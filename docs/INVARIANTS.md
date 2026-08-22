@@ -2,7 +2,9 @@
 
 **Zweck:** AI darf diese Regeln **niemals** verletzen. Bei Refactors/Features: Invariants prüfen.
 
-**Quellen:** TARGET_ARCHITECTURE.md, DEFINITION_OF_DONE.md, ROLE_SEPARATION.md, .cursor/rules/ironcrab-core.mdc
+**SSOT:** Der lebende Katalog inkl. eval-getesteter Regeln (I-MD-*, PumpSwap-Layout, Admission, …) steht in [Iron_crab-eval/docs/spec/INVARIANTS.md](https://github.com/Exploratorsclub/Iron_crab-eval/blob/main/docs/spec/INVARIANTS.md). Diese Datei ist die **kompakte P0-Liste** für den Hot-Path-Alltag. Bei Widerspruch gilt die Eval-Spec plus `.cursor/rules/ironcrab-core.mdc`; den Drift dann angleichen, nicht ignorieren.
+
+**Quellen:** Eval `docs/spec/` (TARGET_ARCHITECTURE, DEFINITION_OF_DONE, ROLE_SEPARATION), `.cursor/rules/ironcrab-core.mdc`
 
 ---
 

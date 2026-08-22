@@ -1,29 +1,22 @@
 # Local Development Setup Guide (Windows)
 
-This guide covers setting up IronCrab for local development on Windows.
+This guide covers setting up IronCrab for **local** development on Windows. Production deploy is out of scope (Maintainer). Onboarding: [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+Clone **both** repos as siblings (`Iron_crab` + `Iron_crab-eval`). Impl-Branch für Mitentwickler: `architecture-rebuild`. Eval-Branch: `main`.
 
 > **⚠️ Windows Native Rust Build Not Fully Supported**  
 > The `yellowstone-grpc-proto` dependency uses `protobuf-src` which may fail on Windows.
-> **Use WSL2 for Rust builds** (see section 5). Windows works fine for UI development.
+> **Use WSL2 for Rust builds** (see section 4). Prefer a clone on the Linux filesystem (`~/...`), not `/mnt/c/`. Windows works fine for UI development.
 
 ---
 
-## Quick Start (Recommended)
+## Quick Start
 
-For the fastest setup, use the helper scripts:
+1. Beide Repos klonen, Branches wie in [CONTRIBUTING.md](../CONTRIBUTING.md).
+2. Rust in **WSL2** bauen (Abschnitt 4).
+3. UI unter Windows: `cd ui && npm install && npm run dev`.
 
-```powershell
-# Start SSH tunnel to server + local UI
-.\run_local.ps1 -Action start -Host ironcrab-prod
-
-# Check status
-.\run_local.ps1 -Action status
-
-# Stop everything
-.\run_local.ps1 -Action stop
-```
-
-This connects to the production server's control-plane and runs the UI locally.
+SSH-Tunnel gegen einen laufenden Server (optional, kein Deploy): `.\run_local.ps1 -Action start` — nur wenn der Maintainer einen Host freigegeben hat.
 
 ---
 
@@ -87,9 +80,9 @@ The UI connects to the control-plane API at `http://localhost:8080` by default.
 
 ---
 
-## 3. Connecting to Server (SSH Tunnel)
+## 3. Connecting to a running server (optional SSH tunnel)
 
-To test the UI against the production control-plane:
+Only if the Maintainer already has a server up and you need the UI against it. This is not a deploy guide.
 
 ```powershell
 # Full tunnel (Control Plane + Prometheus + Grafana + Metrics)
@@ -218,6 +211,8 @@ METRICS_PORT_EXECUTION_ENGINE=9804
 
 ## See Also
 
-- [RUNBOOK_PROD.md](RUNBOOK_PROD.md) - Production operations
-- [CONFIG_SCHEMA.md](CONFIG_SCHEMA.md) - Hot-reload configuration
-- [TARGET_ARCHITECTURE.md](TARGET_ARCHITECTURE.md) - System architecture
+- [CONTRIBUTING.md](../CONTRIBUTING.md) — Onboarding (Code / Spec / Tests)
+- [LEVEL5_EVAL_WORKFLOW.md](LEVEL5_EVAL_WORKFLOW.md) — Eval-CI vs volle Suite
+- [CONFIG_SCHEMA.md](CONFIG_SCHEMA.md) — Hot-reload configuration
+- Spec: [Iron_crab-eval/docs/spec/TARGET_ARCHITECTURE.md](https://github.com/Exploratorsclub/Iron_crab-eval/blob/main/docs/spec/TARGET_ARCHITECTURE.md)
+- [RUNBOOK_PROD.md](RUNBOOK_PROD.md) — Production operations (Maintainer)

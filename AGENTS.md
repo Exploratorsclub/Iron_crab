@@ -4,6 +4,8 @@
 
 This project is a Rust-based Solana trading bot. Cloud Agents work on this repo in isolation (no sibling repos available).
 
+**Shared branch (humans / PRs):** `architecture-rebuild`. Maintainer active development: `architecture-rebuild-next`. Onboarding: [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ### Build & Test
 
 ```bash
