@@ -3178,6 +3178,34 @@ impl MarketDataContext {
         )
     }
 
+    /// Geyser-only bootstrap: admit pool account pubkey when hot-pinned but LivePoolCache has no layout.
+    /// Shared by Arb + Momentum deferred paths (no RPC, no vault/bin PDAs until layout exists).
+    fn try_admit_hot_pool_account_bootstrap(
+        &self,
+        admission: &mut FixedCapAdmission,
+        pool: Pubkey,
+        consumer: ExplicitConsumer,
+    ) -> bool {
+        if self.live_pool_cache.get(&pool).is_some() {
+            return false;
+        }
+        if !self.hot_pool_registry.is_hot_pool(pool) {
+            return false;
+        }
+        let admitted = try_admit_owner_group(
+            admission,
+            Self::pool_consumer_owner(pool, consumer),
+            vec![pool],
+        );
+        if admitted {
+            ironcrab::metrics::inc_market_data_hot_pool_account_bootstrap_admitted_total();
+            self.sync_explicit_pool_admitted_from_admission(admission, pool, consumer);
+        } else {
+            ironcrab::metrics::inc_market_data_hot_pool_account_bootstrap_rejected_total();
+        }
+        admitted
+    }
+
     /// PR4a: drop pool owner group from admission before tracked-map demotion.
     fn release_pool_consumer_group(
         &self,
@@ -3429,6 +3457,21 @@ impl MarketDataContext {
         }
         for pk in self.tracked_wallet_token_accounts.read().iter() {
             rows.push((*pk, ConsumerId::Wallet, None));
+        }
+        // Hot-pool bootstrap: pool account only while LivePoolCache layout is missing (deferred reserves).
+        for (pool, entry) in self.deferred_hot_pool_reserve_pins.read().iter() {
+            if self.live_pool_cache.get(pool).is_some()
+                || !self.hot_pool_registry.is_hot_pool(*pool)
+            {
+                continue;
+            }
+            let consumer = match entry.pin {
+                GeyserPinReason::ArbMultiDex => ConsumerId::Arb,
+                GeyserPinReason::MomentumActive | GeyserPinReason::Wallet => {
+                    consumer_id_for_pool_explicit_row(self, *pool, Some(entry.pin))
+                }
+            };
+            rows.push((*pool, consumer, Some(*pool)));
         }
         rows
     }
@@ -4780,6 +4823,13 @@ impl MarketDataContext {
                     GeyserPinReason::MomentumActive,
                     "live_pool_cache_miss",
                 );
+                if self.try_admit_hot_pool_account_bootstrap(
+                    admission,
+                    pool,
+                    ExplicitConsumer::MomentumPosition,
+                ) {
+                    batch_dirty = true;
+                }
                 inc_market_data_open_position_pumpfun_remediate_still_unsatisfied_total();
                 continue;
             };
@@ -5685,21 +5735,24 @@ impl MarketDataContext {
                 inc_market_data_arb_pin_deferred_still_unsatisfied_total("admit_suppress");
                 continue;
             }
-            if self.live_pool_cache.get(&pool).is_none() {
-                if pin == GeyserPinReason::ArbMultiDex {
-                    inc_market_data_arb_pin_deferred_still_unsatisfied_total(
-                        "live_pool_cache_miss",
-                    );
-                }
-                continue;
-            }
-            let _ = self.try_touch_live_pool_reserve_basis_for_hot_pool(pool);
             let consumer = match pin {
                 GeyserPinReason::ArbMultiDex => ExplicitConsumer::Arb,
                 GeyserPinReason::MomentumActive | GeyserPinReason::Wallet => {
                     momentum_explicit_consumer_for_pool(self, pool)
                 }
             };
+            if self.live_pool_cache.get(&pool).is_none() {
+                if pin == GeyserPinReason::ArbMultiDex {
+                    inc_market_data_arb_pin_deferred_still_unsatisfied_total(
+                        "live_pool_cache_miss",
+                    );
+                }
+                if self.try_admit_hot_pool_account_bootstrap(admission, pool, consumer) {
+                    batch_dirty = true;
+                }
+                continue;
+            }
+            let _ = self.try_touch_live_pool_reserve_basis_for_hot_pool(pool);
             if !self.try_admit_pool_consumer_group(admission, pool, consumer) {
                 if pin == GeyserPinReason::ArbMultiDex {
                     inc_market_data_arb_pin_deferred_still_unsatisfied_total("admit_fail");
@@ -6093,6 +6146,20 @@ impl MarketDataContext {
                 ironcrab::metrics::inc_market_data_momentum_pin_vault_register_total(
                     ironcrab::metrics::MomentumPinVaultRegisterResult::AdmissionRejected,
                 );
+                self.note_deferred_hot_pool_reserve_registration(
+                    pool_pk,
+                    GeyserPinReason::MomentumActive,
+                    "admit_suppress",
+                );
+                if self.live_pool_cache.get(&pool_pk).is_none()
+                    && self.try_admit_hot_pool_account_bootstrap(
+                        admission,
+                        pool_pk,
+                        momentum_consumer,
+                    )
+                {
+                    batch_dirty = true;
+                }
                 self.sync_explicit_pool_admitted_from_admission(
                     admission,
                     pool_pk,
@@ -6129,6 +6196,15 @@ impl MarketDataContext {
                 }
             } else {
                 inc_market_data_momentum_admission_rejected_total();
+                if self.live_pool_cache.get(&pool_pk).is_none()
+                    && self.try_admit_hot_pool_account_bootstrap(
+                        admission,
+                        pool_pk,
+                        momentum_consumer,
+                    )
+                {
+                    batch_dirty = true;
+                }
                 self.record_momentum_active_pool_reserve_registration_outcome(
                     pool_pk,
                     GeyserPinReason::MomentumActive,
@@ -6338,6 +6414,15 @@ impl MarketDataContext {
                     "admit_suppress",
                 );
                 self.log_arb_pin_deferred_throttled(pool_pk, "admit_suppress");
+                if self.live_pool_cache.get(&pool_pk).is_none()
+                    && self.try_admit_hot_pool_account_bootstrap(
+                        admission,
+                        pool_pk,
+                        ExplicitConsumer::Arb,
+                    )
+                {
+                    batch_dirty = true;
+                }
                 self.sync_explicit_pool_admitted_from_admission(
                     admission,
                     pool_pk,
@@ -6356,6 +6441,15 @@ impl MarketDataContext {
                 }
             } else {
                 inc_market_data_arb_admission_rejected_total();
+                if self.live_pool_cache.get(&pool_pk).is_none()
+                    && self.try_admit_hot_pool_account_bootstrap(
+                        admission,
+                        pool_pk,
+                        ExplicitConsumer::Arb,
+                    )
+                {
+                    batch_dirty = true;
+                }
                 self.record_arb_active_pool_reserve_registration_outcome(pool_pk, false);
             }
             self.sync_explicit_pool_admitted_from_admission(
@@ -15625,7 +15719,7 @@ mod pr_b_geyser_tracking_tests {
         ));
         ctx.hot_pool_registry.pin_pool(base_mint, pool);
 
-        // No LivePoolCache layout: Position admit must fail while Momentum stays admitted.
+        // No LivePoolCache layout: Position pin bootstraps pool account only; Momentum stays admitted.
         ctx.apply_momentum_active_entries(
             &mut admission,
             &[MomentumActivePoolEntry {
@@ -15636,11 +15730,16 @@ mod pr_b_geyser_tracking_tests {
         );
         assert!(
             admission.owner_group(&momentum_owner).is_some(),
-            "failed Position admit must not release existing Momentum consumer"
+            "Position bootstrap must not release existing Momentum consumer"
         );
         assert!(
-            admission.owner_group(&position_owner).is_none(),
-            "Position admit should fail when cache layout is unavailable"
+            admission.owner_group(&position_owner).is_some(),
+            "Position pin cache miss must bootstrap pool account into explicit set"
+        );
+        let admitted = admitted_pubkey_set(&admission);
+        assert!(
+            admitted.contains(&pool),
+            "explicit set must include pool account for Geyser bootstrap"
         );
     }
 
@@ -21802,6 +21901,122 @@ mod pr_b_geyser_tracking_tests {
             MARKET_DATA_ARB_TRACKED_VAULTS_GAUGE.load(Ordering::Relaxed),
             2
         );
+    }
+
+    /// Pool-account bootstrap: cache miss at arb pin admits pool pubkey to explicit Geyser set.
+    #[test]
+    fn hot_pool_account_bootstrap_admits_pool_on_arb_cache_miss() {
+        use ironcrab::market_data::track::{
+            admitted_pubkey_set, ExplicitConsumer, ExplicitOwner, ExplicitOwnerKey,
+        };
+        use ironcrab::metrics::MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_ADMITTED_TOTAL;
+        use ironcrab::nats::{
+            ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRequestsUpdate,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let admitted_before =
+            MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_ADMITTED_TOTAL.load(Ordering::Relaxed);
+        let mut admission = test_admission_for(&ctx);
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::MultiDex,
+                    readiness: ArbTrackReadiness::QuoteReady,
+                }],
+                removed: vec![],
+                reconcile: false,
+            },
+        );
+
+        let owner = ExplicitOwner {
+            consumer: ExplicitConsumer::Arb,
+            owner_key: ExplicitOwnerKey::Pool(pool),
+        };
+        assert!(
+            admission.owner_group(&owner).is_some(),
+            "bootstrap must admit pool owner group on cache miss"
+        );
+        let admitted = admitted_pubkey_set(&admission);
+        assert!(
+            admitted.contains(&pool),
+            "explicit set must include pool account pubkey for Geyser bootstrap"
+        );
+        assert!(
+            MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_ADMITTED_TOTAL.load(Ordering::Relaxed)
+                > admitted_before
+        );
+        assert!(ctx.pool_has_explicit_arb_admission(pool));
+    }
+
+    /// Fill-wake: deferred retry counter increments when cache fill hits deferred pool.
+    #[test]
+    fn fill_wake_enqueues_deferred_retry_on_cache_fill() {
+        use ironcrab::market_data::sidefx::SidefxWorkerHost;
+        use ironcrab::metrics::MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = Arc::new(minimal_market_data_context_for_pr_d_tests(jsonl));
+        let (md_state, _, _) = test_md_state_sender_no_worker();
+        let host = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        ctx.deferred_hot_pool_reserve_pins.write().insert(
+            pool,
+            DeferredHotPoolReserve {
+                pin: GeyserPinReason::ArbMultiDex,
+                reason: "live_pool_cache_miss",
+            },
+        );
+
+        let retry_before = MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL.load(Ordering::Relaxed);
+        host.maybe_retry_deferred_hot_pool_reserves_on_cache_fill(&pool);
+        assert!(
+            MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL.load(Ordering::Relaxed) > retry_before,
+            "fill-wake must increment deferred_retry_pool_state_fill for deferred pools"
+        );
+    }
+
+    /// Momentum pin cache miss also bootstraps pool account (dual-consumer shared helper).
+    #[test]
+    fn hot_pool_account_bootstrap_admits_pool_on_momentum_cache_miss() {
+        use ironcrab::market_data::track::admitted_pubkey_set;
+        use ironcrab::nats::{MomentumActivePinReason, MomentumActivePoolEntry};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut admission = test_admission_for(&ctx);
+        ctx.apply_momentum_active_entries(
+            &mut admission,
+            &[MomentumActivePoolEntry {
+                mint: mint.to_string(),
+                pool: pool.to_string(),
+                pin_reason: MomentumActivePinReason::Tracker,
+            }],
+        );
+
+        let admitted = admitted_pubkey_set(&admission);
+        assert!(
+            admitted.contains(&pool),
+            "momentum cache miss must bootstrap pool account into explicit set"
+        );
+        assert!(ctx.pool_has_explicit_momentum_admission(pool));
     }
 
     /// Scope C1c: warmable arb pin under admit suppress must note deferred (not silent skip).

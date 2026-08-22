@@ -436,6 +436,12 @@ pub static MARKET_DATA_DLMM_BIN_WINDOW_REFRESH_UNTRACKED_TOTAL: Lazy<AtomicU64> 
 /// Deferred hot-pool reserve retry enqueued after LivePoolCache fill (C1g).
 pub static MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Hot-pool Geyser explicit admit: pool account only when LivePoolCache layout is missing.
+pub static MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_ADMITTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Hot-pool pool-account bootstrap rejected (cap / admission failure).
+pub static MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_REJECTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// DLMM bin-array publishes from stashed Geyser replay (post-register / post-sync).
 pub static MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -836,6 +842,16 @@ pub fn inc_market_data_dlmm_bin_window_refresh_untracked_total() {
 #[inline]
 pub fn inc_market_data_deferred_retry_pool_state_fill_total() {
     MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_hot_pool_account_bootstrap_admitted_total() {
+    MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_ADMITTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_hot_pool_account_bootstrap_rejected_total() {
+    MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -9024,6 +9040,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_deferred_retry_pool_state_fill_total",
         MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_hot_pool_account_bootstrap_admitted_total",
+        MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_ADMITTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_hot_pool_account_bootstrap_rejected_total",
+        MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_REJECTED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_dlmm_bin_replay_publish_total",
