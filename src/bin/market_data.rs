@@ -743,7 +743,7 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
         let ctx = Arc::clone(&self.ctx);
         let state = state.clone();
         let run_id = self.ctx.run_id.clone();
-        tokio::spawn(async move {
+        self.ctx.spawn_on_ingest_runtime(async move {
             let request_id = format!("fix29-serum-{}", pool);
             let _ = cold_path_raydium_serum_backfill_and_publish(
                 ctx.as_ref(),
@@ -3200,6 +3200,17 @@ impl MdStateContext for MarketDataContext {
 }
 
 impl MarketDataContext {
+    /// Spawn async work on the main market-data Tokio runtime from OS-thread workers (md-state, md-sidefx).
+    fn spawn_on_ingest_runtime<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if let Some(handle) = self.ingest_tokio_handle.read().clone() {
+            handle.spawn(future);
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(future);
+        }
+    }
     /// Non-blocking JSONL enqueue (dedicated `jsonl-writer` thread). Skips `AccountUpdate` / `TransactionDetected`.
     fn write_market_event_jsonl(&self, event: &MarketEvent) {
         write_market_event_jsonl(self, event);
@@ -9006,6 +9017,7 @@ async fn main() -> Result<()> {
         geyser_prune_resume: parking_lot::Mutex::new(GeyserPruneResume::default()),
     });
     let _ = MARKET_DATA_GEYSER_CONNECT_BARRIER.set(Arc::clone(&ctx.geyser_connect_barrier));
+    ctx.set_ingest_tokio_handle(tokio::runtime::Handle::current());
 
     // === Main Loop: Geyser subscription or simulation ===
 
