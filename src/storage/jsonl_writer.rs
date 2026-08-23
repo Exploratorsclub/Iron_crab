@@ -461,8 +461,14 @@ impl QueuedJsonlWriter {
                 let retention_interval = Duration::from_secs(60);
                 let mut last_periodic_flush = Instant::now();
                 let mut last_retention_run = Instant::now();
-                let run_retention = || {
+                // Retention must not rely on recv_timeout alone: under sustained ingest
+                // (~200+/s) the channel rarely idles, so timeout-only would skip the janitor
+                // until a lull.
+                let mut tick_retention_if_due = || {
                     if retention_hours == 0 {
+                        return;
+                    }
+                    if last_retention_run.elapsed() < retention_interval {
                         return;
                     }
                     let open_path = writer.current_path();
@@ -474,6 +480,7 @@ impl QueuedJsonlWriter {
                     ) {
                         warn!(error = %e, "QueuedJsonlWriter: JSONL retention janitor failed");
                     }
+                    last_retention_run = Instant::now();
                 };
                 let dec_queue_depth = || {
                     let mut cur = depth_for_thread.load(Ordering::Relaxed);
@@ -508,16 +515,19 @@ impl QueuedJsonlWriter {
                         Ok(QueuedJsonlMsg::Line(json)) => {
                             write_line(json);
                             dec_queue_depth();
+                            tick_retention_if_due();
                         }
                         Ok(QueuedJsonlMsg::MarketEvent(event)) => {
                             let json =
                                 serde_json::to_string(&*event).unwrap_or_else(|_| "{}".to_string());
                             write_line(json);
                             dec_queue_depth();
+                            tick_retention_if_due();
                         }
                         Ok(QueuedJsonlMsg::Serialize(serialize)) => {
                             write_line(serialize());
                             dec_queue_depth();
+                            tick_retention_if_due();
                         }
                         Ok(QueuedJsonlMsg::Flush) => {
                             let _ = writer.flush();
@@ -532,10 +542,7 @@ impl QueuedJsonlWriter {
                                 let _ = writer.flush();
                                 last_periodic_flush = Instant::now();
                             }
-                            if last_retention_run.elapsed() >= retention_interval {
-                                run_retention();
-                                last_retention_run = Instant::now();
-                            }
+                            tick_retention_if_due();
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
