@@ -12,9 +12,9 @@
 //! This is event-driven, NOT interval-based, to minimize latency.
 
 use crate::arbitrage::{
-    is_usable_quote_kind, quote_from_cached_pool, token_decimals_from_cached_state, ArbCycle,
-    BeamCycleFinder, CycleFinderConfig, DexType, DlmmBinArrays, PoolEdge, PoolGraph, PoolQuote,
-    PoolRanker, QuoteFreshnessConfig, QuoteKind, QuoteProvider, RankerConfig, MAX_RETURN_BPS,
+    quote_from_cached_pool, token_decimals_from_cached_state, ArbCycle, BeamCycleFinder,
+    CycleFinderConfig, DexType, DlmmBinArrays, PoolEdge, PoolGraph, PoolQuote, PoolRanker,
+    QuoteFreshnessConfig, QuoteKind, QuoteProvider, RankerConfig, MAX_RETURN_BPS,
 };
 use crate::execution::live_pool_cache::{CachedPoolState, SharedLivePoolCache};
 use crate::ipc::BinData;
@@ -24,11 +24,10 @@ use crate::ipc::{
 };
 use crate::metrics::{
     multi_hop_cycle_rejected_sanity_inc, multi_hop_hop_missing_quote_inc,
-    multi_hop_quote_from_pool_quote_inc, multi_hop_quote_from_trade_cache_inc,
-    multi_hop_quote_ready_pools_set, multi_hop_quote_ready_wsol_edge_pools_set,
-    multi_hop_return_bps_saturated_inc, multi_hop_search_no_quote_neighbors_inc,
-    multi_hop_search_worker_queue_depth_set, multi_hop_searches_coalesced_inc,
-    multi_hop_shadow_logged_inc, MultiHopSanityRejectReason,
+    multi_hop_quote_from_pool_quote_inc, multi_hop_quote_ready_pools_set,
+    multi_hop_quote_ready_wsol_edge_pools_set, multi_hop_return_bps_saturated_inc,
+    multi_hop_search_no_quote_neighbors_inc, multi_hop_search_worker_queue_depth_set,
+    multi_hop_searches_coalesced_inc, multi_hop_shadow_logged_inc, MultiHopSanityRejectReason,
 };
 use parking_lot::RwLock;
 use solana_sdk::pubkey::Pubkey;
@@ -216,7 +215,7 @@ impl CachedQuoteProvider {
         &self.quote_ready
     }
 
-    /// Mark pool ready when LivePoolCache yields ExecutableMarginal or fresh trade-cache quote.
+    /// Mark pool ready when LivePoolCache yields ExecutableMarginal quote.
     pub fn mark_ready_from_live_pool_cache(&self, pool_address: &Pubkey) {
         let Some(state) = self.live_pool_cache.get(pool_address) else {
             return;
@@ -236,56 +235,11 @@ impl CachedQuoteProvider {
         mint_in: &Pubkey,
         mint_out: &Pubkey,
     ) -> bool {
-        if self.trade_direction_fresh_probe(*pool, *mint_in, *mint_out) {
-            return true;
-        }
         self.try_pool_quote_from_live_pool_cache(pool, state, mint_in, mint_out, PROBE_LAMPORTS)
-            .is_some_and(|q| is_usable_quote_kind(q.kind))
-    }
-
-    fn trade_direction_fresh_probe(
-        &self,
-        pool: Pubkey,
-        input_mint: Pubkey,
-        output_mint: Pubkey,
-    ) -> bool {
-        let now = Instant::now();
-        let cache = self.cache.read();
-        self.trade_direction_fresh(&cache, pool, input_mint, output_mint, now)
-    }
-
-    fn resolve_pool_mints(&self, pool: &Pubkey) -> Option<(Pubkey, Pubkey)> {
-        if let Some(mints) = self.pool_mints.read().get(pool).copied() {
-            return Some(mints);
-        }
-        let state = self.live_pool_cache.get(pool)?;
-        Some(Self::mints_from_state(&state))
-    }
-
-    fn trade_direction_fresh(
-        &self,
-        cache: &HashMap<QuoteCacheKey, QuoteCacheValue>,
-        pool: Pubkey,
-        input_mint: Pubkey,
-        output_mint: Pubkey,
-        now: Instant,
-    ) -> bool {
-        cache
-            .get(&(pool, input_mint, output_mint))
-            .is_some_and(|(_, ts)| now.duration_since(*ts) < self.cache_ttl)
+            .is_some_and(|q| q.kind == QuoteKind::ExecutableMarginal)
     }
 
     fn pool_still_quote_ready(&self, pool: &Pubkey) -> bool {
-        let now = Instant::now();
-        if let Some((mint_a, mint_b)) = self.resolve_pool_mints(pool) {
-            let cache = self.cache.read();
-            if self.trade_direction_fresh(&cache, *pool, mint_a, mint_b, now)
-                || self.trade_direction_fresh(&cache, *pool, mint_b, mint_a, now)
-            {
-                return true;
-            }
-        }
-
         let Some(state) = self.live_pool_cache.get(pool) else {
             return false;
         };
@@ -390,58 +344,29 @@ impl CachedQuoteProvider {
         Some(quote.amount_out)
     }
 
-    fn prefer_pool_quote_then_trade_cache(
+    fn executable_marginal_pool_quote(
         &self,
         pool_address: &Pubkey,
         input_mint: &Pubkey,
         output_mint: &Pubkey,
         amount_in: u64,
     ) -> Option<u64> {
-        let pool_quote = self.live_pool_cache.get(pool_address).and_then(|state| {
-            self.try_pool_quote_from_live_pool_cache(
-                pool_address,
-                &state,
-                input_mint,
-                output_mint,
-                amount_in,
-            )
-        });
-        if let Some(ref q) = pool_quote {
-            if q.kind == QuoteKind::ExecutableMarginal {
-                multi_hop_quote_from_pool_quote_inc();
-                return Some(q.amount_out);
-            }
-        }
-        if let Some(out) = self.trade_cache_quote(pool_address, input_mint, output_mint, amount_in)
-        {
-            return Some(out);
-        }
-        if let Some(q) = pool_quote {
-            if is_usable_quote_kind(q.kind) {
-                multi_hop_quote_from_pool_quote_inc();
-                return Some(q.amount_out);
-            }
+        let state = self.live_pool_cache.get(pool_address)?;
+        let quote = self.try_pool_quote_from_live_pool_cache(
+            pool_address,
+            &state,
+            input_mint,
+            output_mint,
+            amount_in,
+        )?;
+        if quote.kind == QuoteKind::ExecutableMarginal {
+            multi_hop_quote_from_pool_quote_inc();
+            return Some(quote.amount_out);
         }
         None
     }
 
-    fn trade_cache_quote(
-        &self,
-        pool_address: &Pubkey,
-        input_mint: &Pubkey,
-        output_mint: &Pubkey,
-        amount_in: u64,
-    ) -> Option<u64> {
-        let cache = self.cache.read();
-        let (cached_output, ts) = cache.get(&(*pool_address, *input_mint, *output_mint))?;
-        if ts.elapsed() >= self.cache_ttl {
-            return None;
-        }
-        multi_hop_quote_from_trade_cache_inc();
-        Some((*cached_output as u128 * amount_in as u128 / PROBE_LAMPORTS as u128) as u64)
-    }
-
-    /// Seed trade-cache probe quotes from LivePoolCache for top WSOL pools (cold-start).
+    /// Seed trade-cache probe quotes from LivePoolCache for top WSOL pools (cold-start dirty-token hints).
     pub fn warmup_from_live_pool_cache(&self, top_n: usize) {
         let Ok(wsol) = Pubkey::from_str(WSOL_MINT) else {
             return;
@@ -594,12 +519,9 @@ impl QuoteProvider for CachedQuoteProvider {
         output_mint: &Pubkey,
         amount_in: u64,
     ) -> Option<u64> {
-        if let Some(out) = self.prefer_pool_quote_then_trade_cache(
-            pool_address,
-            input_mint,
-            output_mint,
-            amount_in,
-        ) {
+        if let Some(out) =
+            self.executable_marginal_pool_quote(pool_address, input_mint, output_mint, amount_in)
+        {
             return Some(out);
         }
 
@@ -627,13 +549,6 @@ impl QuoteProvider for CachedQuoteProvider {
         input_mint: &Pubkey,
         output_mint: &Pubkey,
     ) -> bool {
-        let cache = self.cache.read();
-        if cache
-            .get(&(*pool_address, *input_mint, *output_mint))
-            .is_some_and(|(_, ts)| ts.elapsed() < self.cache_ttl)
-        {
-            return true;
-        }
         let Some(state) = self.live_pool_cache.get(pool_address) else {
             return false;
         };
@@ -644,7 +559,7 @@ impl QuoteProvider for CachedQuoteProvider {
             output_mint,
             PROBE_LAMPORTS,
         )
-        .is_some_and(|q| is_usable_quote_kind(q.kind))
+        .is_some_and(|q| q.kind == QuoteKind::ExecutableMarginal)
     }
 
     fn get_cached_probe_quote(
@@ -655,7 +570,7 @@ impl QuoteProvider for CachedQuoteProvider {
         output_mint: &Pubkey,
         amount_in: u64,
     ) -> Option<u64> {
-        self.prefer_pool_quote_then_trade_cache(pool_address, input_mint, output_mint, amount_in)
+        self.executable_marginal_pool_quote(pool_address, input_mint, output_mint, amount_in)
     }
 }
 
@@ -1548,20 +1463,54 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_quote_provider() {
-        let provider = CachedQuoteProvider::new(Duration::from_secs(30), create_shared_cache());
+    fn test_cached_quote_provider_requires_live_pool_cache() {
+        let cache = create_shared_cache();
+        let provider = CachedQuoteProvider::new(Duration::from_secs(30), cache.clone());
 
         let pool = Pubkey::new_unique();
-        let input = Pubkey::new_unique();
-        let output = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let token = Pubkey::new_unique();
+        let input = wsol;
+        let output = token;
 
         provider.update_quote(pool, input, output, 1_000_000, 980_000);
 
-        let result = provider.get_quote(&pool, DexType::RaydiumAmmV4, &input, &output, 10_000_000);
-        assert!(result.is_some());
+        let trade_only =
+            provider.get_quote(&pool, DexType::RaydiumAmmV4, &input, &output, 10_000_000);
+        assert!(
+            trade_only.is_none(),
+            "trade cache alone must not satisfy get_quote"
+        );
 
-        let out = result.unwrap();
-        assert!(out > 9_700_000 && out < 9_900_000, "Got {out}");
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint: token,
+                quote_mint: wsol,
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 9,
+                quote_decimals: 9,
+                coin_reserve: Some(10_000_000_000_000),
+                pc_reserve: Some(1_000_000_000_000),
+                market_id: Pubkey::new_unique(),
+                serum_bids: None,
+                serum_asks: None,
+                serum_event_queue: None,
+                serum_base_vault: None,
+                serum_quote_vault: None,
+            }),
+            1,
+        );
+
+        let result = provider.get_quote(&pool, DexType::RaydiumAmmV4, &input, &output, 10_000_000);
+        let out = result.expect("LivePoolCache must provide ExecutableMarginal quote");
+        assert!(out > 0);
+        assert_ne!(
+            out,
+            (980_000u128 * 10_000_000 / 1_000_000) as u64,
+            "must not scale stale trade-cache probe"
+        );
     }
 
     #[test]
@@ -1626,13 +1575,34 @@ mod tests {
 
     #[test]
     fn count_fresh_quote_ready_pools_excludes_stale_index_entries() {
-        let provider = CachedQuoteProvider::new(Duration::from_secs(30), create_shared_cache());
+        let cache = create_shared_cache();
+        let provider = CachedQuoteProvider::new(Duration::from_secs(30), cache.clone());
         let fresh_pool = Pubkey::new_unique();
         let stale_pool = Pubkey::new_unique();
-        let input = Pubkey::new_unique();
-        let output = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let token = Pubkey::new_unique();
 
-        provider.update_quote(fresh_pool, input, output, 1_000_000, 980_000);
+        cache.upsert(
+            fresh_pool,
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint: token,
+                quote_mint: wsol,
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 9,
+                quote_decimals: 9,
+                coin_reserve: Some(10_000_000_000_000),
+                pc_reserve: Some(1_000_000_000_000),
+                market_id: Pubkey::new_unique(),
+                serum_bids: None,
+                serum_asks: None,
+                serum_event_queue: None,
+                serum_base_vault: None,
+                serum_quote_vault: None,
+            }),
+            1,
+        );
+        provider.mark_ready_from_live_pool_cache(&fresh_pool);
         provider.quote_ready_index().mark_ready(stale_pool);
 
         assert_eq!(provider.quote_ready_index().len(), 2);
@@ -1703,12 +1673,33 @@ mod tests {
 
     #[test]
     fn pool_quote_ready_check_is_constant_per_pool() {
-        let provider = CachedQuoteProvider::new(Duration::from_secs(30), create_shared_cache());
+        let cache = create_shared_cache();
+        let provider = CachedQuoteProvider::new(Duration::from_secs(30), cache.clone());
         let pool = Pubkey::new_unique();
-        let mint_a = Pubkey::new_unique();
-        let mint_b = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let token = Pubkey::new_unique();
 
-        provider.update_quote(pool, mint_a, mint_b, 1_000_000, 990_000);
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint: token,
+                quote_mint: wsol,
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 9,
+                quote_decimals: 9,
+                coin_reserve: Some(10_000_000_000_000),
+                pc_reserve: Some(1_000_000_000_000),
+                market_id: Pubkey::new_unique(),
+                serum_bids: None,
+                serum_asks: None,
+                serum_event_queue: None,
+                serum_base_vault: None,
+                serum_quote_vault: None,
+            }),
+            1,
+        );
+        provider.mark_ready_from_live_pool_cache(&pool);
 
         for i in 0..5_000 {
             let noise_pool = Pubkey::new_unique();
@@ -1732,6 +1723,10 @@ mod tests {
         let input = Pubkey::new_unique();
         let output = Pubkey::new_unique();
         provider.update_quote(pool, input, output, 1_000_000, 990_000);
+        assert!(
+            !provider.is_pool_quote_ready(&pool),
+            "trade cache alone must not mark pool quote-ready"
+        );
         std::thread::sleep(Duration::from_millis(5));
         provider.cleanup();
         assert!(!provider.is_pool_quote_ready(&pool));

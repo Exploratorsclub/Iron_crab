@@ -5452,7 +5452,7 @@ pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_LE_300S: Lazy<AtomicU6
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_GT_300S: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
-pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_QUOTE_NONE: Lazy<AtomicU64> =
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NO_EXECUTABLE_MARGINAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_STATE_STALE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -5501,7 +5501,7 @@ pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_CPMM_MATH_NONE: Lazy<AtomicU64>
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_UNSUPPORTED_DEX: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
-pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_TRADE_FALLBACK_NONE: Lazy<AtomicU64> =
+pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_NO_EXECUTABLE_MARGINAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_MINT_DIRECTION_INVALID: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -6152,7 +6152,9 @@ pub fn arb_vault_live_snapshot_cache_age_pin_bucket_inc(op: &str, bucket: &str, 
 /// C1h2: `arb_two_hop_v2_no_fresh_buy_quote_detail_total{reason}`.
 pub fn arb_two_hop_v2_no_fresh_buy_quote_detail_inc(reason: &str) {
     let counter = match reason {
-        "quote_none" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_QUOTE_NONE,
+        "no_executable_marginal" => {
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NO_EXECUTABLE_MARGINAL
+        }
         "state_stale" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_STATE_STALE,
         "trade_stale" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_TRADE_STALE,
         "not_fresh_after_quote" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NOT_FRESH_AFTER,
@@ -6278,7 +6280,7 @@ pub enum ArbTwoHopV2SellQuoteNoneDetail {
     DlmmMarginalReject,
     CpmmMathNone,
     UnsupportedDex,
-    TradeFallbackNone,
+    NoExecutableMarginal,
     MintDirectionInvalid,
 }
 
@@ -6306,8 +6308,8 @@ pub fn arb_two_hop_v2_sell_quote_none_detail_inc(reason: ArbTwoHopV2SellQuoteNon
         ArbTwoHopV2SellQuoteNoneDetail::UnsupportedDex => {
             &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_UNSUPPORTED_DEX
         }
-        ArbTwoHopV2SellQuoteNoneDetail::TradeFallbackNone => {
-            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_TRADE_FALLBACK_NONE
+        ArbTwoHopV2SellQuoteNoneDetail::NoExecutableMarginal => {
+            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_NO_EXECUTABLE_MARGINAL
         }
         ArbTwoHopV2SellQuoteNoneDetail::MintDirectionInvalid => {
             &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_MINT_DIRECTION_INVALID
@@ -7461,8 +7463,8 @@ fn append_arb_c1h2_freshness_forensics_total(out: &mut String) {
     }
     for (reason, counter) in [
         (
-            "quote_none",
-            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_QUOTE_NONE,
+            "no_executable_marginal",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NO_EXECUTABLE_MARGINAL,
         ),
         (
             "state_stale",
@@ -7537,9 +7539,9 @@ fn append_arb_two_hop_v2_sell_quote_none_detail_total(out: &mut String) {
             .to_string(),
     );
     out.push('\n');
-    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"trade_fallback_none\"} ");
+    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"no_executable_marginal\"} ");
     out.push_str(
-        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_TRADE_FALLBACK_NONE
+        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_NO_EXECUTABLE_MARGINAL
             .load(Ordering::Relaxed)
             .to_string(),
     );
@@ -13228,7 +13230,7 @@ mod arb_two_hop_v2_sell_quote_none_detail_metrics_tests {
             "dlmm_marginal_reject",
             "cpmm_math_none",
             "unsupported_dex",
-            "trade_fallback_none",
+            "no_executable_marginal",
             "mint_direction_invalid",
         ] {
             assert!(
