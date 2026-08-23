@@ -610,28 +610,26 @@ fn md_tx_bounded_sidefx_try_enqueue_classed(
     inc_pipeline_dropped: fn(),
 ) {
     let depth = queue_depth.load(Ordering::Relaxed);
-    if depth >= queue_capacity {
-        if class.is_exec_hot() {
-            inc_pipeline_dropped();
-            inc_market_data_tx_sidefx_enqueue_dropped_total();
-            inc_market_data_md_sidefx_enqueue_dropped_total();
-        } else {
-            inc_market_data_md_sidefx_enrich_enqueue_dropped_total();
-        }
-        return;
-    }
     if !class.is_exec_hot() && depth + MARKET_DATA_MD_SIDEFX_ENRICH_HEADROOM >= queue_capacity {
         inc_market_data_md_sidefx_enrich_enqueue_dropped_total();
         return;
     }
-    if tx.try_send(job).is_ok() {
-        md_sidefx_inc_queue_depth(queue_depth, pipeline);
-    } else if class.is_exec_hot() {
-        inc_pipeline_dropped();
-        inc_market_data_tx_sidefx_enqueue_dropped_total();
-        inc_market_data_md_sidefx_enqueue_dropped_total();
-    } else {
-        inc_market_data_md_sidefx_enrich_enqueue_dropped_total();
+    // Channel try_send is authoritative — depth atomic can briefly lag recv/inc ordering.
+    match tx.try_send(job) {
+        Ok(()) => md_sidefx_inc_queue_depth(queue_depth, pipeline),
+        Err(std_mpsc::TrySendError::Full(_)) => {
+            if class.is_exec_hot() {
+                inc_pipeline_dropped();
+                inc_market_data_tx_sidefx_enqueue_dropped_total();
+                inc_market_data_md_sidefx_enqueue_dropped_total();
+            } else {
+                inc_market_data_md_sidefx_enrich_enqueue_dropped_total();
+            }
+        }
+        Err(std_mpsc::TrySendError::Disconnected(job)) => {
+            tx.send(job).expect("md-sidefx worker disconnected");
+            md_sidefx_inc_queue_depth(queue_depth, pipeline);
+        }
     }
 }
 
@@ -827,8 +825,11 @@ mod tests {
     use super::*;
     use crate::metrics::{
         MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL,
+        MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL,
         MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL,
+        MARKET_DATA_TX_DISCOVERY_SIDEFX_JOBS_PROCESSED_TOTAL,
         MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL,
+        MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL,
         MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL,
     };
     use std::sync::atomic::Ordering;
@@ -1306,6 +1307,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn tx_discovery_flood_drops_discovery_without_dropping_account_or_pin_seed() {
         let host = Arc::new(TestBlockingHost) as Arc<dyn SidefxWorkerHost>;
         let workers = spawn_md_sidefx_workers(host, 8, 8, 4);
@@ -1314,8 +1316,12 @@ mod tests {
             MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
         let pin_seed_dropped_before =
             MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let pin_seed_processed_before =
+            MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
         let account_dropped_before =
             MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let account_processed_before =
+            MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
 
         for _ in 0..16 {
             md_tx_discovery_sidefx_try_enqueue(&workers.tx_discovery, mk_tx_discovery_job());
@@ -1330,8 +1336,12 @@ mod tests {
             MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
         let pin_seed_dropped_after =
             MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let pin_seed_processed_after =
+            MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
         let account_dropped_after =
             MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
+        let account_processed_after =
+            MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
 
         assert!(
             discovery_dropped_after > discovery_dropped_before,
@@ -1350,41 +1360,52 @@ mod tests {
             "account pipeline must never increment drop counter"
         );
         assert!(
-            workers.tx_pin_seed.queue_depth.load(Ordering::Relaxed) > 0,
-            "pin-seed job should be accepted despite discovery flood"
+            workers.tx_pin_seed.queue_depth.load(Ordering::Relaxed) > 0
+                || pin_seed_processed_after > pin_seed_processed_before,
+            "pin-seed job should be accepted despite discovery flood (queued or already processed)"
         );
         assert!(
             workers.account.queue_depth.load(Ordering::Relaxed) > 0
-                || MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
-                    == account_dropped_before,
-            "account job should be accepted despite discovery flood"
+                || account_processed_after > account_processed_before,
+            "account job should be accepted despite discovery flood (queued or already processed)"
         );
     }
 
     #[test]
+    #[serial_test::serial]
     fn tx_route_enqueue_hot_pin_seed_non_hot_discovery() {
         let hot_pool = Pubkey::new_unique();
         let cold_pool = Pubkey::new_unique();
         let host = Arc::new(HotPoolTestHost { hot: hot_pool }) as Arc<dyn SidefxWorkerHost>;
         let workers = spawn_md_sidefx_workers(host, 32, 32, 32);
         let senders = workers.tx_senders();
+        let pin_seed_processed_before =
+            MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
+        let discovery_processed_before =
+            MARKET_DATA_TX_DISCOVERY_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
 
         md_tx_sidefx_route_enqueue(&senders, mk_pin_seed_job(hot_pool), true);
         md_tx_sidefx_route_enqueue(&senders, mk_pin_seed_job(cold_pool), false);
 
-        assert_eq!(
-            workers.tx_pin_seed.queue_depth.load(Ordering::Relaxed),
-            1,
-            "hot pin-seed candidate must land in pin-seed queue"
+        let pin_seed_processed_after =
+            MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
+        let discovery_processed_after =
+            MARKET_DATA_TX_DISCOVERY_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
+
+        assert!(
+            workers.tx_pin_seed.queue_depth.load(Ordering::Relaxed) == 1
+                || pin_seed_processed_after > pin_seed_processed_before,
+            "hot pin-seed candidate must land in pin-seed queue (or be processed immediately)"
         );
-        assert_eq!(
-            workers.tx_discovery.queue_depth.load(Ordering::Relaxed),
-            1,
-            "non-hot pin-seed candidate must land in discovery queue"
+        assert!(
+            workers.tx_discovery.queue_depth.load(Ordering::Relaxed) == 1
+                || discovery_processed_after > discovery_processed_before,
+            "non-hot pin-seed candidate must land in discovery queue (or be processed immediately)"
         );
     }
 
     #[test]
+    #[serial_test::serial]
     fn tx_flood_drops_tx_jobs_without_dropping_account_jobs() {
         let host = Arc::new(TestBlockingHost) as Arc<dyn SidefxWorkerHost>;
         let workers = spawn_md_sidefx_workers(host, 8, 8, 4);

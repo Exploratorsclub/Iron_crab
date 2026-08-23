@@ -77,6 +77,35 @@ pub struct OrcaWhirlpoolState {
     /// Detected once when pool is discovered, never changes for a mint
     pub token_a_program: Option<Pubkey>,
     pub token_b_program: Option<Pubkey>,
+    /// Account/Geyser pool parse populated whirlpool quote numerics — never true for TX layout-only seed.
+    pub whirlpool_quote_account_seeded: bool,
+}
+
+/// TX layout-only Orca Whirlpool row: vault/mint pubkeys only; quote numerics are unset (not SSOT).
+#[must_use]
+pub fn orca_whirlpool_tx_layout_seed(
+    token_mint_a: Pubkey,
+    token_mint_b: Pubkey,
+    token_vault_a: Pubkey,
+    token_vault_b: Pubkey,
+) -> OrcaWhirlpoolState {
+    OrcaWhirlpoolState {
+        token_mint_a,
+        token_mint_b,
+        token_vault_a,
+        token_vault_b,
+        tick_current_index: 0,
+        sqrt_price: 0,
+        liquidity: 0,
+        fee_rate: 0,
+        protocol_fee_rate: 0,
+        tick_spacing: 0,
+        vault_a_balance: None,
+        vault_b_balance: None,
+        token_a_program: None,
+        token_b_program: None,
+        whirlpool_quote_account_seeded: false,
+    }
 }
 
 impl From<WhirlpoolParsed> for OrcaWhirlpoolState {
@@ -97,6 +126,7 @@ impl From<WhirlpoolParsed> for OrcaWhirlpoolState {
             // Token programs will be set separately when discovered
             token_a_program: None,
             token_b_program: None,
+            whirlpool_quote_account_seeded: true,
         }
     }
 }
@@ -113,6 +143,7 @@ impl From<WhirlpoolParsed> for OrcaWhirlpoolState {
 pub fn orca_readiness_for_pool_cache_update(s: &OrcaWhirlpoolState) -> DexPoolReadiness {
     let static_ok = s.token_vault_a != Pubkey::default()
         && s.token_vault_b != Pubkey::default()
+        && s.whirlpool_quote_account_seeded
         && s.tick_spacing > 0
         && s.sqrt_price > 0;
     let va = s.vault_a_balance.unwrap_or(0);
@@ -216,6 +247,29 @@ pub struct MeteoraState {
     /// Vault reserves
     pub reserve_x_balance: Option<u64>,
     pub reserve_y_balance: Option<u64>,
+    /// Account/Geyser pool parse populated DLMM bin parameters — never true for TX layout-only seed.
+    pub dlmm_bin_params_account_seeded: bool,
+}
+
+/// TX layout-only Meteora DLMM row: reserve vault pubkeys/mints only; bin params unset (not SSOT).
+#[must_use]
+pub fn meteora_dlmm_tx_layout_seed(
+    token_x_mint: Pubkey,
+    token_y_mint: Pubkey,
+    reserve_x: Pubkey,
+    reserve_y: Pubkey,
+) -> MeteoraState {
+    MeteoraState {
+        token_x_mint,
+        token_y_mint,
+        reserve_x,
+        reserve_y,
+        active_id: 0,
+        bin_step: 0,
+        reserve_x_balance: None,
+        reserve_y_balance: None,
+        dlmm_bin_params_account_seeded: false,
+    }
 }
 
 impl From<DlmmPool> for MeteoraState {
@@ -229,6 +283,7 @@ impl From<DlmmPool> for MeteoraState {
             bin_step: p.bin_step,
             reserve_x_balance: None,
             reserve_y_balance: None,
+            dlmm_bin_params_account_seeded: true,
         }
     }
 }
@@ -3046,6 +3101,7 @@ mod tests {
                 vault_b_balance: Some(2_000_000_000),
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             }),
             100,
         );
@@ -3086,6 +3142,7 @@ mod tests {
                 bin_step: 20,
                 reserve_x_balance: Some(5_000_000_000),
                 reserve_y_balance: Some(10_000_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             100,
         );
@@ -3189,6 +3246,7 @@ mod tests {
             vault_b_balance: Some(2_000_000),
             token_a_program: None,
             token_b_program: None,
+            whirlpool_quote_account_seeded: true,
         });
 
         cache.upsert(pool, state, 100);
@@ -4106,6 +4164,7 @@ mod tests {
             vault_b_balance,
             token_a_program: None,
             token_b_program: None,
+            whirlpool_quote_account_seeded: true,
         }
     }
 
@@ -4710,6 +4769,7 @@ mod tests {
             bin_step,
             reserve_x_balance,
             reserve_y_balance,
+            dlmm_bin_params_account_seeded: true,
         }
     }
 

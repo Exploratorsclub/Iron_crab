@@ -1848,6 +1848,7 @@ mod tests {
                 bin_step: 10,
                 reserve_x_balance: Some(50_000_000_000),
                 reserve_y_balance: Some(1_000_000_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             100,
         );
@@ -2426,6 +2427,7 @@ mod tests {
                 bin_step: 10,
                 reserve_x_balance: Some(50_000_000_000),
                 reserve_y_balance: Some(1_000_000_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             100,
         );
@@ -2659,6 +2661,7 @@ mod tests {
                 vault_b_balance: Some(50_000_000_000),
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             }),
             100,
         );
@@ -2673,6 +2676,7 @@ mod tests {
                 bin_step: 10,
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(50_000_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             100,
         );
@@ -2940,6 +2944,7 @@ mod tests {
             vault_b_balance: Some(50_000_000_000),
             token_a_program: None,
             token_b_program: None,
+            whirlpool_quote_account_seeded: true,
         }
     }
 
@@ -3055,6 +3060,7 @@ mod tests {
                 bin_step: 10,
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(50_000_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             100,
         );
@@ -3223,6 +3229,7 @@ mod tests {
                 bin_step: 10,
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(50_000_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             100,
         );

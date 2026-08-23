@@ -170,14 +170,16 @@ pub fn meteora_dlmm_metadata_for_pool_cache_update(
         POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY.to_string(),
         meteora_dlmm_onchain_mints_for_pool_cache_update(s),
     );
-    meta.insert(
-        POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY.to_string(),
-        s.active_id.to_string(),
-    );
-    meta.insert(
-        POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY.to_string(),
-        s.bin_step.to_string(),
-    );
+    if s.dlmm_bin_params_account_seeded {
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY.to_string(),
+            s.active_id.to_string(),
+        );
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY.to_string(),
+            s.bin_step.to_string(),
+        );
+    }
     if let Some(has) = has_bitmap_extension {
         meta.insert(
             POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY.to_string(),
@@ -690,6 +692,7 @@ mod tests {
                 bin_step: 10,
                 reserve_x_balance: Some(1),
                 reserve_y_balance: Some(2),
+                dlmm_bin_params_account_seeded: true,
             })
         };
         let prev = mk(Pubkey::new_unique());
