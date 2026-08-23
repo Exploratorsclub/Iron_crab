@@ -320,6 +320,58 @@ pub struct PumpAmmState {
     pub creator: Option<Pubkey>,
 }
 
+/// TX layout-only PumpAmm row: vault/mint pubkeys only; reserves and `pool_accounts` unset (not SSOT).
+#[must_use]
+pub fn pump_amm_tx_layout_seed(
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    pool_base_token_account: Pubkey,
+    pool_quote_token_account: Pubkey,
+) -> CachedPoolState {
+    CachedPoolState::PumpAmm(PumpAmmState {
+        base_mint,
+        quote_mint,
+        pool_base_token_account,
+        pool_quote_token_account,
+        base_reserve: None,
+        quote_reserve: None,
+        pool_accounts: Vec::new(),
+        creator: None,
+    })
+}
+
+/// Schicht C complete for PumpSwap: full 14-account swap metas with pool at index 0.
+#[must_use]
+pub fn pump_amm_layer_c_complete(pool: &Pubkey, accounts: &[Pubkey]) -> bool {
+    accounts.len() >= 14 && accounts.first() == Some(pool)
+}
+
+/// Schicht C complete for a cached pool row (Arb `dex_pool_accounts_from_cached_state` contract).
+#[must_use]
+pub fn cached_state_layer_c_complete(pool: &Pubkey, state: &CachedPoolState) -> bool {
+    match state {
+        CachedPoolState::PumpAmm(s) => pump_amm_layer_c_complete(pool, &s.pool_accounts),
+        CachedPoolState::Orca(s) => {
+            s.token_vault_a != Pubkey::default() && s.token_vault_b != Pubkey::default()
+        }
+        CachedPoolState::Meteora(s) => {
+            s.reserve_x != Pubkey::default() && s.reserve_y != Pubkey::default()
+        }
+        CachedPoolState::RaydiumCpmm(s) => {
+            s.token_0_vault != Pubkey::default() && s.token_1_vault != Pubkey::default()
+        }
+        _ => false,
+    }
+}
+
+/// Outcome of [`LivePoolCache::set_pump_amm_pool_accounts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetPumpAmmPoolAccountsResult {
+    Written,
+    MissIncompleteAccounts,
+    MissNoCacheEntry,
+}
+
 /// Meteora CPMM (DAMM V2) cached state
 #[derive(Debug, Clone)]
 pub struct MeteoraCpmmState {
@@ -1172,9 +1224,36 @@ impl LivePoolCache {
     ///
     /// Without this, PumpAmm entries parsed from Geyser have empty pool_accounts,
     /// making them unusable for tx building.
-    pub fn set_pump_amm_pool_accounts(&self, pool: &Pubkey, mut accounts: Vec<Pubkey>) {
-        if accounts.len() >= 14 {
-            pump_amm_normalize_v14_pool_accounts(pool, &mut accounts);
+    ///
+    /// When the pool row is missing, inserts a layout-only PumpAmm entry (no reserve overwrite)
+    /// from accounts indices 2–5 before writing Schicht C.
+    pub fn set_pump_amm_pool_accounts(
+        &self,
+        pool: &Pubkey,
+        accounts: Vec<Pubkey>,
+    ) -> SetPumpAmmPoolAccountsResult {
+        self.set_pump_amm_pool_accounts_at_slot(pool, accounts, 0)
+    }
+
+    /// Same as [`Self::set_pump_amm_pool_accounts`] with an explicit Geyser slot for layout seed.
+    pub fn set_pump_amm_pool_accounts_at_slot(
+        &self,
+        pool: &Pubkey,
+        mut accounts: Vec<Pubkey>,
+        slot: u64,
+    ) -> SetPumpAmmPoolAccountsResult {
+        if !pump_amm_layer_c_complete(pool, &accounts) {
+            return SetPumpAmmPoolAccountsResult::MissIncompleteAccounts;
+        }
+        pump_amm_normalize_v14_pool_accounts(pool, &mut accounts);
+        if !self.pools.contains_key(pool)
+            && !self.ensure_pump_amm_tx_layout_from_accounts(pool, &accounts, slot)
+        {
+            tracing::warn!(
+                pool = %pool,
+                "LivePoolCache: set_pump_amm_pool_accounts layout ensure failed"
+            );
+            return SetPumpAmmPoolAccountsResult::MissNoCacheEntry;
         }
         if let Some(mut entry) = self.pools.get_mut(pool) {
             if let CachedPoolState::PumpAmm(ref mut s) = entry.value_mut().state {
@@ -1193,13 +1272,44 @@ impl LivePoolCache {
                         "LivePoolCache: PumpAmm pool_accounts updated"
                     );
                 }
+                return SetPumpAmmPoolAccountsResult::Written;
             }
-        } else {
-            tracing::debug!(
-                pool = %pool,
-                "LivePoolCache: set_pump_amm_pool_accounts called but pool not in cache"
-            );
         }
+        tracing::warn!(
+            pool = %pool,
+            "LivePoolCache: set_pump_amm_pool_accounts called but pool not in cache"
+        );
+        SetPumpAmmPoolAccountsResult::MissNoCacheEntry
+    }
+
+    /// Layout-only PumpAmm upsert from TX `pool_accounts` when the cache row is missing.
+    fn ensure_pump_amm_tx_layout_from_accounts(
+        &self,
+        pool: &Pubkey,
+        accounts: &[Pubkey],
+        slot: u64,
+    ) -> bool {
+        if self.pools.contains_key(pool) {
+            return true;
+        }
+        let Some(base_mint) = accounts.get(2).copied().filter(|p| *p != Pubkey::default()) else {
+            return false;
+        };
+        let Some(quote_mint) = accounts.get(3).copied().filter(|p| *p != Pubkey::default()) else {
+            return false;
+        };
+        let Some(base_vault) = accounts.get(4).copied().filter(|p| *p != Pubkey::default()) else {
+            return false;
+        };
+        let Some(quote_vault) = accounts.get(5).copied().filter(|p| *p != Pubkey::default()) else {
+            return false;
+        };
+        self.upsert(
+            *pool,
+            pump_amm_tx_layout_seed(base_mint, quote_mint, base_vault, quote_vault),
+            slot,
+        );
+        true
     }
 
     /// JetStream / Geyser: merge PumpSwap extended `sell` layout keys into side maps (not `PumpAmmState`).
@@ -3834,7 +3944,10 @@ mod tests {
         let pool_market = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
         let quote_mint = Pubkey::new_unique();
-        let accounts_to_set: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let mut accounts_to_set: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        accounts_to_set[0] = pool_market;
+        accounts_to_set[2] = base_mint;
+        accounts_to_set[3] = quote_mint;
 
         cache.upsert(
             pool_market,
@@ -3842,7 +3955,8 @@ mod tests {
             100,
         );
 
-        cache.set_pump_amm_pool_accounts(&pool_market, accounts_to_set.clone());
+        let result = cache.set_pump_amm_pool_accounts(&pool_market, accounts_to_set.clone());
+        assert_eq!(result, SetPumpAmmPoolAccountsResult::Written);
 
         let canonical_gc = crate::solana::dex::pumpfun_amm::pump_amm_canonical_global_config();
         let canonical_ea =
@@ -3873,7 +3987,10 @@ mod tests {
         let creator = Pubkey::new_unique();
         let base_reserve = 1_000_000_000u64;
         let quote_reserve = 50_000_000_000u64;
-        let new_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let mut new_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        new_accounts[0] = pool_market;
+        new_accounts[2] = base_mint;
+        new_accounts[3] = quote_mint;
 
         cache.upsert(
             pool_market,
@@ -3890,7 +4007,8 @@ mod tests {
             100,
         );
 
-        cache.set_pump_amm_pool_accounts(&pool_market, new_accounts.clone());
+        let result = cache.set_pump_amm_pool_accounts(&pool_market, new_accounts.clone());
+        assert_eq!(result, SetPumpAmmPoolAccountsResult::Written);
 
         let canonical_gc = crate::solana::dex::pumpfun_amm::pump_amm_canonical_global_config();
         let canonical_ea =
@@ -3917,6 +4035,39 @@ mod tests {
         } else {
             panic!("expected PumpAmm state");
         }
+    }
+
+    /// Hot pin-seed: layout-only ensure + Schicht C when pool row was missing from cache.
+    #[test]
+    fn test_set_pump_amm_pool_accounts_ensures_layout_when_pool_missing() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let mut accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        accounts[0] = pool_market;
+        accounts[2] = base_mint;
+        accounts[3] = quote_mint;
+        accounts[4] = base_vault;
+        accounts[5] = quote_vault;
+
+        assert!(cache.get(&pool_market).is_none());
+
+        let result = cache.set_pump_amm_pool_accounts_at_slot(&pool_market, accounts.clone(), 42);
+        assert_eq!(result, SetPumpAmmPoolAccountsResult::Written);
+
+        let Some(CachedPoolState::PumpAmm(s)) = cache.get(&pool_market) else {
+            panic!("expected PumpAmm cache row after layout ensure");
+        };
+        assert_eq!(s.base_mint, base_mint);
+        assert_eq!(s.quote_mint, quote_mint);
+        assert_eq!(s.pool_base_token_account, base_vault);
+        assert_eq!(s.pool_quote_token_account, quote_vault);
+        assert!(s.base_reserve.is_none());
+        assert!(s.quote_reserve.is_none());
+        assert!(pump_amm_layer_c_complete(&pool_market, &s.pool_accounts));
     }
 
     #[test]

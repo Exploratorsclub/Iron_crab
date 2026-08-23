@@ -325,6 +325,24 @@ static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_UNPARSEABLE: Lazy<AtomicU64> 
     Lazy::new(|| AtomicU64::new(0));
 /// TX layout-only hot-apply preserved existing account quote fields (merge skip-overwrite).
 static MARKET_DATA_TX_LAYOUT_SEED_PRESERVE_QUOTE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// TX pin-seed Schicht C writes to LivePoolCache (`dex=pump_amm|orca|meteora_dlmm|...`).
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_PUMP_AMM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_ORCA: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_METEORA_DLMM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_RAYDIUM_CPMM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_OTHER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// TX pin-seed Schicht C write misses (`reason=no_cache_entry|incomplete|verify_miss`).
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_NO_CACHE_ENTRY: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_INCOMPLETE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_VERIFY: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Account worker dispatch: tracked vault pubkey classified HIGH.
 pub static MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -763,6 +781,31 @@ pub fn inc_market_data_trade_path_vault_register_total(pin: TradePathVaultRegist
 #[inline]
 pub fn inc_market_data_tx_layout_seed_preserve_quote_total() {
     MARKET_DATA_TX_LAYOUT_SEED_PRESERVE_QUOTE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `market_data_tx_pin_seed_pool_accounts_written_total{dex}`.
+#[inline]
+pub fn inc_market_data_tx_pin_seed_pool_accounts_written_total(dex: &str) {
+    let counter = match dex {
+        "pump_amm" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_PUMP_AMM,
+        "orca" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_ORCA,
+        "meteora_dlmm" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_METEORA_DLMM,
+        "raydium_cpmm" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_RAYDIUM_CPMM,
+        _ => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_OTHER,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `market_data_tx_pin_seed_pool_accounts_write_miss_total{reason}`.
+#[inline]
+pub fn inc_market_data_tx_pin_seed_pool_accounts_write_miss_total(reason: &str) {
+    let counter = match reason {
+        "no_cache_entry" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_NO_CACHE_ENTRY,
+        "incomplete" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_INCOMPLETE,
+        "verify_miss" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_VERIFY,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9397,6 +9440,64 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("market_data_tx_layout_seed_preserve_quote_total ");
     out.push_str(
         &MARKET_DATA_TX_LAYOUT_SEED_PRESERVE_QUOTE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_written_total{dex=\"pump_amm\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_PUMP_AMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_written_total{dex=\"orca\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_ORCA
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_written_total{dex=\"meteora_dlmm\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_METEORA_DLMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_written_total{dex=\"raydium_cpmm\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_RAYDIUM_CPMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_written_total{dex=\"other\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_OTHER
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "market_data_tx_pin_seed_pool_accounts_write_miss_total{reason=\"no_cache_entry\"} ",
+    );
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_NO_CACHE_ENTRY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_write_miss_total{reason=\"incomplete\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_INCOMPLETE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_write_miss_total{reason=\"verify_miss\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_VERIFY
             .load(Ordering::Relaxed)
             .to_string(),
     );
