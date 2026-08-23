@@ -3821,11 +3821,22 @@ pub fn record_momentum_exit_quote_legacy_stale_age_diag_total() {
 static MOMENTUM_EXIT_QUOTE_GUARD_REJECT_TOTAL: Lazy<RwLock<HashMap<&'static str, u64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
+static MOMENTUM_EXIT_SUPPRESSED_NO_QUOTE_TOTAL: Lazy<RwLock<HashMap<&'static str, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
 /// Labeled: `momentum_exit_quote_guard_reject_total{reason=...}`.
 #[inline]
 pub fn record_momentum_exit_quote_guard_reject_total(reason: &'static str) {
     let mut map = MOMENTUM_EXIT_QUOTE_GUARD_REJECT_TOTAL.write();
     *map.entry(reason).or_insert(0) += 1;
+}
+
+/// Labeled: `momentum_exit_suppressed_no_quote_total{exit_type=...}` — price/structural exit
+/// threshold met but no usable executable account quote (wait, no trade-mark fallback).
+#[inline]
+pub fn record_momentum_exit_suppressed_no_quote_total(exit_type: &'static str) {
+    let mut map = MOMENTUM_EXIT_SUPPRESSED_NO_QUOTE_TOTAL.write();
+    *map.entry(exit_type).or_insert(0) += 1;
 }
 
 static MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_UNSATISFIED_WARN_TOTAL: Lazy<AtomicU64> =
@@ -10348,6 +10359,13 @@ async fn metrics_response() -> Response<Body> {
     for (reason, count) in MOMENTUM_EXIT_QUOTE_GUARD_REJECT_TOTAL.read().iter() {
         out.push_str("momentum_exit_quote_guard_reject_total{reason=\"");
         out.push_str(reason);
+        out.push_str("\"} ");
+        out.push_str(&count.to_string());
+        out.push('\n');
+    }
+    for (exit_type, count) in MOMENTUM_EXIT_SUPPRESSED_NO_QUOTE_TOTAL.read().iter() {
+        out.push_str("momentum_exit_suppressed_no_quote_total{exit_type=\"");
+        out.push_str(exit_type);
         out.push_str("\"} ");
         out.push_str(&count.to_string());
         out.push('\n');
