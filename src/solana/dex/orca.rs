@@ -1248,7 +1248,8 @@ impl Dex for Orca {
             AM {
                 pubkey: oracle,
                 is_signer: false,
-                is_writable: false,
+                // Adaptive-fee Whirlpools update oracle state during swaps.
+                is_writable: true,
             },
         ];
 
@@ -1493,7 +1494,8 @@ impl Dex for Orca {
             AM {
                 pubkey: oracle,
                 is_signer: false,
-                is_writable: false,
+                // Adaptive-fee Whirlpools update oracle state during swaps.
+                is_writable: true,
             },
         ];
 
@@ -1970,6 +1972,16 @@ mod tests {
         assert!(
             ixs[0].accounts.iter().any(|a| a.pubkey == pool_pk),
             "swap ix must reference hinted whirlpool"
+        );
+        let oracle = super::derive_oracle_pda(&pool_pk);
+        let oracle_meta = ixs[0]
+            .accounts
+            .iter()
+            .find(|meta| meta.pubkey == oracle)
+            .expect("swap ix must contain oracle PDA");
+        assert!(
+            oracle_meta.is_writable,
+            "adaptive-fee Whirlpool swaps require a writable oracle"
         );
     }
 

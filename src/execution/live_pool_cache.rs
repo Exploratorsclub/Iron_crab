@@ -2606,8 +2606,8 @@ fn parse_raydium_amm(data: &[u8]) -> Option<CachedPoolState> {
     let base_mint = Pubkey::new_from_array(data[400..432].try_into().ok()?);
     let quote_mint = Pubkey::new_from_array(data[432..464].try_into().ok()?);
 
-    // Offset 464: market_id (Serum/OpenBook)
-    let market_id = Pubkey::new_from_array(data[464..496].try_into().ok()?);
+    // Raydium AMM v4: offset 464 is LP mint; Serum/OpenBook market_id starts at 528.
+    let market_id = Pubkey::new_from_array(data[528..560].try_into().ok()?);
 
     Some(CachedPoolState::RaydiumAmm(RaydiumAmmState {
         base_mint,
@@ -5132,5 +5132,37 @@ mod tests {
         // Sleep briefly and check again
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(entry.age_ms() >= 10);
+    }
+}
+#[cfg(test)]
+mod raydium_parser_tests {
+    use super::*;
+
+    #[test]
+    fn parse_raydium_amm_reads_market_id_not_lp_mint() {
+        let mut data = vec![0u8; 752];
+        data[0..8].copy_from_slice(&1u64.to_le_bytes());
+        data[32..40].copy_from_slice(&9u64.to_le_bytes());
+        data[40..48].copy_from_slice(&6u64.to_le_bytes());
+
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let lp_mint = Pubkey::new_unique();
+        let market_id = Pubkey::new_unique();
+        data[336..368].copy_from_slice(coin_vault.as_ref());
+        data[368..400].copy_from_slice(pc_vault.as_ref());
+        data[400..432].copy_from_slice(base_mint.as_ref());
+        data[432..464].copy_from_slice(quote_mint.as_ref());
+        data[464..496].copy_from_slice(lp_mint.as_ref());
+        data[528..560].copy_from_slice(market_id.as_ref());
+
+        let parsed = parse_raydium_amm(&data).expect("valid Raydium AMM v4 state");
+        let CachedPoolState::RaydiumAmm(state) = parsed else {
+            panic!("expected Raydium AMM state");
+        };
+        assert_eq!(state.market_id, market_id);
+        assert_ne!(state.market_id, lp_mint);
     }
 }
