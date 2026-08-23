@@ -8898,8 +8898,10 @@ async fn main() -> Result<()> {
     };
 
     // Initialize WalletTracker (P1: Smart Money / Insider Detection)
-    // TODO: Load config from file for production
-    let wallet_tracker_cfg = WalletTrackerCfg::default();
+    let wallet_tracker_cfg: WalletTrackerCfg = file_config
+        .as_ref()
+        .and_then(|c| c.wallet_tracker.clone())
+        .unwrap_or_default();
     let wallet_tracker = WalletTracker::new(wallet_tracker_cfg);
     info!(
         smart_money = wallet_tracker.stats().smart_money_count,

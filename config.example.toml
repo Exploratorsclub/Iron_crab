@@ -71,6 +71,8 @@ max_events_per_sec = 10000
 
 # Storage
 log_dir = "trade_logs/market_events"
+# Closed JSONL files older than this are deleted by the jsonl-writer thread (default: 24h).
+# jsonl_retention_hours = 24
 
 # Metrics
 metrics_port = 9801

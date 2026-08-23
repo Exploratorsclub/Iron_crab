@@ -755,7 +755,7 @@ impl Default for AccountJanitorCfg {
 }
 
 /// Wallet Tracker Configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletTrackerCfg {
     /// Enable wallet tracking. Default: true
     #[serde(default = "default_wallet_tracking_enabled")]
@@ -800,6 +800,20 @@ fn default_whale_threshold() -> u64 {
 } // 10 SOL
 fn default_max_cached_wallets() -> usize {
     10_000
+}
+
+impl Default for WalletTrackerCfg {
+    fn default() -> Self {
+        Self {
+            enabled: default_wallet_tracking_enabled(),
+            smart_money_wallets: Vec::new(),
+            bad_actor_wallets: Vec::new(),
+            early_buyer_slots: default_early_buyer_slots(),
+            max_early_buyers_per_token: default_max_early_buyers(),
+            whale_threshold_lamports: default_whale_threshold(),
+            max_cached_wallets: default_max_cached_wallets(),
+        }
+    }
 }
 
 /// Momentum Strategy Configuration (for momentum-bot)
