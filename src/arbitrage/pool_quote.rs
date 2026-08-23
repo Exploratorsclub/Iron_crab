@@ -235,8 +235,10 @@ pub fn diagnose_quote_not_fresh_with_bins(
 /// Subreason when no candidate produces a fresh buy quote (C1h2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NoFreshBuyQuoteSubreason {
-    QuoteNone,
+    /// Account-state quote could not be built (no vault, bad reserves, DLMM bins missing, etc.).
+    NoExecutableMarginal,
     StateStale,
+    /// Legacy LastTradeMid quote failed freshness (metrics / parsing only).
     TradeStale,
     NotFreshAfterQuote,
 }
@@ -244,7 +246,7 @@ pub enum NoFreshBuyQuoteSubreason {
 impl NoFreshBuyQuoteSubreason {
     pub fn as_metric_label(self) -> &'static str {
         match self {
-            Self::QuoteNone => "quote_none",
+            Self::NoExecutableMarginal => "no_executable_marginal",
             Self::StateStale => "state_stale",
             Self::TradeStale => "trade_stale",
             Self::NotFreshAfterQuote => "not_fresh_after_quote",
@@ -276,10 +278,7 @@ pub fn diagnose_no_fresh_buy_quote(
                 return NoFreshBuyQuoteSubreason::StateStale;
             }
         }
-        if trade_fresh(pool, now, freshness.trade_ttl_ms) {
-            return NoFreshBuyQuoteSubreason::QuoteNone;
-        }
-        return NoFreshBuyQuoteSubreason::TradeStale;
+        return NoFreshBuyQuoteSubreason::NoExecutableMarginal;
     };
     if is_quote_fresh_with_bins(&buy_quote, freshness, vault, dlmm_bins, now) {
         return NoFreshBuyQuoteSubreason::NotFreshAfterQuote;
@@ -534,10 +533,6 @@ fn trade_mid_sol_per_token(pool: &QuotePoolInput) -> Option<Decimal> {
     }
 }
 
-fn trade_fresh(pool: &QuotePoolInput, now: Instant, trade_ttl_ms: u64) -> bool {
-    now.duration_since(pool.trade_updated_at) <= Duration::from_millis(trade_ttl_ms)
-}
-
 fn state_fresh(vault: &QuoteVaultInput, now: Instant, state_ttl_ms: u64) -> bool {
     now.duration_since(vault.updated_at) <= Duration::from_millis(state_ttl_ms)
 }
@@ -616,10 +611,6 @@ pub fn price_based_token_output_raw(
     raw.to_u64().filter(|v| *v > 0)
 }
 
-fn tokens_from_trade_price(sol_lamports: u64, price: Decimal, token_decimals: u8) -> Option<u64> {
-    price_based_token_output_raw(sol_lamports, price, token_decimals)
-}
-
 /// Minimum fraction of price-based raw estimate that `token_out` must reach (10%).
 pub const ARB_TOKEN_OUT_MIN_PRICE_FRACTION_BPS: u64 = 1_000;
 
@@ -663,17 +654,6 @@ pub fn is_expected_token_output_plausible(
         return false;
     }
     true
-}
-
-fn sol_from_trade_price(token_raw: u64, price: Decimal, token_decimals: u8) -> Option<u64> {
-    if price <= Decimal::ZERO || token_raw == 0 {
-        return None;
-    }
-    let token_divisor = Decimal::from(10u64.pow(token_decimals as u32));
-    let tokens_whole = Decimal::from(token_raw) / token_divisor;
-    let sol = tokens_whole * price;
-    let lamports = (sol * Decimal::from(1_000_000_000u64)).floor();
-    lamports.to_u64().filter(|v| *v > 0)
 }
 
 fn executable_marginal_quote(
@@ -782,41 +762,6 @@ fn executable_marginal_quote(
     })
 }
 
-fn last_trade_mid_quote(
-    pool: &QuotePoolInput,
-    side: QuoteSide,
-    amount_in: u64,
-    now: Instant,
-    freshness: &QuoteFreshnessConfig,
-) -> Option<PoolQuote> {
-    if !trade_fresh(pool, now, freshness.trade_ttl_ms) {
-        return None;
-    }
-    let price = match side {
-        QuoteSide::Buy => pool.trade_price_buy?,
-        QuoteSide::Sell => pool.trade_price_sell?,
-    };
-    if price <= Decimal::ZERO || !is_plausible_sol_per_token_price(&pool.token_mint, price) {
-        return None;
-    }
-    let amount_out = match side {
-        QuoteSide::Buy => tokens_from_trade_price(amount_in, price, pool.token_decimals)?,
-        QuoteSide::Sell => sol_from_trade_price(amount_in, price, pool.token_decimals)?,
-    };
-    Some(PoolQuote {
-        pool_address: pool.pool_address.clone(),
-        dex: pool.dex.clone(),
-        kind: QuoteKind::LastTradeMid,
-        side,
-        as_of_slot: 0,
-        as_of_ts: pool.trade_updated_at,
-        fresh: true,
-        state_fingerprint: 0,
-        amount_in,
-        amount_out,
-    })
-}
-
 /// SOL-quoted token reserves extracted from [`CachedPoolState`] (base = token, quote = SOL).
 #[derive(Debug, Clone)]
 pub struct SolQuotedPoolSeed {
@@ -828,12 +773,9 @@ pub struct SolQuotedPoolSeed {
     pub dlmm_token_x_mint: Option<String>,
 }
 
-/// True when a quote may drive beam expansion / quote-ready index.
+/// True when a quote may drive beam expansion / quote-ready index (hot path: account quotes only).
 pub fn is_usable_quote_kind(kind: QuoteKind) -> bool {
-    matches!(
-        kind,
-        QuoteKind::ExecutableMarginal | QuoteKind::LastTradeMid
-    )
+    matches!(kind, QuoteKind::ExecutableMarginal)
 }
 
 fn orca_sol_quoted_vault_reserves(
@@ -1261,7 +1203,7 @@ pub fn token_decimals_from_cached_state(state: &CachedPoolState, token_mint: &Pu
     }
 }
 
-/// Exact-in quote for SOL-quoted pools. Priority: ExecutableMarginal, then LastTradeMid.
+/// Exact-in quote for SOL-quoted pools. Hot path: [`QuoteKind::ExecutableMarginal`] only.
 pub fn quote_exact_in(
     pool: &QuotePoolInput,
     vault: Option<&QuoteVaultInput>,
@@ -1298,17 +1240,13 @@ pub fn quote_exact_in_with_freshness(
     let now = Instant::now();
 
     if let Some(vault) = vault {
-        if let Some(q) =
-            executable_marginal_quote(pool, vault, dlmm_bins, side, amount_in, now, freshness)
-        {
-            return Some(q);
-        }
+        return executable_marginal_quote(pool, vault, dlmm_bins, side, amount_in, now, freshness);
     }
 
-    last_trade_mid_quote(pool, side, amount_in, now, freshness)
+    None
 }
 
-/// SOL per whole token for screening (marginal probe > reserve mid > trade mid).
+/// SOL per whole token for screening via [`quote_exact_in`] (ExecutableMarginal only).
 pub fn quote_sol_per_token_for_screening(
     pool: &QuotePoolInput,
     vault: Option<&QuoteVaultInput>,
@@ -1454,7 +1392,7 @@ pub enum SellQuoteNoneDetailReason {
     DlmmMarginalReject,
     CpmmMathNone,
     UnsupportedDex,
-    TradeFallbackNone,
+    NoExecutableMarginal,
     MintDirectionInvalid,
 }
 
@@ -1468,7 +1406,7 @@ impl SellQuoteNoneDetailReason {
             Self::DlmmMarginalReject => "dlmm_marginal_reject",
             Self::CpmmMathNone => "cpmm_math_none",
             Self::UnsupportedDex => "unsupported_dex",
-            Self::TradeFallbackNone => "trade_fallback_none",
+            Self::NoExecutableMarginal => "no_executable_marginal",
             Self::MintDirectionInvalid => "mint_direction_invalid",
         }
     }
@@ -1598,7 +1536,7 @@ pub fn diagnose_sell_quote_none(
         }
     }
 
-    SellQuoteNoneDetailReason::TradeFallbackNone
+    SellQuoteNoneDetailReason::NoExecutableMarginal
 }
 
 /// Max token input sellable via DLMM bins (sum of token-side liquidity from active bin).
@@ -2185,6 +2123,23 @@ mod tests {
     }
 
     #[test]
+    fn fresh_trade_without_reserves_returns_none() {
+        let mut pool = sample_pool("pump_amm", "tradeOnly");
+        pool.trade_price_buy = Some(Decimal::new(1, 3));
+        pool.trade_price_sell = Some(Decimal::new(1, 3));
+        pool.trade_updated_at = Instant::now();
+        let quote = quote_exact_in(
+            &pool,
+            None,
+            None,
+            NATIVE_SOL_MINT,
+            &pool.token_mint,
+            DLMM_PROBE_SOL_LAMPORTS,
+        );
+        assert!(quote.is_none());
+    }
+
+    #[test]
     fn dlmm_marginal_vs_reserve_mid_divergence_bounded() {
         let active_id = 0i32;
         let bin_step = 100u16;
@@ -2653,7 +2608,7 @@ mod tests {
     }
 
     #[test]
-    fn select_round_trip_pools_incompatible_kinds_only() {
+    fn select_round_trip_pools_trade_only_sell_pool_excluded() {
         use rust_decimal::Decimal;
         use std::str::FromStr;
 
@@ -2684,7 +2639,17 @@ mod tests {
             &QuoteFreshnessConfig::default(),
         )
         .unwrap_err();
-        assert_eq!(err, RoundTripSelectFailure::IncompatibleQuoteKind);
+        assert_eq!(
+            err,
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient {
+                subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
+                no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
+                sell_quote_none_detail_counts: None,
+                sell_not_fresh_detail_counts: None,
+                no_fresh_buy_quote_detail: None,
+                state_stale_age_bucket_counts: None,
+            })
+        );
     }
 
     #[test]
@@ -2719,7 +2684,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnose_sell_quote_none_trade_fallback_none() {
+    fn diagnose_sell_quote_none_no_executable_marginal() {
         let pool = sample_pool("orca", "noTrade");
         let reason = diagnose_sell_quote_none(
             &pool,
@@ -2729,7 +2694,7 @@ mod tests {
             &QuoteFreshnessConfig::default(),
             Instant::now(),
         );
-        assert_eq!(reason, SellQuoteNoneDetailReason::TradeFallbackNone);
+        assert_eq!(reason, SellQuoteNoneDetailReason::NoExecutableMarginal);
     }
 
     #[test]

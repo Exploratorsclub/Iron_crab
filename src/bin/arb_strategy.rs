@@ -278,7 +278,7 @@ struct ArbConfig {
     arb_probe_lamports: u64,
     /// When true, arb_probe_lamports tracks max_position_lamports on load/update.
     arb_probe_follows_max_position: bool,
-    /// LastTradeMid quote TTL for v2 freshness. Default: 30_000 ms.
+    /// Legacy LastTradeMid TTL (freshness re-check on parsed quotes only; hot path does not emit LastTradeMid). Default: 30_000 ms.
     arb_quote_trade_ttl_ms: u64,
     /// ExecutableMarginal state TTL for v2 freshness. Default: 120_000 ms.
     arb_quote_state_ttl_ms: u64,
@@ -2628,8 +2628,8 @@ fn v2_sell_quote_none_detail_to_metric(
         }
         SellQuoteNoneDetailReason::CpmmMathNone => ArbTwoHopV2SellQuoteNoneDetail::CpmmMathNone,
         SellQuoteNoneDetailReason::UnsupportedDex => ArbTwoHopV2SellQuoteNoneDetail::UnsupportedDex,
-        SellQuoteNoneDetailReason::TradeFallbackNone => {
-            ArbTwoHopV2SellQuoteNoneDetail::TradeFallbackNone
+        SellQuoteNoneDetailReason::NoExecutableMarginal => {
+            ArbTwoHopV2SellQuoteNoneDetail::NoExecutableMarginal
         }
         SellQuoteNoneDetailReason::MintDirectionInvalid => {
             ArbTwoHopV2SellQuoteNoneDetail::MintDirectionInvalid
