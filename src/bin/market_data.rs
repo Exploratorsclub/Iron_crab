@@ -2200,8 +2200,15 @@ fn apply_tx_pool_accounts_for_hot_pool(
     };
     ctx.live_pool_cache.upsert(pool, merged, slot);
     if matches!(dex, DexType::PumpFunAmm) && pool_accounts.len() >= 14 {
-        ctx.live_pool_cache
-            .set_pump_amm_pool_accounts(&pool, pool_accounts.to_vec());
+        let _ = ctx.live_pool_cache.set_pump_amm_pool_accounts_at_slot(
+            &pool,
+            pool_accounts.to_vec(),
+            slot,
+        );
+    } else {
+        ironcrab::metrics::inc_market_data_tx_pin_seed_pool_accounts_written_total(
+            dex.to_string().as_str(),
+        );
     }
     ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(
         ironcrab::metrics::TxPoolAccountsHotApplyResult::Upsert,

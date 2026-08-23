@@ -12,9 +12,10 @@ use super::pool_publish::{
 };
 use super::worker::{DlmmPoolStateSignal, MdSidefxBurstScratch, MdSidefxCommand};
 use crate::execution::live_pool_cache::{
-    meteora_cpmm_readiness_for_pool_cache_update, meteora_dlmm_readiness_for_pool_cache_update,
-    orca_readiness_for_pool_cache_update, parse_pool_account,
-    raydium_amm_readiness_for_pool_cache_update, CachedPoolState, PumpFunState,
+    cached_state_layer_c_complete, meteora_cpmm_readiness_for_pool_cache_update,
+    meteora_dlmm_readiness_for_pool_cache_update, orca_readiness_for_pool_cache_update,
+    parse_pool_account, pump_amm_layer_c_complete, raydium_amm_readiness_for_pool_cache_update,
+    CachedPoolState, PumpFunState, SetPumpAmmPoolAccountsResult,
 };
 use crate::ipc::{
     DexPoolReadiness, MarketEvent, MarketEventKind, PoolCacheUpdate, NATIVE_SOL_MINT,
@@ -28,6 +29,8 @@ use crate::metrics::{
     inc_market_data_md_sidefx_enrich_publish_skipped_total,
     inc_market_data_open_position_pumpfun_jetstream_publish_total,
     inc_market_data_pool_state_publish_skipped_balance_unchanged_total,
+    inc_market_data_tx_pin_seed_pool_accounts_write_miss_total,
+    inc_market_data_tx_pin_seed_pool_accounts_written_total,
     record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_pool_mint_map_to_devwallet_ms, MarketDataLatencySegment,
 };
@@ -63,6 +66,63 @@ fn sidefx_host_enqueue_jetstream<T: serde::Serialize>(
         log_fail,
         bump_market_events_published_total,
     );
+}
+
+/// Hot pin-seed Schicht C write for PumpSwap with post-write verification + metrics.
+fn md_sidefx_pin_seed_write_pump_layer_c(
+    host: &dyn SidefxWorkerHost,
+    pool_address: &Pubkey,
+    pool_accounts: &[Pubkey],
+    slot: u64,
+    is_hot: bool,
+) -> bool {
+    let result = host.live_pool_cache().set_pump_amm_pool_accounts_at_slot(
+        pool_address,
+        pool_accounts.to_vec(),
+        slot,
+    );
+    match result {
+        SetPumpAmmPoolAccountsResult::Written => {
+            if is_hot {
+                inc_market_data_tx_pin_seed_pool_accounts_written_total("pump_amm");
+                match host
+                    .live_pool_cache()
+                    .get_pump_amm_pool_accounts(pool_address)
+                {
+                    Some(stored) if pump_amm_layer_c_complete(pool_address, &stored) => true,
+                    _ => {
+                        warn!(
+                            pool = %pool_address,
+                            slot,
+                            accounts_len = pool_accounts.len(),
+                            "tx pin-seed: pump layer C verify miss after write"
+                        );
+                        inc_market_data_tx_pin_seed_pool_accounts_write_miss_total("verify_miss");
+                        false
+                    }
+                }
+            } else {
+                true
+            }
+        }
+        SetPumpAmmPoolAccountsResult::MissIncompleteAccounts => {
+            if is_hot {
+                inc_market_data_tx_pin_seed_pool_accounts_write_miss_total("incomplete");
+            }
+            false
+        }
+        SetPumpAmmPoolAccountsResult::MissNoCacheEntry => {
+            if is_hot {
+                inc_market_data_tx_pin_seed_pool_accounts_write_miss_total("no_cache_entry");
+                warn!(
+                    pool = %pool_address,
+                    slot,
+                    "tx pin-seed: pump layer C write miss (no cache entry)"
+                );
+            }
+            false
+        }
+    }
 }
 
 fn md_sidefx_build_balance_updated_from_cache(
@@ -816,6 +876,18 @@ pub fn md_sidefx_process_pump_amm_trade(host: &dyn SidefxWorkerHost, job: &MdSid
         .map(|p| p.to_string())
         .unwrap_or_default();
 
+    let is_hot = host.is_hot_pool(pool_address);
+    if is_hot {
+        host.apply_tx_pool_accounts_for_hot_pool(
+            *pool_address,
+            DexType::PumpFunAmm,
+            *base_mint_pk,
+            Pubkey::from_str(&quote_mint).unwrap_or_default(),
+            pool_accounts,
+            *slot,
+        );
+    }
+
     let is_first_trade = host.known_pump_amm_pools_insert(*pool_address);
 
     if is_first_trade {
@@ -883,8 +955,7 @@ pub fn md_sidefx_process_pump_amm_trade(host: &dyn SidefxWorkerHost, job: &MdSid
         );
     }
     if pool_accounts.len() >= 14 {
-        host.live_pool_cache()
-            .set_pump_amm_pool_accounts(pool_address, pool_accounts.clone());
+        md_sidefx_pin_seed_write_pump_layer_c(host, pool_address, pool_accounts, *slot, is_hot);
         let (ext_flag, ext_third, ext_t0, ext_t1) = host
             .live_pool_cache()
             .pump_amm_sell_extended_layout(pool_address);
@@ -1088,16 +1159,6 @@ pub fn md_sidefx_process_pump_amm_trade(host: &dyn SidefxWorkerHost, job: &MdSid
             );
         }
     }
-    if host.is_hot_pool(pool_address) {
-        host.apply_tx_pool_accounts_for_hot_pool(
-            *pool_address,
-            DexType::PumpFunAmm,
-            *base_mint_pk,
-            Pubkey::from_str(&quote_mint).unwrap_or_default(),
-            pool_accounts,
-            *slot,
-        );
-    }
 }
 
 pub fn md_sidefx_process_generic_dex_first_trade(
@@ -1121,8 +1182,15 @@ pub fn md_sidefx_process_generic_dex_first_trade(
         return;
     }
     let is_first_trade = host.known_trade_dex_pools_insert(*pool_address);
-    if !is_first_trade && !host.is_hot_pool(pool_address) {
-        return;
+    if !is_first_trade {
+        if !host.is_hot_pool(pool_address) {
+            return;
+        }
+        if let Some(state) = host.live_pool_cache().get(pool_address) {
+            if cached_state_layer_c_complete(pool_address, &state) {
+                return;
+            }
+        }
     }
     let accounts_event = MarketEvent::new(
         "market-data",
