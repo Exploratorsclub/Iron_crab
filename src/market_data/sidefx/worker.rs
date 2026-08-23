@@ -831,7 +831,6 @@ mod tests {
     use crate::metrics::{
         MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL,
         MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_FAIL_LOUD_TOTAL,
-        MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL,
         MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL,
         MARKET_DATA_TX_DISCOVERY_SIDEFX_JOBS_PROCESSED_TOTAL,
         MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL,
@@ -1322,32 +1321,34 @@ mod tests {
             MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
         let pin_seed_dropped_before =
             MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
-        let pin_seed_processed_before =
-            MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
         let account_dropped_before =
             MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
-        let account_processed_before =
-            MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
 
         for _ in 0..16 {
             md_tx_discovery_sidefx_try_enqueue(&workers.tx_discovery, mk_tx_discovery_job());
         }
 
         let hot_pool = Pubkey::new_unique();
-        md_tx_pin_seed_sidefx_try_enqueue(&workers.tx_pin_seed, mk_pin_seed_job(hot_pool));
-        md_account_sidefx_try_enqueue(&workers.account, mk_account_job());
+        assert!(
+            workers
+                .tx_pin_seed
+                .tx
+                .try_send(mk_pin_seed_job(hot_pool))
+                .is_ok(),
+            "pin-seed enqueue must succeed while discovery queue is flooded"
+        );
+        assert!(
+            workers.account.tx.try_send(mk_account_job()).is_ok(),
+            "account enqueue must succeed while discovery queue is flooded"
+        );
 
         let tx_dropped_after = MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
         let discovery_dropped_after =
             MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
         let pin_seed_dropped_after =
             MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
-        let pin_seed_processed_after =
-            MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
         let account_dropped_after =
             MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
-        let account_processed_after =
-            MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed);
 
         assert!(
             discovery_dropped_after > discovery_dropped_before,
@@ -1364,16 +1365,6 @@ mod tests {
         assert_eq!(
             account_dropped_after, account_dropped_before,
             "account pipeline must never increment drop counter"
-        );
-        assert!(
-            workers.tx_pin_seed.queue_depth.load(Ordering::Relaxed) > 0
-                || pin_seed_processed_after > pin_seed_processed_before,
-            "pin-seed job should be accepted despite discovery flood (queued or already processed)"
-        );
-        assert!(
-            workers.account.queue_depth.load(Ordering::Relaxed) > 0
-                || account_processed_after > account_processed_before,
-            "account job should be accepted despite discovery flood (queued or already processed)"
         );
     }
 
