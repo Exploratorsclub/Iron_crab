@@ -5,6 +5,7 @@ use super::host::SidefxWorkerHost;
 use crate::market_data::ingest::AccountUpdateClass;
 use crate::metrics::{
     inc_market_data_account_sidefx_backpressure_total,
+    inc_market_data_account_sidefx_enqueue_fail_loud_total,
     inc_market_data_account_sidefx_jobs_processed_total,
     inc_market_data_md_sidefx_enqueue_dropped_total,
     inc_market_data_md_sidefx_enrich_enqueue_dropped_total,
@@ -494,17 +495,16 @@ pub fn md_account_sidefx_try_enqueue_classed(
         Ok(()) => {
             md_sidefx_inc_queue_depth(&sender.queue_depth, MdSidefxPipeline::AccountQuote);
         }
-        Err(err) => {
+        Err(std_mpsc::TrySendError::Full(job)) => {
             inc_market_data_account_sidefx_backpressure_total();
-            let job = match err {
-                std_mpsc::TrySendError::Full(j) => j,
-                std_mpsc::TrySendError::Disconnected(j) => j,
-            };
-            sender
-                .tx
-                .send(job)
-                .expect("md-account-sidefx worker disconnected");
-            md_sidefx_inc_queue_depth(&sender.queue_depth, MdSidefxPipeline::AccountQuote);
+            if sender.tx.send(job).is_ok() {
+                md_sidefx_inc_queue_depth(&sender.queue_depth, MdSidefxPipeline::AccountQuote);
+            } else {
+                inc_market_data_account_sidefx_enqueue_fail_loud_total();
+            }
+        }
+        Err(std_mpsc::TrySendError::Disconnected(_)) => {
+            inc_market_data_account_sidefx_enqueue_fail_loud_total();
         }
     }
 }
@@ -626,9 +626,14 @@ fn md_tx_bounded_sidefx_try_enqueue_classed(
                 inc_market_data_md_sidefx_enrich_enqueue_dropped_total();
             }
         }
-        Err(std_mpsc::TrySendError::Disconnected(job)) => {
-            tx.send(job).expect("md-sidefx worker disconnected");
-            md_sidefx_inc_queue_depth(queue_depth, pipeline);
+        Err(std_mpsc::TrySendError::Disconnected(_)) => {
+            inc_market_data_md_sidefx_enqueue_dropped_total();
+            inc_pipeline_dropped();
+            if class.is_exec_hot() {
+                inc_market_data_tx_sidefx_enqueue_dropped_total();
+            } else {
+                inc_market_data_md_sidefx_enrich_enqueue_dropped_total();
+            }
         }
     }
 }
@@ -825,6 +830,7 @@ mod tests {
     use super::*;
     use crate::metrics::{
         MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL,
+        MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_FAIL_LOUD_TOTAL,
         MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL,
         MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL,
         MARKET_DATA_TX_DISCOVERY_SIDEFX_JOBS_PROCESSED_TOTAL,
@@ -832,7 +838,7 @@ mod tests {
         MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL,
         MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL,
     };
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     const RAYDIUM_CPMM_OWNER: Pubkey =
@@ -1451,5 +1457,49 @@ mod tests {
         let dropped_after =
             MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed);
         assert_eq!(dropped_before, dropped_after);
+    }
+
+    #[test]
+    fn account_enqueue_disconnected_worker_fail_loud_without_panic() {
+        let (tx, rx) = std_mpsc::sync_channel(8);
+        drop(rx);
+        let sender = MdAccountSidefxSender {
+            tx,
+            queue_depth: Arc::new(AtomicUsize::new(0)),
+            queue_capacity: 8,
+        };
+        let fail_loud_before =
+            MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_FAIL_LOUD_TOTAL.load(Ordering::Relaxed);
+        md_account_sidefx_try_enqueue(&sender, mk_account_job());
+        let fail_loud_after =
+            MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_FAIL_LOUD_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            fail_loud_after > fail_loud_before,
+            "disconnected account sidefx enqueue must bump fail-loud metric"
+        );
+    }
+
+    #[test]
+    fn spawn_on_ingest_runtime_from_os_thread_does_not_panic() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        let spawned = Arc::new(AtomicBool::new(false));
+        let spawned_flag = Arc::clone(&spawned);
+        let ingest_handle = parking_lot::RwLock::new(Some(handle));
+        let thread = std::thread::spawn(move || {
+            if let Some(h) = ingest_handle.read().clone() {
+                h.spawn(async move {
+                    spawned_flag.store(true, Ordering::Relaxed);
+                });
+            }
+        });
+        thread.join().expect("join os thread");
+        runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        });
+        assert!(spawned.load(Ordering::Relaxed));
     }
 }
