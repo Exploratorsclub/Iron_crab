@@ -131,6 +131,10 @@ impl WalletTracker {
         run_id: &str,
         component: &str,
     ) -> Vec<MarketEvent> {
+        if !self.config.enabled {
+            return Vec::new();
+        }
+
         let mut events = Vec::new();
 
         // Check if this is a known wallet
@@ -490,6 +494,76 @@ mod tests {
         assert_eq!(events.len(), 1);
         if let MarketEventKind::WalletActivity { wallet_type, .. } = &events[0].kind {
             assert_eq!(*wallet_type, WalletType::SmartMoney);
+        } else {
+            panic!("Expected WalletActivity event");
+        }
+    }
+
+    #[test]
+    fn default_cfg_whale_threshold_is_10_sol() {
+        assert_eq!(
+            WalletTrackerCfg::default().whale_threshold_lamports,
+            10_000_000_000
+        );
+    }
+
+    #[test]
+    fn process_trade_disabled_emits_nothing() {
+        let config = WalletTrackerCfg {
+            enabled: false,
+            ..WalletTrackerCfg::default()
+        };
+        let tracker = WalletTracker::new(config);
+        let events = tracker.process_trade(
+            "TokenMint123",
+            "AnyWallet",
+            true,
+            20_000_000_000,
+            1_000_000,
+            2000,
+            "sig123456789012345678901234567890",
+            "test-run",
+            "test",
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn sub_threshold_trade_does_not_emit_whale_activity() {
+        let tracker = WalletTracker::new(WalletTrackerCfg::default());
+        let events = tracker.process_trade(
+            "TokenMint123",
+            "SmallTrader",
+            true,
+            1_320_000_000, // 1.32 SOL
+            1_000_000,
+            2000,
+            "sig123456789012345678901234567890",
+            "test-run",
+            "test",
+        );
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e.kind, MarketEventKind::WalletActivity { .. })));
+    }
+
+    #[test]
+    fn whale_threshold_trade_emits_wallet_activity() {
+        let tracker = WalletTracker::new(WalletTrackerCfg::default());
+        let events = tracker.process_trade(
+            "TokenMint123",
+            "BigTrader",
+            true,
+            10_000_000_000,
+            1_000_000,
+            2000,
+            "sig123456789012345678901234567890",
+            "test-run",
+            "test",
+        );
+        assert_eq!(events.len(), 1);
+        if let MarketEventKind::WalletActivity { wallet_type, .. } = &events[0].kind {
+            assert_eq!(*wallet_type, WalletType::Whale);
         } else {
             panic!("Expected WalletActivity event");
         }

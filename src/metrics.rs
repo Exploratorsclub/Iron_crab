@@ -2666,6 +2666,10 @@ pub static MARKET_DATA_JSONL_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU
 pub static MARKET_DATA_JSONL_RECORDS_WRITTEN_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+pub static JSONL_RETENTION_DELETED_FILES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static JSONL_RETENTION_DELETED_BYTES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
 /// Record Geyser ingest progress for Tokio liveness (cheap atomics only).
 #[inline]
 pub fn record_market_data_tokio_progress() {
@@ -2691,6 +2695,16 @@ pub fn set_market_data_jsonl_queue_depth(depth: usize) {
 #[inline]
 pub fn inc_market_data_jsonl_records_written_total() {
     MARKET_DATA_JSONL_RECORDS_WRITTEN_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_jsonl_retention_deleted_files_total(count: u64) {
+    JSONL_RETENTION_DELETED_FILES_TOTAL.fetch_add(count, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_jsonl_retention_deleted_bytes_total(bytes: u64) {
+    JSONL_RETENTION_DELETED_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// Update monotonic Geyser head slot (max). Safe from any market-data ingest arm.
@@ -9829,6 +9843,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_jsonl_records_written_total",
         MARKET_DATA_JSONL_RECORDS_WRITTEN_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "jsonl_retention_deleted_files_total",
+        JSONL_RETENTION_DELETED_FILES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "jsonl_retention_deleted_bytes_total",
+        JSONL_RETENTION_DELETED_BYTES_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_last_trade_publish_ts_unix_ms",
