@@ -229,8 +229,17 @@ pub fn parse_transaction_update_with_pool_lookup(
     update: &GeyserTransactionUpdate,
     pool_lookup: PoolLookupFn<'_>,
 ) -> Option<ParsedDexEvent> {
+    let mut normalized_update;
+    let (update, selected_program) = match update.instruction_accounts.first().copied() {
+        Some(program) if is_supported_dex_program(program) => {
+            normalized_update = update.clone();
+            normalized_update.instruction_accounts.remove(0);
+            (&normalized_update, Some(program))
+        }
+        _ => (update, None),
+    };
     // 1. Try top-level instruction first
-    if let Some(event) = try_parse_top_level(update, pool_lookup) {
+    if let Some(event) = try_parse_top_level(update, pool_lookup, selected_program) {
         return Some(event);
     }
 
@@ -246,6 +255,7 @@ pub fn parse_transaction_update_with_pool_lookup(
 fn try_parse_top_level(
     update: &GeyserTransactionUpdate,
     pool_lookup: PoolLookupFn<'_>,
+    selected_program: Option<Pubkey>,
 ) -> Option<ParsedDexEvent> {
     let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).ok()?;
     let raydium_cpmm = Pubkey::from_str(RAYDIUM_CPMM).ok()?;
@@ -254,7 +264,7 @@ fn try_parse_top_level(
     let pumpfun = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
     let pumpfun_amm = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok()?;
 
-    let selected_program = update.instruction_program_id.or_else(|| {
+    let selected_program = selected_program.or_else(|| {
         let known = [meteora, raydium_cpmm, pumpfun_amm, pumpfun, raydium, orca];
         let mut present = known
             .into_iter()
@@ -319,7 +329,6 @@ fn try_parse_inner_instructions(
             .collect();
 
         let synth = GeyserTransactionUpdate {
-            instruction_program_id: Some(program_id),
             instruction_accounts,
             instruction_data: inner.data.clone(),
             inner_instructions: vec![], // avoid recursion; we only parse one level
@@ -355,6 +364,20 @@ fn try_parse_inner_instructions(
     }
 
     pump_amm_fallback
+}
+
+fn is_supported_dex_program(program: Pubkey) -> bool {
+    [
+        RAYDIUM_AMM_V4,
+        RAYDIUM_CPMM,
+        ORCA_WHIRLPOOL,
+        METEORA_DLMM,
+        PUMPFUN_PROGRAM,
+        PUMPFUN_AMM_PROGRAM,
+    ]
+    .iter()
+    .filter_map(|value| Pubkey::from_str(value).ok())
+    .any(|known| known == program)
 }
 
 // ============================================================================
@@ -2029,6 +2052,7 @@ mod tests {
         let token_program =
             Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
         let instruction_accounts = vec![
+            orca,
             token_program,
             Pubkey::new_unique(),
             pool,
@@ -2040,7 +2064,6 @@ mod tests {
             signature: "multi-dex-router".to_string(),
             slot: 1,
             account_keys: vec![meteora, orca],
-            instruction_program_id: Some(orca),
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2107,7 +2130,6 @@ mod tests {
             signature: "test_sig".to_string(),
             slot: 100,
             account_keys,
-            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2236,7 +2258,6 @@ mod tests {
             signature: "sell_synth_sig".to_string(),
             slot: 200,
             account_keys,
-            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2365,7 +2386,6 @@ mod tests {
             signature: "sell_ext_synth_sig".to_string(),
             slot: 201,
             account_keys,
-            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2494,7 +2514,6 @@ mod tests {
             signature: "sell_26_synth_sig".to_string(),
             slot: 202,
             account_keys,
-            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2620,7 +2639,6 @@ mod tests {
             signature: "inner_cpi_sell_sig".to_string(),
             slot: 203,
             account_keys: account_keys.clone(),
-            instruction_program_id: None,
             instruction_accounts: vec![user],
             instruction_data: vec![0u8; 8],
             inner_instructions: vec![InnerInstruction {
@@ -2712,7 +2730,6 @@ mod tests {
                 .to_string(),
             slot: 421_716_594,
             account_keys,
-            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2807,7 +2824,6 @@ mod tests {
             signature: "synth_buy_exact_sol".to_string(),
             slot: 1,
             account_keys,
-            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2893,7 +2909,6 @@ mod tests {
             signature: "legacy_buy_curve".to_string(),
             slot: 2,
             account_keys,
-            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2968,7 +2983,6 @@ mod tests {
             signature: "raydium_buy_regression".to_string(),
             slot: 3,
             account_keys,
-            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],

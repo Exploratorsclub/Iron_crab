@@ -380,7 +380,6 @@ mod tx_dex_detection_tests {
             signature: "test".into(),
             slot: 1,
             account_keys,
-            instruction_program_id: None,
             instruction_accounts,
             instruction_data: vec![],
             inner_instructions,
