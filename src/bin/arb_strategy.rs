@@ -95,12 +95,13 @@ use ironcrab::metrics::{
     inc_arb_vault_rescreen_scheduled_total, inc_arb_vault_seed_from_cache_miss_total,
     inc_arb_vault_seed_from_cache_ok_total, record_arb_bundle_profit_insufficient,
     record_arb_heartbeat_phase, record_arb_intent_suppressed_implausible_token_out,
-    record_arb_intent_suppressed_unsupported_route, record_arb_price_freshness_stale_age_ms,
-    record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
+    record_arb_intent_suppressed_unsupported_route, record_arb_pool_identity_check,
+    record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
+    record_arb_proactive_track_publish_total, record_arb_quote_invariant_violation,
     record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
-    record_arb_track_publish_skipped_unchanged_total, record_arb_track_removed_total,
-    record_arb_track_requests_messages_total, record_arb_track_requests_publish_chunks_total,
-    record_arb_track_requests_publish_failed_total,
+    record_arb_round_trip_by_dex_pair, record_arb_track_publish_skipped_unchanged_total,
+    record_arb_track_removed_total, record_arb_track_requests_messages_total,
+    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
     record_arb_track_selection_blocking_join_failed_total,
     record_arb_track_selection_queue_overflow_total, record_arb_track_selection_recompute_total,
     record_arb_two_hop_v2_formable_gates, record_arb_writer_lock_wait, serve_metrics,
@@ -2848,6 +2849,72 @@ static ARB_V2_INSUFFICIENT_LOG_THROTTLE: std::sync::LazyLock<
     ))
 });
 
+const V2_GATE_FORENSICS_CATEGORY_COUNT: usize = 4;
+static ARB_V2_GATE_FORENSICS_LOG_THROTTLE: std::sync::LazyLock<
+    parking_lot::Mutex<
+        fixed_category_log_throttle::FixedCategoryLogThrottle<V2_GATE_FORENSICS_CATEGORY_COUNT>,
+    >,
+> = std::sync::LazyLock::new(|| {
+    parking_lot::Mutex::new(fixed_category_log_throttle::FixedCategoryLogThrottle::new(
+        Duration::from_secs(HOT_PATH_LOG_THROTTLE_SECS),
+    ))
+});
+
+#[allow(clippy::too_many_arguments)]
+fn log_v2_gate_forensics(
+    category: usize,
+    outcome: &'static str,
+    mint: &str,
+    token_decimals: u8,
+    probe_lamports: u64,
+    buy_dex: &str,
+    buy_pool: &str,
+    buy_slot: u64,
+    buy_amount_out: u64,
+    sell_dex: &str,
+    sell_pool: &str,
+    sell_slot: u64,
+    sell_amount_out: u64,
+    slot_delta: u64,
+    spread_bps: Option<i128>,
+    profit_lamports: Option<i128>,
+) {
+    if !ARB_V2_GATE_FORENSICS_LOG_THROTTLE
+        .lock()
+        .should_emit(category, Instant::now())
+    {
+        return;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut screen_hasher = std::collections::hash_map::DefaultHasher::new();
+    mint.hash(&mut screen_hasher);
+    buy_pool.hash(&mut screen_hasher);
+    sell_pool.hash(&mut screen_hasher);
+    buy_slot.hash(&mut screen_hasher);
+    sell_slot.hash(&mut screen_hasher);
+    let screen_id = screen_hasher.finish();
+    warn!(
+        kind = "arb_round_trip_forensics",
+        screen_id,
+        outcome,
+        mint,
+        token_decimals,
+        probe_lamports,
+        buy_dex,
+        buy_pool,
+        buy_slot,
+        buy_amount_out,
+        sell_dex,
+        sell_pool,
+        sell_slot,
+        sell_amount_out,
+        slot_delta,
+        spread_bps = ?spread_bps,
+        profit_lamports = ?profit_lamports,
+        "arb v2 terminal gate forensic sample"
+    );
+}
+
 fn insufficient_subreason_metric_label(subreason: RoundTripInsufficientSubreason) -> &'static str {
     match subreason {
         RoundTripInsufficientSubreason::CandidatesLt2 => "candidates_lt2",
@@ -3708,12 +3775,36 @@ impl TokenArbTracker {
         };
 
         arb_two_hop_v2_round_trip_formable_inc();
+        record_arb_round_trip_by_dex_pair(&selection.buy_dex, &selection.sell_dex, "formable");
 
         let buy_as_of_slot = selection.buy_quote.as_of_slot;
         let sell_as_of_slot = selection.sell_quote.as_of_slot;
         let slot_delta = buy_as_of_slot.abs_diff(sell_as_of_slot);
         record_arb_quote_pair_slot_delta(buy_as_of_slot, sell_as_of_slot);
         if config.arb_max_leg_slot_delta > 0 && slot_delta > config.arb_max_leg_slot_delta {
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "slot_delta",
+            );
+            log_v2_gate_forensics(
+                0,
+                "slot_delta",
+                &self.base_mint,
+                token_decimals,
+                probe,
+                &selection.buy_dex,
+                &selection.buy_pool_address,
+                buy_as_of_slot,
+                selection.buy_quote.amount_out,
+                &selection.sell_dex,
+                &selection.sell_pool_address,
+                sell_as_of_slot,
+                selection.sell_quote.amount_out,
+                slot_delta,
+                None,
+                None,
+            );
             arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::SlotDeltaExceeded);
             return None;
         }
@@ -3733,6 +3824,11 @@ impl TokenArbTracker {
                 };
                 if buy_age > config.arb_max_leg_age_slots || sell_age > config.arb_max_leg_age_slots
                 {
+                    record_arb_round_trip_by_dex_pair(
+                        &selection.buy_dex,
+                        &selection.sell_dex,
+                        "leg_too_old",
+                    );
                     arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::LegSlotTooOld);
                     return None;
                 }
@@ -3756,9 +3852,9 @@ impl TokenArbTracker {
             .unwrap_or(config.max_position_lamports)
             .max(probe);
 
-        let profit_lamports = selection.sell_quote.amount_out as i64
-            - probe as i64
-            - config.est_tx_cost_lamports as i64;
+        let profit_lamports_i128 = i128::from(selection.sell_quote.amount_out)
+            - i128::from(probe)
+            - i128::from(config.est_tx_cost_lamports);
 
         let buy_liquidity_unknown =
             !buy_pool.has_reserve_data && buy_pool.liquidity_sol <= Decimal::ZERO;
@@ -3770,11 +3866,47 @@ impl TokenArbTracker {
             config.min_profit_lamports
         };
 
-        let spread_bps = if probe > 0 {
-            let gross = selection.sell_quote.amount_out as i64 - probe as i64;
-            (gross * 10_000 / probe as i64).clamp(i64::MIN, i64::MAX) as i32
-        } else {
-            0
+        if probe == 0 {
+            record_arb_quote_invariant_violation(&selection.buy_dex, "zero_probe");
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "arithmetic_invalid",
+            );
+            return None;
+        }
+        let spread_bps_i128 = (i128::from(selection.sell_quote.amount_out) - i128::from(probe))
+            .saturating_mul(10_000)
+            / i128::from(probe);
+        let (Ok(spread_bps), Ok(profit_lamports)) = (
+            i32::try_from(spread_bps_i128),
+            i64::try_from(profit_lamports_i128),
+        ) else {
+            record_arb_quote_invariant_violation(&selection.buy_dex, "arithmetic_range");
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "arithmetic_invalid",
+            );
+            log_v2_gate_forensics(
+                3,
+                "arithmetic_invalid",
+                &self.base_mint,
+                token_decimals,
+                probe,
+                &selection.buy_dex,
+                &selection.buy_pool_address,
+                buy_as_of_slot,
+                selection.buy_quote.amount_out,
+                &selection.sell_dex,
+                &selection.sell_pool_address,
+                sell_as_of_slot,
+                selection.sell_quote.amount_out,
+                slot_delta,
+                Some(spread_bps_i128),
+                Some(profit_lamports_i128),
+            );
+            return None;
         };
 
         let max_spread = if self.base_mint == USDC_MINT || self.base_mint == USDT_MINT {
@@ -3784,6 +3916,29 @@ impl TokenArbTracker {
         };
 
         if spread_bps < config.min_spread_bps as i32 {
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "spread_below",
+            );
+            log_v2_gate_forensics(
+                1,
+                "spread_below",
+                &self.base_mint,
+                token_decimals,
+                probe,
+                &selection.buy_dex,
+                &selection.buy_pool_address,
+                buy_as_of_slot,
+                selection.buy_quote.amount_out,
+                &selection.sell_dex,
+                &selection.sell_pool_address,
+                sell_as_of_slot,
+                selection.sell_quote.amount_out,
+                slot_delta,
+                Some(spread_bps_i128),
+                Some(profit_lamports_i128),
+            );
             record_arb_two_hop_v2_formable_gates(
                 spread_bps,
                 profit_lamports,
@@ -3794,6 +3949,29 @@ impl TokenArbTracker {
         }
 
         if spread_bps as i64 > max_spread {
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "spread_above",
+            );
+            log_v2_gate_forensics(
+                2,
+                "spread_above",
+                &self.base_mint,
+                token_decimals,
+                probe,
+                &selection.buy_dex,
+                &selection.buy_pool_address,
+                buy_as_of_slot,
+                selection.buy_quote.amount_out,
+                &selection.sell_dex,
+                &selection.sell_pool_address,
+                sell_as_of_slot,
+                selection.sell_quote.amount_out,
+                slot_delta,
+                Some(spread_bps_i128),
+                Some(profit_lamports_i128),
+            );
             record_arb_two_hop_v2_formable_gates(
                 spread_bps,
                 profit_lamports,
@@ -3804,6 +3982,11 @@ impl TokenArbTracker {
         }
 
         if profit_lamports < effective_min_profit as i64 {
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "profit_below",
+            );
             record_arb_two_hop_v2_formable_gates(
                 spread_bps,
                 profit_lamports,
@@ -3818,6 +4001,7 @@ impl TokenArbTracker {
             profit_lamports,
             ArbTwoHopV2FormableGateOutcome::PassedGates,
         );
+        record_arb_round_trip_by_dex_pair(&selection.buy_dex, &selection.sell_dex, "passed");
 
         let buy_price = Decimal::from(selection.buy_quote.amount_in)
             / Decimal::from(1_000_000_000u64)
@@ -6506,14 +6690,17 @@ impl ArbContext {
         }
 
         let Ok(pool_pk) = Pubkey::from_str(pool_address) else {
+            record_arb_pool_identity_check(dex, "invalid_pubkey");
             debug!(pool = %pool_address, mint = %mint, dex = %dex, "Trade rejected: invalid pool pubkey");
             return None;
         };
         let Some((cached_state, _, _)) = self.live_pool_cache.get_with_metadata(&pool_pk) else {
+            record_arb_pool_identity_check(dex, "absent");
             debug!(pool = %pool_address, mint = %mint, dex = %dex, "Trade deferred: pool absent from authoritative Geyser cache");
             return None;
         };
         if !cached_pool_authorizes_arb_trade(&cached_state, dex, mint, quote_mint) {
+            record_arb_pool_identity_check(dex, "mismatch");
             debug!(
                 pool = %pool_address,
                 mint = %mint,
@@ -6524,6 +6711,7 @@ impl ArbContext {
             );
             return None;
         }
+        record_arb_pool_identity_check(dex, "match");
 
         // DATA QUALITY: Reject trades with zero amounts (parser failed to extract token balance)
         if token_amount == 0 || sol_amount == 0 {

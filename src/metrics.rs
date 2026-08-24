@@ -5595,6 +5595,82 @@ pub static ARB_TWO_HOP_V2_SCREEN_SKIPPED_MINT_NOT_SELECTED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_ROUND_TRIP_FORMABLE_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+
+// Bounded-cardinality arb forensics. Pool/mint/account addresses deliberately never become
+// Prometheus labels; exact identities belong in the throttled structured forensic log.
+const ARB_FORENSICS_DEX_LABELS: [&str; 5] =
+    ["orca", "meteora_dlmm", "pump_amm", "raydium", "other"];
+const ARB_FORENSICS_ROUND_TRIP_OUTCOMES: [&str; 8] = [
+    "formable",
+    "slot_delta",
+    "leg_too_old",
+    "spread_below",
+    "spread_above",
+    "profit_below",
+    "passed",
+    "arithmetic_invalid",
+];
+const ARB_FORENSICS_IDENTITY_OUTCOMES: [&str; 4] =
+    ["match", "absent", "mismatch", "invalid_pubkey"];
+const ARB_FORENSICS_INVARIANTS: [&str; 5] = [
+    "arithmetic_range",
+    "out_exceeds_i64",
+    "round_trip_amount_mismatch",
+    "zero_probe",
+    "other",
+];
+
+static ARB_ROUND_TRIP_BY_DEX_PAIR_TOTAL: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    (0..ARB_FORENSICS_DEX_LABELS.len()
+        * ARB_FORENSICS_DEX_LABELS.len()
+        * ARB_FORENSICS_ROUND_TRIP_OUTCOMES.len())
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+static ARB_POOL_IDENTITY_CHECK_TOTAL: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    (0..ARB_FORENSICS_DEX_LABELS.len() * ARB_FORENSICS_IDENTITY_OUTCOMES.len())
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+static ARB_QUOTE_INVARIANT_VIOLATION_TOTAL: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    (0..ARB_FORENSICS_DEX_LABELS.len() * ARB_FORENSICS_INVARIANTS.len())
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+
+fn arb_forensics_label_index(labels: &[&str], value: &str) -> usize {
+    labels
+        .iter()
+        .position(|candidate| *candidate == value)
+        .unwrap_or(labels.len() - 1)
+}
+
+/// Record one terminal v2 round-trip outcome with bounded canonical DEX labels.
+pub fn record_arb_round_trip_by_dex_pair(buy_dex: &str, sell_dex: &str, outcome: &str) {
+    let buy = arb_forensics_label_index(&ARB_FORENSICS_DEX_LABELS, buy_dex);
+    let sell = arb_forensics_label_index(&ARB_FORENSICS_DEX_LABELS, sell_dex);
+    let outcome = arb_forensics_label_index(&ARB_FORENSICS_ROUND_TRIP_OUTCOMES, outcome);
+    let idx = (buy * ARB_FORENSICS_DEX_LABELS.len() + sell)
+        * ARB_FORENSICS_ROUND_TRIP_OUTCOMES.len()
+        + outcome;
+    ARB_ROUND_TRIP_BY_DEX_PAIR_TOTAL[idx].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record authoritative pool-identity admission without address labels.
+pub fn record_arb_pool_identity_check(dex: &str, outcome: &str) {
+    let dex = arb_forensics_label_index(&ARB_FORENSICS_DEX_LABELS, dex);
+    let outcome = arb_forensics_label_index(&ARB_FORENSICS_IDENTITY_OUTCOMES, outcome);
+    let idx = dex * ARB_FORENSICS_IDENTITY_OUTCOMES.len() + outcome;
+    ARB_POOL_IDENTITY_CHECK_TOTAL[idx].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record checked-arithmetic and quote-contract violations with bounded labels.
+pub fn record_arb_quote_invariant_violation(dex: &str, invariant: &str) {
+    let dex = arb_forensics_label_index(&ARB_FORENSICS_DEX_LABELS, dex);
+    let invariant = arb_forensics_label_index(&ARB_FORENSICS_INVARIANTS, invariant);
+    let idx = dex * ARB_FORENSICS_INVARIANTS.len() + invariant;
+    ARB_QUOTE_INVARIANT_VIOLATION_TOTAL[idx].fetch_add(1, Ordering::Relaxed);
+}
 pub static ARB_TRACK_REMOVED_BUDGET_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_REMOVED_STALE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_REMOVED_COOLDOWN_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -8704,6 +8780,62 @@ fn append_arb_two_hop_v2_formable_gate_histograms(out: &mut String) {
     }
 }
 
+fn append_arb_forensics_metrics(out: &mut String) {
+    for (buy_idx, buy_dex) in ARB_FORENSICS_DEX_LABELS.iter().enumerate() {
+        for (sell_idx, sell_dex) in ARB_FORENSICS_DEX_LABELS.iter().enumerate() {
+            for (outcome_idx, outcome) in ARB_FORENSICS_ROUND_TRIP_OUTCOMES.iter().enumerate() {
+                let idx = (buy_idx * ARB_FORENSICS_DEX_LABELS.len() + sell_idx)
+                    * ARB_FORENSICS_ROUND_TRIP_OUTCOMES.len()
+                    + outcome_idx;
+                out.push_str(&format!(
+                    "arb_round_trip_by_dex_pair_total{{buy_dex=\"{buy_dex}\",sell_dex=\"{sell_dex}\",outcome=\"{outcome}\"}} {}\n",
+                    ARB_ROUND_TRIP_BY_DEX_PAIR_TOTAL[idx].load(Ordering::Relaxed)
+                ));
+            }
+        }
+    }
+    for (dex_idx, dex) in ARB_FORENSICS_DEX_LABELS.iter().enumerate() {
+        for (outcome_idx, outcome) in ARB_FORENSICS_IDENTITY_OUTCOMES.iter().enumerate() {
+            let idx = dex_idx * ARB_FORENSICS_IDENTITY_OUTCOMES.len() + outcome_idx;
+            out.push_str(&format!(
+                "arb_pool_identity_check_total{{dex=\"{dex}\",outcome=\"{outcome}\"}} {}\n",
+                ARB_POOL_IDENTITY_CHECK_TOTAL[idx].load(Ordering::Relaxed)
+            ));
+        }
+        for (invariant_idx, invariant) in ARB_FORENSICS_INVARIANTS.iter().enumerate() {
+            let idx = dex_idx * ARB_FORENSICS_INVARIANTS.len() + invariant_idx;
+            out.push_str(&format!(
+                "arb_quote_invariant_violation_total{{dex=\"{dex}\",invariant=\"{invariant}\"}} {}\n",
+                ARB_QUOTE_INVARIANT_VIOLATION_TOTAL[idx].load(Ordering::Relaxed)
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod arb_forensics_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn dex_pair_and_identity_metrics_are_exported_with_bounded_labels() {
+        record_arb_round_trip_by_dex_pair("orca", "meteora_dlmm", "spread_above");
+        record_arb_pool_identity_check("pump_amm", "mismatch");
+        record_arb_quote_invariant_violation("unknown_future_dex", "unknown_future_reason");
+
+        let mut out = String::new();
+        append_arb_forensics_metrics(&mut out);
+        assert!(out.contains("arb_round_trip_by_dex_pair_total{buy_dex=\"orca\",sell_dex=\"meteora_dlmm\",outcome=\"spread_above\"}"));
+        assert!(
+            out.contains("arb_pool_identity_check_total{dex=\"pump_amm\",outcome=\"mismatch\"}")
+        );
+        assert!(
+            out.contains("arb_quote_invariant_violation_total{dex=\"other\",invariant=\"other\"}")
+        );
+        assert!(!out.contains("unknown_future_dex"));
+        assert!(!out.contains("unknown_future_reason"));
+    }
+}
+
 /// Append `_bucket{le=...}`, `_sum`, `_count` lines (same layout as `tx_slot_to_send_ms`).
 fn append_momentum_latency_histogram_prometheus(
     out: &mut String,
@@ -11659,6 +11791,7 @@ async fn metrics_response() -> Response<Body> {
     );
     out.push('\n');
     append_arb_two_hop_v2_formable_gate_histograms(&mut out);
+    append_arb_forensics_metrics(&mut out);
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "arb_track_pin_before_first_screen_ms",

@@ -2837,6 +2837,68 @@
         "x": 20,
         "y": 107
       }
+    },
+    {
+      "type": "timeseries",
+      "title": "Arb V2 Terminal Funnel by DEX Pair",
+      "description": "Bounded-cardinality terminal outcomes. Exact pool/mint evidence is emitted as throttled arb_round_trip_forensics structured events.",
+      "targets": [
+        {
+          "expr": "sum by (buy_dex, sell_dex, outcome) (rate(arb_round_trip_by_dex_pair_total{job=\"arb-strategy\",outcome!=\"formable\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{buy_dex}} → {{sell_dex}}: {{outcome}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 110
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Arb Authoritative Identity Admission",
+      "targets": [
+        {
+          "expr": "sum by (dex, outcome) (rate(arb_pool_identity_check_total{job=\"arb-strategy\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{dex}}: {{outcome}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 110
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Arb Quote Invariant Violations",
+      "targets": [
+        {
+          "expr": "sum by (dex, invariant) (increase(arb_quote_invariant_violation_total{job=\"arb-strategy\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{dex}}: {{invariant}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 110
+      }
     }
   ]
 }
