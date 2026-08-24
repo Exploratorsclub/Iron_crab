@@ -544,9 +544,6 @@ impl GeyserTxListener {
                                                                         "geyser_tx_listener: Found instruction"
                                                                     );
                                                                     if program_ids.contains(program_pubkey) {
-                                                                        // Preserve the selected instruction's owner as an internal
-                                                                        // leading marker. The parser strips it before DEX layout parsing.
-                                                                        instruction_accounts.push(*program_pubkey);
                                                                         for &account_idx in &ix.accounts {
                                                                             if let Some(pubkey) =
                                                                                 account_keys.get(account_idx as usize)
@@ -572,7 +569,6 @@ impl GeyserTxListener {
                                                                                 inner_ix.program_id_index as usize,
                                                                             ) {
                                                                                 if program_ids.contains(program_pubkey) {
-                                                                                    instruction_accounts.push(*program_pubkey);
                                                                                     for &account_idx in &inner_ix.accounts {
                                                                                         if let Some(pubkey) = account_keys.get(
                                                                                             account_idx as usize,

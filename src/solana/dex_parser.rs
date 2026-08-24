@@ -229,17 +229,8 @@ pub fn parse_transaction_update_with_pool_lookup(
     update: &GeyserTransactionUpdate,
     pool_lookup: PoolLookupFn<'_>,
 ) -> Option<ParsedDexEvent> {
-    let mut normalized_update;
-    let (update, selected_program) = match update.instruction_accounts.first().copied() {
-        Some(program) if is_supported_dex_program(program) => {
-            normalized_update = update.clone();
-            normalized_update.instruction_accounts.remove(0);
-            (&normalized_update, Some(program))
-        }
-        _ => (update, None),
-    };
     // 1. Try top-level instruction first
-    if let Some(event) = try_parse_top_level(update, pool_lookup, selected_program) {
+    if let Some(event) = try_parse_top_level(update, pool_lookup) {
         return Some(event);
     }
 
@@ -255,7 +246,6 @@ pub fn parse_transaction_update_with_pool_lookup(
 fn try_parse_top_level(
     update: &GeyserTransactionUpdate,
     pool_lookup: PoolLookupFn<'_>,
-    selected_program: Option<Pubkey>,
 ) -> Option<ParsedDexEvent> {
     let raydium = Pubkey::from_str(RAYDIUM_AMM_V4).ok()?;
     let raydium_cpmm = Pubkey::from_str(RAYDIUM_CPMM).ok()?;
@@ -264,14 +254,14 @@ fn try_parse_top_level(
     let pumpfun = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
     let pumpfun_amm = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok()?;
 
-    let selected_program = selected_program.or_else(|| {
-        let known = [meteora, raydium_cpmm, pumpfun_amm, pumpfun, raydium, orca];
-        let mut present = known
-            .into_iter()
-            .filter(|program| update.account_keys.contains(program));
-        let only = present.next()?;
-        present.next().is_none().then_some(only)
-    })?;
+    let known = [meteora, raydium_cpmm, pumpfun_amm, pumpfun, raydium, orca];
+    let mut present = known
+        .into_iter()
+        .filter(|program| update.account_keys.contains(program));
+    let selected_program = present.next()?;
+    if present.next().is_some() {
+        return None;
+    }
 
     if selected_program == meteora {
         return parse_meteora_transaction(update);
@@ -364,20 +354,6 @@ fn try_parse_inner_instructions(
     }
 
     pump_amm_fallback
-}
-
-fn is_supported_dex_program(program: Pubkey) -> bool {
-    [
-        RAYDIUM_AMM_V4,
-        RAYDIUM_CPMM,
-        ORCA_WHIRLPOOL,
-        METEORA_DLMM,
-        PUMPFUN_PROGRAM,
-        PUMPFUN_AMM_PROGRAM,
-    ]
-    .iter()
-    .filter_map(|value| Pubkey::from_str(value).ok())
-    .any(|known| known == program)
 }
 
 // ============================================================================
@@ -2039,7 +2015,9 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
 mod tests {
     use super::*;
     use crate::solana::dex::pumpfun::PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR;
-    use crate::solana::geyser_listener::{GeyserTransactionUpdate, TokenAmount, TokenBalance};
+    use crate::solana::geyser_listener::{
+        GeyserTransactionUpdate, InnerInstruction, TokenAmount, TokenBalance,
+    };
     use std::time::Instant;
 
     #[test]
@@ -2051,22 +2029,23 @@ mod tests {
         let sol_mint = *SOL_MINT_PUBKEY;
         let token_program =
             Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
-        let instruction_accounts = vec![
-            orca,
-            token_program,
-            Pubkey::new_unique(),
-            pool,
-            Pubkey::new_unique(),
-        ];
+        let authority = Pubkey::new_unique();
+        let trader = Pubkey::new_unique();
+        let instruction_accounts = vec![token_program, authority, pool, trader];
+        let account_keys = vec![meteora, orca, token_program, authority, pool, trader];
         let mut instruction_data = ORCA_SWAP.to_vec();
         instruction_data.extend_from_slice(&[0u8; 34]);
         let update = GeyserTransactionUpdate {
             signature: "multi-dex-router".to_string(),
             slot: 1,
-            account_keys: vec![meteora, orca],
+            account_keys,
             instruction_accounts,
-            instruction_data,
-            inner_instructions: vec![],
+            instruction_data: instruction_data.clone(),
+            inner_instructions: vec![InnerInstruction {
+                program_id_index: 1,
+                accounts: vec![2, 3, 4, 5],
+                data: instruction_data,
+            }],
             pre_token_balances: vec![],
             post_token_balances: vec![],
             pre_balances: vec![],
