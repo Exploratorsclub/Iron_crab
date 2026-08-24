@@ -9452,6 +9452,8 @@ mod event_pipeline_tests {
     fn arb_trade_identity_requires_account_seeded_matching_pool_metadata() {
         let mint = Pubkey::new_unique();
         let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let wrong_pool = Pubkey::new_unique();
         let mut state = ironcrab::execution::live_pool_cache::orca_whirlpool_tx_layout_seed(
             mint,
             sol,
@@ -9480,6 +9482,57 @@ mod event_pipeline_tests {
             &mint_str,
             NATIVE_SOL_MINT,
         ));
+
+        let cache = ironcrab::execution::live_pool_cache::create_shared_cache();
+        let ctx = test_arb_context(cache.clone());
+        let apply = |pool: Pubkey, mint: &str, dex: &str| {
+            ctx.apply_trade_to_tracker(
+                &pool.to_string(),
+                mint,
+                NATIVE_SOL_MINT,
+                1_000_000,
+                1_000_000,
+                6,
+                true,
+                dex,
+            )
+        };
+
+        assert!(apply(pool, &mint_str, "orca").is_none(), "missing address");
+        let unseeded = ironcrab::execution::live_pool_cache::orca_whirlpool_tx_layout_seed(
+            mint,
+            sol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        cache.upsert(pool, CachedPoolState::Orca(unseeded.clone()), 1);
+        assert!(
+            apply(pool, &mint_str, "orca").is_none(),
+            "unseeded metadata"
+        );
+        let mut authoritative = unseeded;
+        authoritative.whirlpool_quote_account_seeded = true;
+        cache.upsert(pool, CachedPoolState::Orca(authoritative), 2);
+        assert!(
+            apply(pool, &mint_str, "meteora_dlmm").is_none(),
+            "wrong DEX"
+        );
+        assert!(
+            apply(pool, &Pubkey::new_unique().to_string(), "orca").is_none(),
+            "wrong mint pair"
+        );
+        assert!(
+            apply(wrong_pool, &mint_str, "orca").is_none(),
+            "wrong address"
+        );
+        assert!(
+            ctx.trackers.read().is_empty(),
+            "rejected trades must not mutate trackers"
+        );
+        assert!(
+            apply(pool, &mint_str, "orca").is_some(),
+            "all four checks pass"
+        );
     }
 
     fn sample_trade_event(pool: &str) -> MarketEvent {

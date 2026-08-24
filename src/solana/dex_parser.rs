@@ -267,14 +267,24 @@ fn try_parse_top_level(
             .truncate(stripped.instruction_accounts.len() - 2);
         (selected, Some(stripped))
     } else {
-        let mut present = known
+        let present: Vec<Pubkey> = known
             .into_iter()
-            .filter(|program| update.account_keys.contains(program));
-        let selected = present.next()?;
-        if present.next().is_some() {
-            return None;
+            .filter(|program| update.account_keys.contains(program))
+            .collect();
+        if present.len() > 1 {
+            let mut parsed = present.into_iter().filter_map(|program| match program {
+                p if p == meteora => parse_meteora_transaction(update),
+                p if p == raydium_cpmm => parse_raydium_cpmm_transaction(update),
+                p if p == pumpfun_amm => parse_pumpfun_amm_transaction(update),
+                p if p == pumpfun => parse_pumpfun_transaction(update),
+                p if p == raydium => parse_raydium_transaction(update),
+                p if p == orca => parse_orca_transaction(update, pool_lookup),
+                _ => None,
+            });
+            let event = parsed.next()?;
+            return parsed.next().is_none().then_some(event);
         }
-        (selected, None)
+        (*present.first()?, None)
     };
     let update = parsed_update.as_ref().unwrap_or(update);
 
@@ -2097,6 +2107,58 @@ mod tests {
                 dex: DexType::OrcaWhirlpool,
                 ..
             }) if pool_address == pool
+        ));
+    }
+
+    #[test]
+    fn unique_valid_layout_wins_when_legacy_update_lacks_program_provenance() {
+        let orca = Pubkey::from_str(ORCA_WHIRLPOOL).unwrap();
+        let meteora = Pubkey::from_str(METEORA_DLMM).unwrap();
+        let pool = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let token_program =
+            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let mut instruction_data = ORCA_SWAP.to_vec();
+        instruction_data.extend_from_slice(&[0u8; 34]);
+        let update = GeyserTransactionUpdate {
+            signature: "legacy-multi-dex".to_string(),
+            slot: 1,
+            account_keys: vec![meteora, orca, token_program, Pubkey::new_unique(), pool],
+            instruction_accounts: vec![
+                token_program,
+                Pubkey::new_unique(),
+                pool,
+                Pubkey::new_unique(),
+            ],
+            instruction_data,
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![],
+            post_balances: vec![],
+            fee_lamports: 0,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+        let lookup = |candidate: &Pubkey| {
+            (*candidate == pool).then_some(OrcaPoolInfo {
+                token_mint_a: *SOL_MINT_PUBKEY,
+                token_mint_b: token_mint,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: Some(0),
+                tick_spacing: Some(64),
+                token_a_program: Some(token_program),
+                token_b_program: Some(token_program),
+            })
+        };
+
+        assert!(matches!(
+            parse_transaction_update_with_pool_lookup(&update, Some(&lookup)),
+            Some(ParsedDexEvent::Trade {
+                dex: DexType::OrcaWhirlpool,
+                ..
+            })
         ));
     }
 
