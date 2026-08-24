@@ -134,6 +134,10 @@ pub struct GeyserTransactionUpdate {
     pub signature: String,
     pub slot: u64,
     pub account_keys: Vec<Pubkey>,
+    /// Program that owns `instruction_accounts` / `instruction_data`.
+    /// Preserved explicitly so routed transactions cannot be parsed as a different DEX
+    /// merely because another DEX program also appears in `account_keys`.
+    pub instruction_program_id: Option<Pubkey>,
     /// First instruction's account indices (for Pump.fun Create)
     pub instruction_accounts: Vec<Pubkey>,
     /// Instruction data (first 8 bytes = discriminator)
@@ -503,6 +507,7 @@ impl GeyserTxListener {
                                                     };
                                                     let mut account_keys = Vec::new();
                                                     let mut instruction_accounts = Vec::new();
+                                                    let mut instruction_program_id = None;
                                                     let mut instruction_data = Vec::new();
                                                     if let Some(transaction) = &tx.transaction {
                                                         if let Some(message) = &transaction.message {
@@ -544,6 +549,7 @@ impl GeyserTxListener {
                                                                         "geyser_tx_listener: Found instruction"
                                                                     );
                                                                     if program_ids.contains(program_pubkey) {
+                                                                        instruction_program_id = Some(*program_pubkey);
                                                                         for &account_idx in &ix.accounts {
                                                                             if let Some(pubkey) =
                                                                                 account_keys.get(account_idx as usize)
@@ -569,6 +575,7 @@ impl GeyserTxListener {
                                                                                 inner_ix.program_id_index as usize,
                                                                             ) {
                                                                                 if program_ids.contains(program_pubkey) {
+                                                                                    instruction_program_id = Some(*program_pubkey);
                                                                                     for &account_idx in &inner_ix.accounts {
                                                                                         if let Some(pubkey) = account_keys.get(
                                                                                             account_idx as usize,
@@ -670,6 +677,7 @@ impl GeyserTxListener {
                                                         signature,
                                                         slot: tx_update.slot,
                                                         account_keys,
+                                                        instruction_program_id,
                                                         instruction_accounts,
                                                         instruction_data,
                                                         inner_instructions,

@@ -765,6 +765,7 @@ mod pool_discovery_ingest_tests {
             signature: "testsig".to_string(),
             slot: 42,
             account_keys: vec![pump],
+            instruction_program_id: Some(pump),
             instruction_accounts: ixs,
             instruction_data: vec![0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77, 0, 0, 0, 0],
             inner_instructions: vec![],

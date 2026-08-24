@@ -1511,6 +1511,46 @@ fn pool_state_mints(state: &CachedPoolState) -> (String, String) {
     }
 }
 
+/// Geyser-only admission guard for Trade events.
+///
+/// A transaction parser may identify a candidate pool before its account update arrives. That
+/// candidate must not create or mutate an arb tracker until the SLAVE LivePoolCache confirms the
+/// pool address, DEX and complete mint pair from DEX-owned account data. Orca/Meteora TX-layout
+/// seeds are deliberately insufficient because they are not account-authoritative quote state.
+fn cached_pool_authorizes_arb_trade(
+    state: &CachedPoolState,
+    dex: &str,
+    mint: &str,
+    quote_mint: &str,
+) -> bool {
+    let dex_matches = match state {
+        CachedPoolState::Orca(_) => matches!(dex, "orca" | "orca_whirlpool"),
+        CachedPoolState::RaydiumAmm(_) => {
+            matches!(dex, "raydium" | "raydium_amm" | "raydium_amm_v4")
+        }
+        CachedPoolState::RaydiumCpmm(_) => dex == "raydium_cpmm",
+        CachedPoolState::Meteora(_) => matches!(dex, "meteora" | "meteora_dlmm"),
+        CachedPoolState::MeteoraCpmm(_) => dex == "meteora_cpmm",
+        CachedPoolState::PumpFun(_) => dex == "pumpfun",
+        CachedPoolState::PumpAmm(_) => matches!(dex, "pump_amm" | "pumpswap" | "pump_swap_amm"),
+    };
+    if !dex_matches {
+        return false;
+    }
+
+    let account_authoritative = match state {
+        CachedPoolState::Orca(s) => s.whirlpool_quote_account_seeded,
+        CachedPoolState::Meteora(s) => s.dlmm_bin_params_account_seeded,
+        _ => true,
+    };
+    if !account_authoritative {
+        return false;
+    }
+
+    let (mint_a, mint_b) = pool_state_mints(state);
+    (mint == mint_a && quote_mint == mint_b) || (mint == mint_b && quote_mint == mint_a)
+}
+
 fn pool_state_has_arb_relevant_quote(state: &CachedPoolState) -> bool {
     let (mint_a, mint_b) = pool_state_mints(state);
     is_arb_relevant_pool_pair(&mint_a, &mint_b)
@@ -6465,6 +6505,26 @@ impl ArbContext {
             return None;
         }
 
+        let Ok(pool_pk) = Pubkey::from_str(pool_address) else {
+            debug!(pool = %pool_address, mint = %mint, dex = %dex, "Trade rejected: invalid pool pubkey");
+            return None;
+        };
+        let Some((cached_state, _, _)) = self.live_pool_cache.get_with_metadata(&pool_pk) else {
+            debug!(pool = %pool_address, mint = %mint, dex = %dex, "Trade deferred: pool absent from authoritative Geyser cache");
+            return None;
+        };
+        if !cached_pool_authorizes_arb_trade(&cached_state, dex, mint, quote_mint) {
+            debug!(
+                pool = %pool_address,
+                mint = %mint,
+                quote_mint = %quote_mint,
+                trade_dex = %dex,
+                cached_dex = %cached_state.dex_name(),
+                "Trade rejected: pool identity does not match authoritative Geyser cache"
+            );
+            return None;
+        }
+
         // DATA QUALITY: Reject trades with zero amounts (parser failed to extract token balance)
         if token_amount == 0 || sol_amount == 0 {
             self.zero_amount_trades.fetch_add(1, Ordering::Relaxed);
@@ -6594,17 +6654,15 @@ impl ArbContext {
         };
 
         self.apply_pending_pool_accounts(pool_address, mint, quote_mint);
-        if let Ok(pool_pk) = Pubkey::from_str(pool_address) {
-            if let Some((state, _, _)) = self.live_pool_cache.get_with_metadata(&pool_pk) {
-                let mut trackers = self.trackers.write();
-                if let Some(tracker) = trackers.get_mut(mint) {
-                    maybe_backfill_tracker_pool_accounts_from_cache(
-                        pool_pk,
-                        pool_address,
-                        &state,
-                        tracker,
-                    );
-                }
+        {
+            let mut trackers = self.trackers.write();
+            if let Some(tracker) = trackers.get_mut(mint) {
+                maybe_backfill_tracker_pool_accounts_from_cache(
+                    pool_pk,
+                    pool_address,
+                    &cached_state,
+                    tracker,
+                );
             }
         }
 
@@ -9362,6 +9420,63 @@ mod event_pipeline_tests {
     const TEST_BUILD: &str = "0.0.0";
     const TEST_RUN: &str = "run-test";
 
+    fn seed_test_raydium_trade_identity(cache: &SharedLivePoolCache, pool: Pubkey, mint: Pubkey) {
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(ironcrab::execution::live_pool_cache::RaydiumAmmState {
+                base_mint: mint,
+                quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 6,
+                quote_decimals: 9,
+                coin_reserve: Some(5_000_000),
+                pc_reserve: Some(10_000_000_000),
+                market_id: Pubkey::new_unique(),
+                serum_bids: Some(Pubkey::new_unique()),
+                serum_asks: Some(Pubkey::new_unique()),
+                serum_event_queue: Some(Pubkey::new_unique()),
+                serum_base_vault: Some(Pubkey::new_unique()),
+                serum_quote_vault: Some(Pubkey::new_unique()),
+            }),
+            1,
+        );
+    }
+
+    #[test]
+    fn arb_trade_identity_requires_account_seeded_matching_pool_metadata() {
+        let mint = Pubkey::new_unique();
+        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let mut state = ironcrab::execution::live_pool_cache::orca_whirlpool_tx_layout_seed(
+            mint,
+            sol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let mint_str = mint.to_string();
+
+        assert!(!cached_pool_authorizes_arb_trade(
+            &CachedPoolState::Orca(state.clone()),
+            "orca",
+            &mint_str,
+            NATIVE_SOL_MINT,
+        ));
+
+        state.whirlpool_quote_account_seeded = true;
+        assert!(cached_pool_authorizes_arb_trade(
+            &CachedPoolState::Orca(state.clone()),
+            "orca",
+            &mint_str,
+            NATIVE_SOL_MINT,
+        ));
+        assert!(!cached_pool_authorizes_arb_trade(
+            &CachedPoolState::Orca(state),
+            "meteora_dlmm",
+            &mint_str,
+            NATIVE_SOL_MINT,
+        ));
+    }
+
     fn sample_trade_event(pool: &str) -> MarketEvent {
         MarketEvent::new(
             TEST_COMPONENT,
@@ -9794,6 +9909,9 @@ mod event_pipeline_tests {
         use ironcrab::execution::live_pool_cache::create_shared_cache;
 
         let live_pool_cache = create_shared_cache();
+        let pool_pk = Pubkey::new_unique();
+        let mint_pk = Pubkey::new_unique();
+        seed_test_raydium_trade_identity(&live_pool_cache, pool_pk, mint_pk);
         let log_dir = std::env::temp_dir().join(format!("arb_coalesce_snap_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&log_dir).expect("test log dir");
         let jsonl_writer =
@@ -9850,13 +9968,13 @@ mod event_pipeline_tests {
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
-        let pool = "pool-coalesce-snap";
-        let mint = "TokenMint11111111111111111111111111111111";
-        ctx.handle_pool_created(pool, mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
+        let pool = pool_pk.to_string();
+        let mint = mint_pk.to_string();
+        ctx.handle_pool_created(&pool, &mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
 
         const COALESCED_SLOT: u64 = 99;
         ctx.coalesce_pool_state_update(
-            pool.to_string(),
+            pool.clone(),
             "raydium".to_string(),
             5_000_000,
             10_000_000_000,
@@ -9873,8 +9991,8 @@ mod event_pipeline_tests {
             ctx.tracker_write.try_enqueue(
                 ArbTrackerWriteJob::ApplyTrade {
                     job: ArbTwoHopTradeJob {
-                        pool_address: pool.to_string(),
-                        mint: mint.to_string(),
+                        pool_address: pool.clone(),
+                        mint: mint.clone(),
                         quote_mint: NATIVE_SOL_MINT.to_string(),
                         sol_amount: 10_000_000,
                         token_amount: 1_000_000,
@@ -9898,7 +10016,7 @@ mod event_pipeline_tests {
             .expect("ApplyTrade must succeed");
         let vault = apply_result
             .vault_balances
-            .get(pool)
+            .get(&pool)
             .expect("coalesced pool state must be in ApplyTrade snapshot");
         assert_eq!(
             vault.update_slot, COALESCED_SLOT,
@@ -9911,6 +10029,9 @@ mod event_pipeline_tests {
         use ironcrab::execution::live_pool_cache::create_shared_cache;
 
         let live_pool_cache = create_shared_cache();
+        let pool_pk = Pubkey::new_unique();
+        let mint_pk = Pubkey::new_unique();
+        seed_test_raydium_trade_identity(&live_pool_cache, pool_pk, mint_pk);
         let log_dir = std::env::temp_dir().join(format!("arb_writer_test_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&log_dir).expect("test log dir");
         let jsonl_writer =
@@ -9967,12 +10088,12 @@ mod event_pipeline_tests {
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
-        let pool = "pool-writer-decouple";
-        let mint = "TokenMint11111111111111111111111111111111";
-        ctx.handle_pool_created(pool, mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
+        let pool = pool_pk.to_string();
+        let mint = mint_pk.to_string();
+        ctx.handle_pool_created(&pool, &mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
 
         ctx.coalesce_pool_state_update(
-            pool.to_string(),
+            pool.clone(),
             "raydium".to_string(),
             5_000_000,
             10_000_000_000,
@@ -9989,8 +10110,8 @@ mod event_pipeline_tests {
             ctx.tracker_write.try_enqueue(
                 ArbTrackerWriteJob::ApplyTrade {
                     job: ArbTwoHopTradeJob {
-                        pool_address: pool.to_string(),
-                        mint: mint.to_string(),
+                        pool_address: pool.clone(),
+                        mint: mint.clone(),
                         quote_mint: NATIVE_SOL_MINT.to_string(),
                         sol_amount: 10_000_000,
                         token_amount: 1_000_000,
@@ -10015,7 +10136,7 @@ mod event_pipeline_tests {
         assert!(
             apply_result
                 .vault_balances
-                .get(pool)
+                .get(&pool)
                 .is_some_and(|v| v.update_slot == 42),
             "ApplyTrade snapshot must include flushed coalesced reserves"
         );
@@ -10378,6 +10499,15 @@ mod event_pipeline_tests {
         use ironcrab::execution::live_pool_cache::create_shared_cache;
 
         let live_pool_cache = create_shared_cache();
+        let mint_pk = Pubkey::new_unique();
+        let tracker_pool_pks = [
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        for pool in tracker_pool_pks {
+            seed_test_raydium_trade_identity(&live_pool_cache, pool, mint_pk);
+        }
         let log_dir = std::env::temp_dir().join(format!("arb_scoped_snap_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&log_dir).expect("test log dir");
         let jsonl_writer =
@@ -10407,8 +10537,8 @@ mod event_pipeline_tests {
                 },
             );
         }
-        let tracker_pools = ["pool-a", "pool-b", "pool-c"];
-        for pool in tracker_pools {
+        let tracker_pools = tracker_pool_pks.map(|pool| pool.to_string());
+        for pool in &tracker_pools {
             vault_balances.insert(
                 pool.to_string(),
                 VaultBalanceCache {
@@ -10467,9 +10597,9 @@ mod event_pipeline_tests {
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
-        let mint = "TokenMint11111111111111111111111111111111";
-        for pool in tracker_pools {
-            ctx.handle_pool_created(pool, mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
+        let mint = mint_pk.to_string();
+        for pool in &tracker_pools {
+            ctx.handle_pool_created(pool, &mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
         }
 
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -10479,7 +10609,7 @@ mod event_pipeline_tests {
                 ArbTrackerWriteJob::ApplyTrade {
                     job: ArbTwoHopTradeJob {
                         pool_address: tracker_pools[0].to_string(),
-                        mint: mint.to_string(),
+                        mint: mint.clone(),
                         quote_mint: NATIVE_SOL_MINT.to_string(),
                         sol_amount: 10_000_000,
                         token_amount: 1_000_000,
@@ -10512,7 +10642,7 @@ mod event_pipeline_tests {
             tracker_pools.len(),
             "scoped snapshot must include only tracker pools, not global cache"
         );
-        for pool in tracker_pools {
+        for pool in &tracker_pools {
             assert!(
                 apply_result.vault_balances.contains_key(pool),
                 "tracker pool {pool} missing from scoped vault snapshot"

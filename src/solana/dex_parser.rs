@@ -190,6 +190,9 @@ const RAYDIUM_INITIALIZE2: u8 = 1;
 // Meteora DLMM swap (Anchor: sighash("global:swap"))
 const METEORA_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
+// Orca Whirlpool swap (Anchor: sighash("global:swap")); program provenance disambiguates it.
+const ORCA_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+
 // Raydium CPMM swap (Anchor: similar pattern)
 const RAYDIUM_CPMM_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
@@ -251,22 +254,31 @@ fn try_parse_top_level(
     let pumpfun = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
     let pumpfun_amm = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok()?;
 
-    if update.account_keys.contains(&meteora) {
+    let selected_program = update.instruction_program_id.or_else(|| {
+        let known = [meteora, raydium_cpmm, pumpfun_amm, pumpfun, raydium, orca];
+        let mut present = known
+            .into_iter()
+            .filter(|program| update.account_keys.contains(program));
+        let only = present.next()?;
+        present.next().is_none().then_some(only)
+    })?;
+
+    if selected_program == meteora {
         return parse_meteora_transaction(update);
     }
-    if update.account_keys.contains(&raydium_cpmm) {
+    if selected_program == raydium_cpmm {
         return parse_raydium_cpmm_transaction(update);
     }
-    if update.account_keys.contains(&pumpfun_amm) {
+    if selected_program == pumpfun_amm {
         return parse_pumpfun_amm_transaction(update);
     }
-    if update.account_keys.contains(&pumpfun) {
+    if selected_program == pumpfun {
         return parse_pumpfun_transaction(update);
     }
-    if update.account_keys.contains(&raydium) {
+    if selected_program == raydium {
         return parse_raydium_transaction(update);
     }
-    if update.account_keys.contains(&orca) {
+    if selected_program == orca {
         return parse_orca_transaction(update, pool_lookup);
     }
 
@@ -307,6 +319,7 @@ fn try_parse_inner_instructions(
             .collect();
 
         let synth = GeyserTransactionUpdate {
+            instruction_program_id: Some(program_id),
             instruction_accounts,
             instruction_data: inner.data.clone(),
             inner_instructions: vec![], // avoid recursion; we only parse one level
@@ -592,9 +605,6 @@ fn parse_orca_transaction(
     if update.instruction_data.len() < 8 {
         return None;
     }
-
-    // Orca swap discriminator
-    const ORCA_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
     let disc = &update.instruction_data[0..8];
     if disc != ORCA_SWAP {
@@ -2010,6 +2020,63 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn selected_instruction_program_wins_in_multi_dex_transaction() {
+        let orca = Pubkey::from_str(ORCA_WHIRLPOOL).unwrap();
+        let meteora = Pubkey::from_str(METEORA_DLMM).unwrap();
+        let pool = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = *SOL_MINT_PUBKEY;
+        let token_program =
+            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let instruction_accounts = vec![
+            token_program,
+            Pubkey::new_unique(),
+            pool,
+            Pubkey::new_unique(),
+        ];
+        let mut instruction_data = ORCA_SWAP.to_vec();
+        instruction_data.extend_from_slice(&[0u8; 34]);
+        let update = GeyserTransactionUpdate {
+            signature: "multi-dex-router".to_string(),
+            slot: 1,
+            account_keys: vec![meteora, orca],
+            instruction_program_id: Some(orca),
+            instruction_accounts,
+            instruction_data,
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![],
+            post_balances: vec![],
+            fee_lamports: 0,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+        let lookup = |candidate: &Pubkey| {
+            (*candidate == pool).then_some(OrcaPoolInfo {
+                token_mint_a: sol_mint,
+                token_mint_b: token_mint,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: Some(0),
+                tick_spacing: Some(64),
+                token_a_program: Some(token_program),
+                token_b_program: Some(token_program),
+            })
+        };
+
+        let parsed = parse_transaction_update_with_pool_lookup(&update, Some(&lookup));
+        assert!(matches!(
+            parsed,
+            Some(ParsedDexEvent::Trade {
+                pool_address,
+                dex: DexType::OrcaWhirlpool,
+                ..
+            }) if pool_address == pool
+        ));
+    }
+
+    #[test]
     fn test_dex_type_display() {
         assert_eq!(DexType::RaydiumAmmV4.to_string(), "raydium");
         assert_eq!(DexType::OrcaWhirlpool.to_string(), "orca");
@@ -2040,6 +2107,7 @@ mod tests {
             signature: "test_sig".to_string(),
             slot: 100,
             account_keys,
+            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2168,6 +2236,7 @@ mod tests {
             signature: "sell_synth_sig".to_string(),
             slot: 200,
             account_keys,
+            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2296,6 +2365,7 @@ mod tests {
             signature: "sell_ext_synth_sig".to_string(),
             slot: 201,
             account_keys,
+            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2424,6 +2494,7 @@ mod tests {
             signature: "sell_26_synth_sig".to_string(),
             slot: 202,
             account_keys,
+            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2549,6 +2620,7 @@ mod tests {
             signature: "inner_cpi_sell_sig".to_string(),
             slot: 203,
             account_keys: account_keys.clone(),
+            instruction_program_id: None,
             instruction_accounts: vec![user],
             instruction_data: vec![0u8; 8],
             inner_instructions: vec![InnerInstruction {
@@ -2640,6 +2712,7 @@ mod tests {
                 .to_string(),
             slot: 421_716_594,
             account_keys,
+            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2734,6 +2807,7 @@ mod tests {
             signature: "synth_buy_exact_sol".to_string(),
             slot: 1,
             account_keys,
+            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2819,6 +2893,7 @@ mod tests {
             signature: "legacy_buy_curve".to_string(),
             slot: 2,
             account_keys,
+            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
@@ -2893,6 +2968,7 @@ mod tests {
             signature: "raydium_buy_regression".to_string(),
             slot: 3,
             account_keys,
+            instruction_program_id: None,
             instruction_accounts,
             instruction_data,
             inner_instructions: vec![],
