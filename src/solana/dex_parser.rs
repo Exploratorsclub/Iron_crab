@@ -190,6 +190,9 @@ const RAYDIUM_INITIALIZE2: u8 = 1;
 // Meteora DLMM swap (Anchor: sighash("global:swap"))
 const METEORA_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
+// Orca Whirlpool swap (Anchor: sighash("global:swap")); program provenance disambiguates it.
+const ORCA_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+
 // Raydium CPMM swap (Anchor: similar pattern)
 const RAYDIUM_CPMM_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
@@ -251,22 +254,56 @@ fn try_parse_top_level(
     let pumpfun = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
     let pumpfun_amm = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok()?;
 
-    if update.account_keys.contains(&meteora) {
+    let known = [meteora, raydium_cpmm, pumpfun_amm, pumpfun, raydium, orca];
+    let (selected_program, parsed_update) = if update.instruction_accounts.len() >= 2
+        && update.instruction_accounts[update.instruction_accounts.len() - 2]
+            == crate::solana::geyser_listener::INSTRUCTION_PROGRAM_TRAILER
+        && known.contains(update.instruction_accounts.last()?)
+    {
+        let selected = *update.instruction_accounts.last()?;
+        let mut stripped = update.clone();
+        stripped
+            .instruction_accounts
+            .truncate(stripped.instruction_accounts.len() - 2);
+        (selected, Some(stripped))
+    } else {
+        let present: Vec<Pubkey> = known
+            .into_iter()
+            .filter(|program| update.account_keys.contains(program))
+            .collect();
+        if present.len() > 1 {
+            let mut parsed = present.into_iter().filter_map(|program| match program {
+                p if p == meteora => parse_meteora_transaction(update),
+                p if p == raydium_cpmm => parse_raydium_cpmm_transaction(update),
+                p if p == pumpfun_amm => parse_pumpfun_amm_transaction(update),
+                p if p == pumpfun => parse_pumpfun_transaction(update),
+                p if p == raydium => parse_raydium_transaction(update),
+                p if p == orca => parse_orca_transaction(update, pool_lookup),
+                _ => None,
+            });
+            let event = parsed.next()?;
+            return parsed.next().is_none().then_some(event);
+        }
+        (*present.first()?, None)
+    };
+    let update = parsed_update.as_ref().unwrap_or(update);
+
+    if selected_program == meteora {
         return parse_meteora_transaction(update);
     }
-    if update.account_keys.contains(&raydium_cpmm) {
+    if selected_program == raydium_cpmm {
         return parse_raydium_cpmm_transaction(update);
     }
-    if update.account_keys.contains(&pumpfun_amm) {
+    if selected_program == pumpfun_amm {
         return parse_pumpfun_amm_transaction(update);
     }
-    if update.account_keys.contains(&pumpfun) {
+    if selected_program == pumpfun {
         return parse_pumpfun_transaction(update);
     }
-    if update.account_keys.contains(&raydium) {
+    if selected_program == raydium {
         return parse_raydium_transaction(update);
     }
-    if update.account_keys.contains(&orca) {
+    if selected_program == orca {
         return parse_orca_transaction(update, pool_lookup);
     }
 
@@ -592,9 +629,6 @@ fn parse_orca_transaction(
     if update.instruction_data.len() < 8 {
         return None;
     }
-
-    // Orca swap discriminator
-    const ORCA_SWAP: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
     let disc = &update.instruction_data[0..8];
     if disc != ORCA_SWAP {
@@ -2006,8 +2040,127 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
 mod tests {
     use super::*;
     use crate::solana::dex::pumpfun::PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR;
-    use crate::solana::geyser_listener::{GeyserTransactionUpdate, TokenAmount, TokenBalance};
+    use crate::solana::geyser_listener::{
+        GeyserTransactionUpdate, InnerInstruction, TokenAmount, TokenBalance,
+    };
     use std::time::Instant;
+
+    #[test]
+    fn selected_instruction_program_wins_in_multi_dex_transaction() {
+        let orca = Pubkey::from_str(ORCA_WHIRLPOOL).unwrap();
+        let meteora = Pubkey::from_str(METEORA_DLMM).unwrap();
+        let pool = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = *SOL_MINT_PUBKEY;
+        let token_program =
+            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let authority = Pubkey::new_unique();
+        let trader = Pubkey::new_unique();
+        let instruction_accounts = vec![
+            token_program,
+            authority,
+            pool,
+            trader,
+            crate::solana::geyser_listener::INSTRUCTION_PROGRAM_TRAILER,
+            orca,
+        ];
+        let account_keys = vec![meteora, orca, token_program, authority, pool, trader];
+        let mut instruction_data = ORCA_SWAP.to_vec();
+        instruction_data.extend_from_slice(&[0u8; 34]);
+        let update = GeyserTransactionUpdate {
+            signature: "multi-dex-router".to_string(),
+            slot: 1,
+            account_keys,
+            instruction_accounts,
+            instruction_data: instruction_data.clone(),
+            inner_instructions: vec![InnerInstruction {
+                program_id_index: 1,
+                accounts: vec![2, 3, 4, 5],
+                data: instruction_data,
+            }],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![],
+            post_balances: vec![],
+            fee_lamports: 0,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+        let lookup = |candidate: &Pubkey| {
+            (*candidate == pool).then_some(OrcaPoolInfo {
+                token_mint_a: sol_mint,
+                token_mint_b: token_mint,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: Some(0),
+                tick_spacing: Some(64),
+                token_a_program: Some(token_program),
+                token_b_program: Some(token_program),
+            })
+        };
+
+        let parsed = parse_transaction_update_with_pool_lookup(&update, Some(&lookup));
+        assert!(matches!(
+            parsed,
+            Some(ParsedDexEvent::Trade {
+                pool_address,
+                dex: DexType::OrcaWhirlpool,
+                ..
+            }) if pool_address == pool
+        ));
+    }
+
+    #[test]
+    fn unique_valid_layout_wins_when_legacy_update_lacks_program_provenance() {
+        let orca = Pubkey::from_str(ORCA_WHIRLPOOL).unwrap();
+        let meteora = Pubkey::from_str(METEORA_DLMM).unwrap();
+        let pool = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let token_program =
+            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let mut instruction_data = ORCA_SWAP.to_vec();
+        instruction_data.extend_from_slice(&[0u8; 34]);
+        let update = GeyserTransactionUpdate {
+            signature: "legacy-multi-dex".to_string(),
+            slot: 1,
+            account_keys: vec![meteora, orca, token_program, Pubkey::new_unique(), pool],
+            instruction_accounts: vec![
+                token_program,
+                Pubkey::new_unique(),
+                pool,
+                Pubkey::new_unique(),
+            ],
+            instruction_data,
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![],
+            post_balances: vec![],
+            fee_lamports: 0,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+        let lookup = |candidate: &Pubkey| {
+            (*candidate == pool).then_some(OrcaPoolInfo {
+                token_mint_a: *SOL_MINT_PUBKEY,
+                token_mint_b: token_mint,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: Some(0),
+                tick_spacing: Some(64),
+                token_a_program: Some(token_program),
+                token_b_program: Some(token_program),
+            })
+        };
+
+        assert!(matches!(
+            parse_transaction_update_with_pool_lookup(&update, Some(&lookup)),
+            Some(ParsedDexEvent::Trade {
+                dex: DexType::OrcaWhirlpool,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn test_dex_type_display() {
