@@ -131,9 +131,7 @@ pub fn record_arb_pin_quality_anchor(pool: &str, pin_ts_ms: u64) {
         return;
     }
     let key = stable_hash(pool);
-    if !admit_key(&mut COHORT_STATE.lock(), key, pin_ts_ms) {
-        return;
-    }
+    admit_key(&mut COHORT_STATE.lock(), key, pin_ts_ms);
 }
 
 /// Register a published pin and its latency anchor in the publishing process.
