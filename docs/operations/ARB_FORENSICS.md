@@ -49,3 +49,29 @@ The funnel invariant is:
 formable = slot_delta + leg_too_old + spread_below + spread_above + profit_below + passed
            + arithmetic_invalid
 ```
+
+## Deterministic pinned-pool quality cohort
+
+`arb_pin_quality_cohort_member` selects pools with stable FNV-1a hashing at a fixed 1/16 rate.
+Market-data and arb-strategy therefore trace the same bounded cohort without another topic, RPC,
+or address label. Reconcile snapshots preserve the first pin timestamp in each process.
+
+The stage sequence is:
+
+```text
+pin_published -> pin_received -> subscription -> master_update
+              -> slave_update -> tracker_seeded -> quote_ready
+```
+
+- `arb_pin_quality_cohort_stage_pools{stage,outcome}` counts unique cohort pools per process.
+- `arb_pin_quality_stage_latency_ms{stage}` measures first-pin to first-stage latency.
+- `arb_pin_quality_slot_updates_total{outcome}` classifies every cohort update as `forward`,
+  `duplicate`, or `regression`.
+- Subscription outcomes distinguish missing cache layout, vault registration, and DLMM bins.
+- Master/slave outcomes distinguish complete from zero-sided reserve state.
+- Arb identity mismatches mark the affected cohort pool before admission is rejected.
+
+Pool addresses are emitted only in existing deferred-registration logs and bounded
+`kind="arb_pin_quality"` slot-regression warnings. A clean verification run requires no slot
+regressions, no unexplained `missing_*` cohort pools after warmup, and convergence from
+`pin_received` through `quote_ready`. The arb slot gate remains unchanged until that proof holds.

@@ -29,6 +29,10 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
+use ironcrab::arb_quality::{
+    arb_pin_quality_cohort_member, record_arb_pin_quality_completeness, record_arb_pin_quality_pin,
+    record_arb_pin_quality_slot, record_arb_pin_quality_stage,
+};
 use ironcrab::arbitrage::in_flight::{
     in_flight_key_from_intent_metadata, InFlightArbKey, InFlightArbRegistry,
 };
@@ -3779,6 +3783,13 @@ impl TokenArbTracker {
 
         let buy_as_of_slot = selection.buy_quote.as_of_slot;
         let sell_as_of_slot = selection.sell_quote.as_of_slot;
+        record_arb_pin_quality_stage(&selection.buy_pool_address, "quote_ready", "complete", None);
+        record_arb_pin_quality_stage(
+            &selection.sell_pool_address,
+            "quote_ready",
+            "complete",
+            None,
+        );
         let slot_delta = buy_as_of_slot.abs_diff(sell_as_of_slot);
         record_arb_quote_pair_slot_delta(buy_as_of_slot, sell_as_of_slot);
         if config.arb_max_leg_slot_delta > 0 && slot_delta > config.arb_max_leg_slot_delta {
@@ -6701,6 +6712,8 @@ impl ArbContext {
         };
         if !cached_pool_authorizes_arb_trade(&cached_state, dex, mint, quote_mint) {
             record_arb_pool_identity_check(dex, "mismatch");
+            record_arb_pin_quality_stage(pool_address, "slave_update", "identity_mismatch", None);
+            record_arb_pin_quality_completeness(pool_address, dex, "identity_mismatch");
             debug!(
                 pool = %pool_address,
                 mint = %mint,
@@ -7523,6 +7536,12 @@ impl ArbContext {
             return;
         }
 
+        for chunk in &chunks {
+            for entry in &chunk.active {
+                record_arb_pin_quality_pin(&entry.pool, chunk.ts_unix_ms);
+            }
+        }
+
         self.arb_track_published
             .fetch_add(chunks.len() as u64, Ordering::Relaxed);
         tokio::spawn(async move {
@@ -8226,6 +8245,21 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
 
 fn apply_pool_cache_jetstream_message(ctx: &ArbContext, update: PoolCacheUpdate) {
     arb_strategy_pool_cache_update_seen_inc();
+    let cohort = arb_pin_quality_cohort_member(&update.pool_address);
+    if cohort {
+        let slot_outcome = record_arb_pin_quality_slot(&update.pool_address, update.geyser_slot);
+        if slot_outcome == "regression" {
+            warn!(
+                kind = "arb_pin_quality",
+                stage = "slave_update",
+                outcome = "slot_regression",
+                pool = %update.pool_address,
+                dex = %update.dex,
+                geyser_slot = update.geyser_slot,
+                "Cohort PoolCacheUpdate regressed in slot"
+            );
+        }
+    }
     if !matches!(update.update_type, PoolCacheUpdateType::PoolRemoved)
         && arb_tracked_token_mint(&update.base_mint, &update.quote_mint).is_none()
     {
@@ -8237,6 +8271,20 @@ fn apply_pool_cache_jetstream_message(ctx: &ArbContext, update: PoolCacheUpdate)
         ctx.multi_hop.as_ref(),
         &update,
     ) {
+        if cohort {
+            let outcome = if update.base_reserve == 0 || update.quote_reserve == 0 {
+                "missing_vault"
+            } else {
+                "complete"
+            };
+            record_arb_pin_quality_stage(
+                &update.pool_address,
+                "slave_update",
+                outcome,
+                Some(update.header.ts_unix_ms),
+            );
+            record_arb_pin_quality_completeness(&update.pool_address, &update.dex, outcome);
+        }
         ctx.multi_hop
             .touch_live_pool_quote_ready(&update.pool_address);
         if !ctx.tracker_write.try_enqueue(
@@ -8245,6 +8293,12 @@ fn apply_pool_cache_jetstream_message(ctx: &ArbContext, update: PoolCacheUpdate)
             },
             ArbTrackerWriteJobType::SeedPoolCache,
         ) {
+            record_arb_pin_quality_stage(
+                &update.pool_address,
+                "tracker_seeded",
+                "queue_drop",
+                Some(update.header.ts_unix_ms),
+            );
             debug!(
                 pool = %update.pool_address,
                 "Dropped PoolCache tracker seed (single-writer queue full)"
@@ -8285,6 +8339,12 @@ fn process_arb_tracker_write_job(ctx: Arc<ArbContext>, job: ArbTrackerWriteJob) 
             let vault_seeded = ctx.consume_vault_seed_from_pool_cache_update(&update);
             let tracker_seeded = ctx.seed_trackers_for_pool_cache_update(&update);
             if tracker_seeded || vault_seeded {
+                record_arb_pin_quality_stage(
+                    &update.pool_address,
+                    "tracker_seeded",
+                    "complete",
+                    Some(update.header.ts_unix_ms),
+                );
                 arb_strategy_pool_cache_update_seeded_inc();
                 if let Some(mint) = arb_tracked_token_mint(&update.base_mint, &update.quote_mint) {
                     ctx.publish_proactive_arb_track_for_mint(mint);

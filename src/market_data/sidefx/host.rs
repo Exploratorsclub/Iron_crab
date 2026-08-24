@@ -76,6 +76,11 @@ pub trait SidefxWorkerHost: Send + Sync {
     /// True when pool is in momentum/arb hot set (arb-pinned DLMM PoolStateUpdate gate).
     fn is_hot_pool(&self, pool: &Pubkey) -> bool;
 
+    /// True only for the Arb consumer pin; used by bounded data-quality instrumentation.
+    fn is_arb_pinned(&self, _pool: &Pubkey) -> bool {
+        false
+    }
+
     /// Scope C: open-position pin on a PumpFun bonding-curve pool (EXEC_HOT publish guarantee).
     fn is_open_position_pumpfun_pin(&self, pool: &Pubkey) -> bool;
 

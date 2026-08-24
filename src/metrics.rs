@@ -7,6 +7,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::arb_quality::append_arb_pin_quality_metrics;
+
 /// Recent trade record for dashboard display
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecentTrade {
@@ -11792,6 +11794,7 @@ async fn metrics_response() -> Response<Body> {
     out.push('\n');
     append_arb_two_hop_v2_formable_gate_histograms(&mut out);
     append_arb_forensics_metrics(&mut out);
+    append_arb_pin_quality_metrics(&mut out);
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "arb_track_pin_before_first_screen_ms",

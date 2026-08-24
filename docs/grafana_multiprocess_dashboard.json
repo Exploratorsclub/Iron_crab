@@ -2899,6 +2899,86 @@
         "x": 18,
         "y": 110
       }
+    },
+    {
+      "type": "row",
+      "title": "Arb Pinned Data Quality Cohort (Deterministic 1/16)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 118
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Cohort Stage Completeness",
+      "description": "Unique deterministic cohort pools reaching each Geyser-only pipeline stage. Addresses remain exclusively in throttled structured logs.",
+      "targets": [
+        {
+          "expr": "sum by (job, stage, outcome) (arb_pin_quality_cohort_stage_pools{job=~\"market-data|arb-strategy\"})",
+          "refId": "A",
+          "legendFormat": "{{job}} {{stage}}: {{outcome}}"
+        },
+        {
+          "expr": "sum by (job, dex, outcome) (arb_pin_quality_completeness_pools{job=~\"market-data|arb-strategy\"})",
+          "refId": "B",
+          "legendFormat": "{{job}} {{dex}}: {{outcome}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 0,
+        "y": 119
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Cohort Pin-to-Stage Latency",
+      "description": "Average wall-clock latency from the first observed pin timestamp to each stage; no RPC is involved.",
+      "targets": [
+        {
+          "expr": "sum by (job, stage) (arb_pin_quality_stage_latency_ms_sum{job=~\"market-data|arb-strategy\"}) / clamp_min(sum by (job, stage) (arb_pin_quality_stage_latency_ms_count{job=~\"market-data|arb-strategy\"}), 1)",
+          "refId": "A",
+          "legendFormat": "{{job}} {{stage}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 7,
+        "x": 10,
+        "y": 119
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Cohort Slot Monotonicity",
+      "description": "Every cohort PoolCacheUpdate classified against the prior slot in that process. Any regression is a data-quality violation.",
+      "targets": [
+        {
+          "expr": "sum by (job, outcome) (rate(arb_pin_quality_slot_updates_total{job=~\"market-data|arb-strategy\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{job}}: {{outcome}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 7,
+        "x": 17,
+        "y": 119
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
     }
   ]
 }
