@@ -255,13 +255,28 @@ fn try_parse_top_level(
     let pumpfun_amm = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok()?;
 
     let known = [meteora, raydium_cpmm, pumpfun_amm, pumpfun, raydium, orca];
-    let mut present = known
-        .into_iter()
-        .filter(|program| update.account_keys.contains(program));
-    let selected_program = present.next()?;
-    if present.next().is_some() {
-        return None;
-    }
+    let (selected_program, parsed_update) = if update.instruction_accounts.len() >= 2
+        && update.instruction_accounts[update.instruction_accounts.len() - 2]
+            == crate::solana::geyser_listener::INSTRUCTION_PROGRAM_TRAILER
+        && known.contains(update.instruction_accounts.last()?)
+    {
+        let selected = *update.instruction_accounts.last()?;
+        let mut stripped = update.clone();
+        stripped
+            .instruction_accounts
+            .truncate(stripped.instruction_accounts.len() - 2);
+        (selected, Some(stripped))
+    } else {
+        let mut present = known
+            .into_iter()
+            .filter(|program| update.account_keys.contains(program));
+        let selected = present.next()?;
+        if present.next().is_some() {
+            return None;
+        }
+        (selected, None)
+    };
+    let update = parsed_update.as_ref().unwrap_or(update);
 
     if selected_program == meteora {
         return parse_meteora_transaction(update);
@@ -2031,7 +2046,14 @@ mod tests {
             Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
         let authority = Pubkey::new_unique();
         let trader = Pubkey::new_unique();
-        let instruction_accounts = vec![token_program, authority, pool, trader];
+        let instruction_accounts = vec![
+            token_program,
+            authority,
+            pool,
+            trader,
+            crate::solana::geyser_listener::INSTRUCTION_PROGRAM_TRAILER,
+            orca,
+        ];
         let account_keys = vec![meteora, orca, token_program, authority, pool, trader];
         let mut instruction_data = ORCA_SWAP.to_vec();
         instruction_data.extend_from_slice(&[0u8; 34]);

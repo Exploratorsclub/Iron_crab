@@ -154,6 +154,11 @@ pub struct GeyserTransactionUpdate {
     pub grpc_recv_at: Instant,
 }
 
+/// Internal trailer used to retain the selected top-level instruction program without changing
+/// the public transaction-update shape. The parser removes both trailer entries before handing
+/// instruction accounts to a DEX-specific layout parser.
+pub(crate) const INSTRUCTION_PROGRAM_TRAILER: Pubkey = Pubkey::new_from_array([0xA5; 32]);
+
 /// Event emitted when a new confirmed block is produced (from blocks_meta)
 #[derive(Debug, Clone)]
 pub struct GeyserBlockhashUpdate {
@@ -504,6 +509,7 @@ impl GeyserTxListener {
                                                     let mut account_keys = Vec::new();
                                                     let mut instruction_accounts = Vec::new();
                                                     let mut instruction_data = Vec::new();
+                                                    let mut instruction_program = None;
                                                     if let Some(transaction) = &tx.transaction {
                                                         if let Some(message) = &transaction.message {
                                                             for key in &message.account_keys {
@@ -544,6 +550,7 @@ impl GeyserTxListener {
                                                                         "geyser_tx_listener: Found instruction"
                                                                     );
                                                                     if program_ids.contains(program_pubkey) {
+                                                                        instruction_program = Some(*program_pubkey);
                                                                         for &account_idx in &ix.accounts {
                                                                             if let Some(pubkey) =
                                                                                 account_keys.get(account_idx as usize)
@@ -569,6 +576,7 @@ impl GeyserTxListener {
                                                                                 inner_ix.program_id_index as usize,
                                                                             ) {
                                                                                 if program_ids.contains(program_pubkey) {
+                                                                                    instruction_program = Some(*program_pubkey);
                                                                                     for &account_idx in &inner_ix.accounts {
                                                                                         if let Some(pubkey) = account_keys.get(
                                                                                             account_idx as usize,
@@ -594,6 +602,10 @@ impl GeyserTxListener {
                                                                 }
                                                             }
                                                         }
+                                                    }
+                                                    if let Some(program) = instruction_program {
+                                                        instruction_accounts.push(INSTRUCTION_PROGRAM_TRAILER);
+                                                        instruction_accounts.push(program);
                                                     }
                                                     let mut inner_instructions = Vec::new();
                                                     if let Some(meta) = &tx.meta {
