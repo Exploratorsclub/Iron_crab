@@ -9420,7 +9420,12 @@ mod event_pipeline_tests {
     const TEST_BUILD: &str = "0.0.0";
     const TEST_RUN: &str = "run-test";
 
-    fn seed_test_raydium_trade_identity(cache: &SharedLivePoolCache, pool: Pubkey, mint: Pubkey) {
+    fn seed_test_raydium_trade_identity(
+        cache: &SharedLivePoolCache,
+        pool: Pubkey,
+        mint: Pubkey,
+        slot: u64,
+    ) {
         cache.upsert(
             pool,
             CachedPoolState::RaydiumAmm(ironcrab::execution::live_pool_cache::RaydiumAmmState {
@@ -9439,7 +9444,7 @@ mod event_pipeline_tests {
                 serum_base_vault: Some(Pubkey::new_unique()),
                 serum_quote_vault: Some(Pubkey::new_unique()),
             }),
-            1,
+            slot,
         );
     }
 
@@ -9911,7 +9916,7 @@ mod event_pipeline_tests {
         let live_pool_cache = create_shared_cache();
         let pool_pk = Pubkey::new_unique();
         let mint_pk = Pubkey::new_unique();
-        seed_test_raydium_trade_identity(&live_pool_cache, pool_pk, mint_pk);
+        seed_test_raydium_trade_identity(&live_pool_cache, pool_pk, mint_pk, 99);
         let log_dir = std::env::temp_dir().join(format!("arb_coalesce_snap_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&log_dir).expect("test log dir");
         let jsonl_writer =
@@ -10031,7 +10036,7 @@ mod event_pipeline_tests {
         let live_pool_cache = create_shared_cache();
         let pool_pk = Pubkey::new_unique();
         let mint_pk = Pubkey::new_unique();
-        seed_test_raydium_trade_identity(&live_pool_cache, pool_pk, mint_pk);
+        seed_test_raydium_trade_identity(&live_pool_cache, pool_pk, mint_pk, 42);
         let log_dir = std::env::temp_dir().join(format!("arb_writer_test_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&log_dir).expect("test log dir");
         let jsonl_writer =
@@ -10506,7 +10511,7 @@ mod event_pipeline_tests {
             Pubkey::new_unique(),
         ];
         for pool in tracker_pool_pks {
-            seed_test_raydium_trade_identity(&live_pool_cache, pool, mint_pk);
+            seed_test_raydium_trade_identity(&live_pool_cache, pool, mint_pk, 42);
         }
         let log_dir = std::env::temp_dir().join(format!("arb_scoped_snap_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&log_dir).expect("test log dir");
@@ -10655,6 +10660,9 @@ mod event_pipeline_tests {
         use ironcrab::execution::live_pool_cache::create_shared_cache;
 
         let live_pool_cache = create_shared_cache();
+        let pool_pk = Pubkey::new_unique();
+        let mint_pk = Pubkey::new_unique();
+        seed_test_raydium_trade_identity(&live_pool_cache, pool_pk, mint_pk, 1);
         let log_dir = std::env::temp_dir().join(format!("arb_hb_release_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&log_dir).expect("test log dir");
         let jsonl_writer =
@@ -10710,9 +10718,9 @@ mod event_pipeline_tests {
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
-        let pool = "pool-hb-release";
-        let mint = "TokenMint11111111111111111111111111111111";
-        ctx.handle_pool_created(pool, mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
+        let pool = pool_pk.to_string();
+        let mint = mint_pk.to_string();
+        ctx.handle_pool_created(&pool, &mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
 
         let heartbeat_ctx = ctx.clone();
         let heartbeat_sim = std::thread::spawn(move || {
@@ -10730,8 +10738,8 @@ mod event_pipeline_tests {
             ctx.tracker_write.try_enqueue(
                 ArbTrackerWriteJob::ApplyTrade {
                     job: ArbTwoHopTradeJob {
-                        pool_address: pool.to_string(),
-                        mint: mint.to_string(),
+                        pool_address: pool.clone(),
+                        mint: mint.clone(),
                         quote_mint: NATIVE_SOL_MINT.to_string(),
                         sol_amount: 10_000_000,
                         token_amount: 1_000_000,
