@@ -785,7 +785,18 @@ impl LivePoolCache {
     ///
     /// Updates without quotable reserve basis (e.g. 0/0 `PoolDiscovered`) do **not** refresh
     /// `updated_at` on an existing row — prevents age-gate spoofing without quote readiness.
-    pub fn upsert(&self, pool: Pubkey, state: CachedPoolState, slot: u64) -> bool {
+    pub fn upsert(&self, pool: Pubkey, mut state: CachedPoolState, slot: u64) -> bool {
+        // TokenMintInfo can arrive before the pool account. Preserve that immutable
+        // Geyser fact when the Orca row is created later instead of depending on
+        // event ordering.
+        if let CachedPoolState::Orca(ref mut orca) = state {
+            if orca.token_a_program.is_none() {
+                orca.token_a_program = self.get_mint_program(&orca.token_mint_a);
+            }
+            if orca.token_b_program.is_none() {
+                orca.token_b_program = self.get_mint_program(&orca.token_mint_b);
+            }
+        }
         let refresh_age = pool_state_has_reserve_basis(&state);
         let new_fingerprint = pool_state_material_fingerprint(&state);
         match self.pools.entry(pool) {
@@ -4378,6 +4389,30 @@ mod tests {
             orca_readiness_for_pool_cache_update(&s),
             DexPoolReadiness::Ready
         );
+    }
+
+    #[test]
+    fn orca_upsert_hydrates_token_programs_seen_before_pool() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token_a = Pubkey::new_unique();
+        let token_b = Pubkey::new_unique();
+        let token_2022 = Pubkey::new_unique();
+        let legacy_token = Pubkey::new_unique();
+
+        cache.update_mint_program(&token_a, token_2022);
+        cache.update_mint_program(&token_b, legacy_token);
+        cache.upsert(
+            pool,
+            CachedPoolState::Orca(make_orca_state(token_a, token_b, Some(1), Some(2))),
+            100,
+        );
+
+        let CachedPoolState::Orca(state) = cache.get(&pool).expect("orca pool") else {
+            panic!("expected Orca state");
+        };
+        assert_eq!(state.token_a_program, Some(token_2022));
+        assert_eq!(state.token_b_program, Some(legacy_token));
     }
 
     #[test]
