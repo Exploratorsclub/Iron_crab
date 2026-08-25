@@ -35,6 +35,7 @@ use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use ironcrab::arb_quality::{record_arb_pin_quality_anchor, record_arb_pin_quality_stage};
 use ironcrab::config::{Config, MarketDataGeyserCfg, WalletTrackerCfg};
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest, ControlRequestKind,
@@ -657,6 +658,10 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
 
     fn is_hot_pool(&self, pool: &Pubkey) -> bool {
         self.ctx.hot_pool_registry.is_hot_pool(*pool)
+    }
+
+    fn is_arb_pinned(&self, pool: &Pubkey) -> bool {
+        self.ctx.hot_pool_registry.pool_has_arb(*pool)
     }
 
     fn is_open_position_pumpfun_pin(&self, pool: &Pubkey) -> bool {
@@ -6016,7 +6021,9 @@ impl MarketDataContext {
     }
 
     fn record_arb_active_pool_reserve_registration_outcome(&self, pool: Pubkey, registered: bool) {
+        let pool_text = pool.to_string();
         if registered {
+            record_arb_pin_quality_stage(&pool_text, "subscription", "complete", None);
             inc_market_data_arb_pin_vault_register_ok_total();
             self.clear_arb_pin_deferred_with_metric(pool);
             self.refresh_arb_tracked_vaults_gauge();
@@ -6024,6 +6031,7 @@ impl MarketDataContext {
             return;
         }
         if self.live_pool_cache.get(&pool).is_none() {
+            record_arb_pin_quality_stage(&pool_text, "subscription", "missing_cache", None);
             self.note_deferred_hot_pool_reserve_registration(
                 pool,
                 GeyserPinReason::ArbMultiDex,
@@ -6033,6 +6041,7 @@ impl MarketDataContext {
             return;
         }
         if self.hot_pool_reserve_registration_satisfied(pool) {
+            record_arb_pin_quality_stage(&pool_text, "subscription", "complete", None);
             self.clear_arb_pin_deferred_with_metric(pool);
             self.refresh_arb_tracked_vaults_gauge();
             self.publish_hot_pool_balance_refresh_from_cache(pool);
@@ -6043,6 +6052,20 @@ impl MarketDataContext {
             GeyserPinReason::ArbMultiDex,
             "vault_register_no_change",
         );
+        let outcome = self
+            .live_pool_cache
+            .get(&pool)
+            .map(|state| {
+                if !self.pool_vaults_fully_tracked_for_cache(pool, &state) {
+                    "missing_vault"
+                } else if !self.pool_geyser_bins_fully_tracked_for_cache(pool, &state) {
+                    "missing_bins"
+                } else {
+                    "other"
+                }
+            })
+            .unwrap_or("missing_cache");
+        record_arb_pin_quality_stage(&pool_text, "subscription", outcome, None);
         self.log_arb_pin_deferred_throttled(pool, "vault_register_no_change");
     }
 
@@ -6666,6 +6689,15 @@ impl MarketDataContext {
         update: &ArbTrackRequestsUpdate,
     ) -> bool {
         record_market_data_arb_track_requests_messages_total();
+        for entry in &update.active {
+            record_arb_pin_quality_anchor(&entry.pool, update.ts_unix_ms);
+            record_arb_pin_quality_stage(
+                &entry.pool,
+                "pin_received",
+                "observed",
+                Some(update.ts_unix_ms),
+            );
+        }
         let mut batch_dirty = false;
         if update.reconcile {
             batch_dirty |= self.apply_arb_snapshot_reconcile(admission, &update.active);

@@ -11,6 +11,10 @@ use super::pool_publish::{
     raydium_cpmm_vaults_for_pool_cache_update,
 };
 use super::worker::{DlmmPoolStateSignal, MdSidefxBurstScratch, MdSidefxCommand};
+use crate::arb_quality::{
+    arb_pin_quality_cohort_member, record_arb_pin_quality_completeness,
+    record_arb_pin_quality_slot, record_arb_pin_quality_stage,
+};
 use crate::execution::live_pool_cache::{
     cached_state_layer_c_complete, meteora_cpmm_readiness_for_pool_cache_update,
     meteora_dlmm_readiness_for_pool_cache_update, orca_readiness_for_pool_cache_update,
@@ -66,6 +70,42 @@ fn sidefx_host_enqueue_jetstream<T: serde::Serialize>(
         log_fail,
         bump_market_events_published_total,
     );
+}
+
+fn record_arb_quality_master_update(host: &dyn SidefxWorkerHost, update: &PoolCacheUpdate) {
+    if !arb_pin_quality_cohort_member(&update.pool_address) {
+        return;
+    }
+    let Ok(pool) = Pubkey::from_str(&update.pool_address) else {
+        return;
+    };
+    if !host.is_arb_pinned(&pool) {
+        return;
+    }
+    let slot_outcome = record_arb_pin_quality_slot(&update.pool_address, update.geyser_slot);
+    let outcome = if update.base_reserve == 0 || update.quote_reserve == 0 {
+        "missing_vault"
+    } else {
+        "complete"
+    };
+    record_arb_pin_quality_stage(
+        &update.pool_address,
+        "master_update",
+        outcome,
+        Some(update.header.ts_unix_ms),
+    );
+    record_arb_pin_quality_completeness(&update.pool_address, &update.dex, outcome);
+    if slot_outcome == "regression" {
+        warn!(
+            kind = "arb_pin_quality",
+            stage = "master_update",
+            outcome = "slot_regression",
+            pool = %update.pool_address,
+            dex = %update.dex,
+            geyser_slot = update.geyser_slot,
+            "Cohort MASTER PoolCacheUpdate regressed in slot"
+        );
+    }
 }
 
 /// Hot pin-seed Schicht C write for PumpSwap with post-write verification + metrics.
@@ -235,6 +275,7 @@ fn md_sidefx_build_balance_updated_from_cache(
         }
         CachedPoolState::PumpAmm(_) => {}
     }
+    record_arb_quality_master_update(host, &balance_update);
     Some(balance_update)
 }
 
@@ -1880,6 +1921,7 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                     pool_update.metadata = Some(meta);
                 }
             }
+            record_arb_quality_master_update(host, &pool_update);
             let subject = pool_subject(&pool_pubkey.to_string());
             sidefx_host_enqueue_jetstream(
                 host,
@@ -2055,6 +2097,7 @@ pub fn md_sidefx_process_vault_balance_tick(
                     .merge_meteora_dlmm_pool_readiness(vault_view.pool_address, readiness);
             }
         }
+        record_arb_quality_master_update(host, &balance_update);
         let subject = pool_subject(&vault_view.pool_address.to_string());
         sidefx_host_enqueue_jetstream(
             host,
