@@ -4401,6 +4401,14 @@ pub static MOMENTUM_TRACKER_TRADES_RECORDED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MOMENTUM_TRADES_RECEIVED_NO_TRACKER_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_NO_TRACKER_POOL_NOT_DISCOVERED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_NO_TRACKER_TRADE_BEFORE_DISCOVERY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_NO_TRACKER_ABSENT_AFTER_DISCOVERY_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MOMENTUM_NO_TRACKER_POOL_KEY_MISMATCH_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static MOMENTUM_TRACKER_REJECTED_DEV_SELL_EARLY_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MOMENTUM_TRACKER_REJECTED_MICRO_BUY_SPAM_TOTAL: Lazy<AtomicU64> =
@@ -4427,6 +4435,25 @@ pub fn record_momentum_tracker_trades_recorded() {
 #[inline]
 pub fn record_momentum_trades_received_no_tracker() {
     MOMENTUM_TRADES_RECEIVED_NO_TRACKER_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn record_momentum_no_tracker_reason(reason: &str) {
+    match reason {
+        "pool_not_discovered" => {
+            MOMENTUM_NO_TRACKER_POOL_NOT_DISCOVERED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "trade_before_discovery" => {
+            MOMENTUM_NO_TRACKER_TRADE_BEFORE_DISCOVERY_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "tracker_absent_after_discovery" => {
+            MOMENTUM_NO_TRACKER_ABSENT_AFTER_DISCOVERY_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "pool_key_mismatch" => {
+            MOMENTUM_NO_TRACKER_POOL_KEY_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
 }
 
 /// Maps `TokenTracker::reject` reason strings to low-cardinality Prometheus counters.
@@ -10880,6 +10907,38 @@ async fn metrics_response() -> Response<Body> {
         "momentum_trades_received_no_tracker_total",
         MOMENTUM_TRADES_RECEIVED_NO_TRACKER_TOTAL.load(Ordering::Relaxed)
     );
+    out.push_str(
+        "momentum_trades_received_no_tracker_reason_total{reason=\"pool_not_discovered\"} ",
+    );
+    out.push_str(
+        &MOMENTUM_NO_TRACKER_POOL_NOT_DISCOVERED_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "momentum_trades_received_no_tracker_reason_total{reason=\"trade_before_discovery\"} ",
+    );
+    out.push_str(
+        &MOMENTUM_NO_TRACKER_TRADE_BEFORE_DISCOVERY_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_trades_received_no_tracker_reason_total{reason=\"tracker_absent_after_discovery\"} ");
+    out.push_str(
+        &MOMENTUM_NO_TRACKER_ABSENT_AFTER_DISCOVERY_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_trades_received_no_tracker_reason_total{reason=\"pool_key_mismatch\"} ");
+    out.push_str(
+        &MOMENTUM_NO_TRACKER_POOL_KEY_MISMATCH_TOTAL
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "momentum_tracker_rejected_dev_sell_early_total",
         MOMENTUM_TRACKER_REJECTED_DEV_SELL_EARLY_TOTAL.load(Ordering::Relaxed)
