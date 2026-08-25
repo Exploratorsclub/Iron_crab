@@ -55,8 +55,9 @@ SYSTEMD_SRC_DIR="$SCRIPT_DIR/docs/systemd"
 # -----------------------------------------------------------------------------
 # 1. Git Pull
 # -----------------------------------------------------------------------------
-log_info "Pulling latest changes from GitHub..."
-git pull origin architecture-rebuild
+DEPLOY_BRANCH="architecture-rebuild-next"
+log_info "Pulling latest changes from GitHub branch: $DEPLOY_BRANCH..."
+git pull --ff-only origin "$DEPLOY_BRANCH"
 
 # -----------------------------------------------------------------------------
 # 2. Build Rust Binaries

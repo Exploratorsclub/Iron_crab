@@ -23739,6 +23739,13 @@ async fn process_market_event(
             token_decimals: trade_token_decimals, // Decimals from post_token_balances (Geyser)
             ..  // Ignore quote_mint - we don't need it for momentum detection
         } => {
+            // Quote assets and parser sentinels are market context, never Momentum
+            // candidates. Stop before tracker lookup, warning emission, or MintInfo
+            // caching so expected quote-side trades cannot pollute strategy state.
+            if is_non_tradeable_momentum_mint(mint) {
+                return Ok(false);
+            }
+
             // P1: Trade-based Token Discovery
             // If we missed the PoolCreated event (Geyser filter issues), discover via first trade
             let tracker_exists = ctx

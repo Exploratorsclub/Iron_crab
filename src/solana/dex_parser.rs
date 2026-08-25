@@ -1812,48 +1812,99 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
         return None;
     }
 
-    let amount_in = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
+    let _amount_in = u64::from_le_bytes(update.instruction_data[8..16].try_into().ok()?);
     let _min_out = u64::from_le_bytes(update.instruction_data[16..24].try_into().ok()?);
 
-    // Determine direction from balance changes
-    // Find which token increased (that's what user received)
-    let base_mint = update
-        .post_token_balances
-        .iter()
-        .find(|post| {
-            let post_amt: u64 = post.ui_token_amount.amount.parse().unwrap_or(0);
-            let pre_amt: u64 = update
-                .pre_token_balances
-                .iter()
-                .find(|pre| pre.mint == post.mint && pre.account_index == post.account_index)
-                .and_then(|pre| pre.ui_token_amount.amount.parse().ok())
-                .unwrap_or(0);
-            post_amt > pre_amt && post.mint != "So11111111111111111111111111111111111111112"
-        })
-        .and_then(|b| Pubkey::from_str(&b.mint).ok())
-        .unwrap_or_default();
+    // Determine direction from the two user token accounts, not from an arbitrary
+    // increasing balance. On a SELL the non-WSOL user account decreases while WSOL
+    // increases; the old increasing-non-WSOL heuristic therefore fell back to
+    // Pubkey::default() and published the system program as the trade mint.
+    let user_token_delta = |account: &Pubkey| -> Option<(Pubkey, i128)> {
+        let account_index =
+            u8::try_from(update.account_keys.iter().position(|key| key == account)?).ok()?;
+        let post = update
+            .post_token_balances
+            .iter()
+            .find(|balance| balance.account_index == account_index)?;
+        let pre = update
+            .pre_token_balances
+            .iter()
+            .find(|balance| balance.account_index == account_index && balance.mint == post.mint)?;
+        let pre_amount = pre.ui_token_amount.amount.parse::<u64>().ok()?;
+        let post_amount = post.ui_token_amount.amount.parse::<u64>().ok()?;
+        let mint = Pubkey::from_str(&post.mint).ok()?;
+        Some((mint, i128::from(post_amount) - i128::from(pre_amount)))
+    };
 
-    let is_buy = base_mint != Pubkey::default();
+    let (mint_x, delta_x) = user_token_delta(&update.instruction_accounts[3])?;
+    let (mint_y, delta_y) = user_token_delta(&update.instruction_accounts[4])?;
+    if mint_x == mint_y || delta_x == 0 || delta_y == 0 || delta_x.signum() == delta_y.signum() {
+        debug!(
+            sig = %update.signature,
+            mint_x = %mint_x,
+            mint_y = %mint_y,
+            delta_x,
+            delta_y,
+            "Meteora: ambiguous user token balance deltas"
+        );
+        return None;
+    }
 
-    // Calculate actual amounts from balance changes
-    let (sol_amount, token_amount) = if is_buy {
-        let tokens_received = calculate_token_balance_change(
-            &update.pre_token_balances,
-            &update.post_token_balances,
-            &base_mint,
+    let sol_mint = *SOL_MINT_PUBKEY;
+    let (base_mint, quote_mint, is_buy, sol_amount, token_amount) = if mint_x == sol_mint {
+        if delta_x < 0 {
+            (
+                mint_y,
+                mint_x,
+                true,
+                delta_x.unsigned_abs() as u64,
+                delta_y.unsigned_abs() as u64,
+            )
+        } else {
+            (
+                mint_y,
+                mint_x,
+                false,
+                delta_x.unsigned_abs() as u64,
+                delta_y.unsigned_abs() as u64,
+            )
+        }
+    } else if mint_y == sol_mint {
+        if delta_y < 0 {
+            (
+                mint_x,
+                mint_y,
+                true,
+                delta_y.unsigned_abs() as u64,
+                delta_x.unsigned_abs() as u64,
+            )
+        } else {
+            (
+                mint_x,
+                mint_y,
+                false,
+                delta_y.unsigned_abs() as u64,
+                delta_x.unsigned_abs() as u64,
+            )
+        }
+    } else if delta_x < 0 {
+        // Preserve non-SOL pair provenance. Downstream strategies must reject
+        // quote_mint != WSOL rather than treating the quote amount as lamports.
+        (
+            mint_y,
+            mint_x,
+            true,
+            delta_x.unsigned_abs() as u64,
+            delta_y.unsigned_abs() as u64,
         )
-        .unwrap_or(0);
-        (amount_in, tokens_received)
     } else {
-        // SELL: SOL received is in native balances, not token_balances!
-        let sol_received = calculate_native_balance_change(
-            &update.account_keys,
-            &update.pre_balances,
-            &update.post_balances,
-            &trader,
+        (
+            mint_x,
+            mint_y,
+            true,
+            delta_y.unsigned_abs() as u64,
+            delta_x.unsigned_abs() as u64,
         )
-        .unwrap_or(0);
-        (sol_received, amount_in)
     };
 
     debug!(
@@ -1867,12 +1918,6 @@ fn parse_meteora_transaction(update: &GeyserTransactionUpdate) -> Option<ParsedD
     );
 
     let token_decimals = get_token_decimals(&update.post_token_balances, &base_mint);
-
-    // Extract actual quote_mint from token balance changes.
-    // In a swap, exactly 2 mints are involved: base and quote.
-    // For non-SOL pairs (e.g., TOKEN/USDC), this correctly identifies the
-    // quote_mint so arb-strategy can filter them out.
-    let quote_mint = extract_quote_mint(&update.post_token_balances, &base_mint);
 
     Some(ParsedDexEvent::Trade {
         pool_address,
@@ -2044,6 +2089,114 @@ mod tests {
         GeyserTransactionUpdate, InnerInstruction, TokenAmount, TokenBalance,
     };
     use std::time::Instant;
+
+    fn meteora_user_delta_update(is_buy: bool) -> (GeyserTransactionUpdate, Pubkey) {
+        let pool = Pubkey::new_unique();
+        let reserve_x = Pubkey::new_unique();
+        let reserve_y = Pubkey::new_unique();
+        let user_wsol = Pubkey::new_unique();
+        let user_token = Pubkey::new_unique();
+        let trader = Pubkey::new_unique();
+        let token_program = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let wsol = *SOL_MINT_PUBKEY;
+        let account_keys = vec![
+            pool,
+            reserve_x,
+            reserve_y,
+            user_wsol,
+            user_token,
+            trader,
+            token_program,
+        ];
+        let instruction_accounts = account_keys.clone();
+        let (wsol_pre, wsol_post, token_pre, token_post) = if is_buy {
+            (1_000_000_000, 900_000_000, 0, 500_000_000)
+        } else {
+            (900_000_000, 1_000_000_000, 500_000_000, 0)
+        };
+        let balances = |account_index: u8, mint: Pubkey, decimals: u8, amount: u64| TokenBalance {
+            account_index,
+            mint: mint.to_string(),
+            ui_token_amount: TokenAmount {
+                ui_amount: None,
+                decimals,
+                amount: amount.to_string(),
+            },
+            program_id: None,
+            owner: None,
+        };
+        let mut instruction_data = METEORA_SWAP.to_vec();
+        instruction_data.extend_from_slice(&100_000_000u64.to_le_bytes());
+        instruction_data.extend_from_slice(&0u64.to_le_bytes());
+        (
+            GeyserTransactionUpdate {
+                signature: format!("meteora-{}", if is_buy { "buy" } else { "sell" }),
+                slot: 42,
+                account_keys,
+                instruction_accounts,
+                instruction_data,
+                inner_instructions: vec![],
+                pre_token_balances: vec![
+                    balances(3, wsol, 9, wsol_pre),
+                    balances(4, token_mint, 6, token_pre),
+                ],
+                post_token_balances: vec![
+                    balances(3, wsol, 9, wsol_post),
+                    balances(4, token_mint, 6, token_post),
+                ],
+                pre_balances: vec![0; 7],
+                post_balances: vec![0; 7],
+                fee_lamports: 0,
+                compute_units_consumed: None,
+                grpc_recv_at: Instant::now(),
+            },
+            token_mint,
+        )
+    }
+
+    #[test]
+    fn meteora_buy_uses_increasing_non_wsol_user_mint() {
+        let (update, token_mint) = meteora_user_delta_update(true);
+        let ParsedDexEvent::Trade {
+            mint,
+            quote_mint,
+            is_buy,
+            sol_amount,
+            token_amount,
+            ..
+        } = parse_meteora_transaction(&update).expect("meteora buy")
+        else {
+            panic!("expected trade")
+        };
+        assert_eq!(mint, token_mint);
+        assert_eq!(quote_mint, *SOL_MINT_PUBKEY);
+        assert!(is_buy);
+        assert_eq!(sol_amount, 100_000_000);
+        assert_eq!(token_amount, 500_000_000);
+    }
+
+    #[test]
+    fn meteora_sell_uses_decreasing_non_wsol_user_mint() {
+        let (update, token_mint) = meteora_user_delta_update(false);
+        let ParsedDexEvent::Trade {
+            mint,
+            quote_mint,
+            is_buy,
+            sol_amount,
+            token_amount,
+            ..
+        } = parse_meteora_transaction(&update).expect("meteora sell")
+        else {
+            panic!("expected trade")
+        };
+        assert_eq!(mint, token_mint);
+        assert_ne!(mint, Pubkey::default());
+        assert_eq!(quote_mint, *SOL_MINT_PUBKEY);
+        assert!(!is_buy);
+        assert_eq!(sol_amount, 100_000_000);
+        assert_eq!(token_amount, 500_000_000);
+    }
 
     #[test]
     fn selected_instruction_program_wins_in_multi_dex_transaction() {
