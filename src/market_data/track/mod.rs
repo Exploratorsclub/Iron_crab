@@ -1,6 +1,7 @@
 pub mod admission_wiring;
 pub mod barrier;
 pub mod coalesce;
+pub mod desired_admission;
 pub mod desired_set;
 pub mod enrichment;
 pub mod eviction_planner;
@@ -24,6 +25,12 @@ pub use coalesce::{
     arb_coalesce_try_send, merge_arb_track_requests_updates, merge_momentum_active_pools_updates,
     momentum_coalesce_try_send, spawn_arb_tracking_coalescer, spawn_momentum_tracking_coalescer,
     MARKET_DATA_ARB_COALESCE_CHANNEL_CAP, MARKET_DATA_MOMENTUM_COALESCE_CHANNEL_CAP,
+};
+pub use desired_admission::{
+    pin_priority_from_consumer as admission_pin_priority_from_consumer,
+    AdmissionDesiredExplicitSet, AdmissionObserver, AdmissionResult, CapConvergeResult,
+    ConsumerId as AdmissionConsumerId, NoopAdmissionObserver, OwnerGroupSnapshot, OwnerKey,
+    PinPriority as AdmissionPinPriority, RestoreResult,
 };
 pub use desired_set::{
     pin_priority_for_momentum_active_pin, pin_priority_from_consumer, symmetric_diff, ConsumerId,
