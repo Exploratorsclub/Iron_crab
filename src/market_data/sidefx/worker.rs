@@ -980,6 +980,10 @@ mod tests {
             _slot: u64,
         ) {
         }
+        fn hot_pool_reserve_registration_satisfied(&self, _pool: Pubkey) -> bool {
+            false
+        }
+        fn register_geyser_reserves_after_hot_pool_cache_fill(&self, _pool: Pubkey) {}
     }
 
     fn mk_account_job() -> MdSidefxCommand {
@@ -1132,6 +1136,10 @@ mod tests {
             _slot: u64,
         ) {
         }
+        fn hot_pool_reserve_registration_satisfied(&self, _pool: Pubkey) -> bool {
+            false
+        }
+        fn register_geyser_reserves_after_hot_pool_cache_fill(&self, _pool: Pubkey) {}
     }
 
     #[test]
