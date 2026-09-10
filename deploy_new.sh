@@ -55,7 +55,7 @@ SYSTEMD_SRC_DIR="$SCRIPT_DIR/docs/systemd"
 # -----------------------------------------------------------------------------
 # 1. Git Pull
 # -----------------------------------------------------------------------------
-DEPLOY_BRANCH="architecture-rebuild-next"
+DEPLOY_BRANCH="architecture-rebuild"
 log_info "Pulling latest changes from GitHub branch: $DEPLOY_BRANCH..."
 git pull --ff-only origin "$DEPLOY_BRANCH"
 
