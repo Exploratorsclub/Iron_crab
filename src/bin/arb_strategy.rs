@@ -29,16 +29,20 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
+use ironcrab::arb_quality::{
+    arb_pin_quality_cohort_member, record_arb_pin_quality_completeness, record_arb_pin_quality_pin,
+    record_arb_pin_quality_slot, record_arb_pin_quality_stage,
+};
 use ironcrab::arbitrage::in_flight::{
     in_flight_key_from_intent_metadata, InFlightArbKey, InFlightArbRegistry,
 };
 use ironcrab::arbitrage::{
     arb_track_removal_reason, classify_cross_dex_sell_failure, dlmm_marginal_price_plausible,
     dlmm_sol_output_from_bins, dlmm_token_output_from_bins, freshness_age_bucket,
-    is_arb_route_executable, is_expected_token_output_plausible, is_quote_fresh,
+    is_arb_route_executable, is_expected_token_output_plausible, is_quote_fresh_with_bins,
     populate_arb_slave_from_live_pool_cache, price_based_token_output_raw, quote_exact_in,
     quote_exact_in_with_freshness, quote_sell_round_trip, quotes_pairable,
-    round_trip_profit_lamports, select_arb_track_pools, select_round_trip_pools,
+    round_trip_profit_lamports, select_arb_track_pools, select_round_trip_pools, state_fingerprint,
     sync_arb_slave_from_pool_cache_update, MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch,
     NoCrossDexSellDetailReason, PoolQuote, QuoteFreshnessConfig, QuoteKind, QuotePoolInput,
     QuoteVaultInput, RoundTripInsufficient, RoundTripInsufficientSubreason, RoundTripLeg,
@@ -95,12 +99,13 @@ use ironcrab::metrics::{
     inc_arb_vault_rescreen_scheduled_total, inc_arb_vault_seed_from_cache_miss_total,
     inc_arb_vault_seed_from_cache_ok_total, record_arb_bundle_profit_insufficient,
     record_arb_heartbeat_phase, record_arb_intent_suppressed_implausible_token_out,
-    record_arb_intent_suppressed_unsupported_route, record_arb_price_freshness_stale_age_ms,
-    record_arb_proactive_pin_first_publish, record_arb_proactive_track_publish_total,
+    record_arb_intent_suppressed_unsupported_route, record_arb_pool_identity_check,
+    record_arb_price_freshness_stale_age_ms, record_arb_proactive_pin_first_publish,
+    record_arb_proactive_track_publish_total, record_arb_quote_invariant_violation,
     record_arb_quote_pair_slot_delta, record_arb_quote_shadow_round_trip,
-    record_arb_track_publish_skipped_unchanged_total, record_arb_track_removed_total,
-    record_arb_track_requests_messages_total, record_arb_track_requests_publish_chunks_total,
-    record_arb_track_requests_publish_failed_total,
+    record_arb_round_trip_by_dex_pair, record_arb_track_publish_skipped_unchanged_total,
+    record_arb_track_removed_total, record_arb_track_requests_messages_total,
+    record_arb_track_requests_publish_chunks_total, record_arb_track_requests_publish_failed_total,
     record_arb_track_selection_blocking_join_failed_total,
     record_arb_track_selection_queue_overflow_total, record_arb_track_selection_recompute_total,
     record_arb_two_hop_v2_formable_gates, record_arb_writer_lock_wait, serve_metrics,
@@ -155,6 +160,36 @@ fn track_pool_readiness_to_wire(r: TrackPoolReadiness) -> ArbTrackReadiness {
     }
 }
 
+fn v2_sell_recovery_is_completeness_detail(detail: Option<NoCrossDexSellDetailReason>) -> bool {
+    matches!(
+        detail,
+        Some(
+            NoCrossDexSellDetailReason::SellMissingVault
+                | NoCrossDexSellDetailReason::SellMissingDlmmBins
+        )
+    )
+}
+
+/// Map selection readiness to wire tier: Executable only when vault (+ DLMM bins) present.
+fn wire_readiness_for_selected_pool(
+    pool: &str,
+    dex: &str,
+    classified: TrackPoolReadiness,
+    vault_balances: &HashMap<String, VaultBalanceCache>,
+    bin_arrays: &HashMap<String, HashMap<i64, BinArrayCache>>,
+) -> ArbTrackReadiness {
+    let has_vault = vault_balances.contains_key(pool);
+    let bins_ok =
+        dex != "meteora_dlmm" || bin_arrays.get(pool).is_some_and(|bins| !bins.is_empty());
+    if has_vault && bins_ok && classified >= TrackPoolReadiness::QuoteReady {
+        return ArbTrackReadiness::Executable;
+    }
+    if classified >= TrackPoolReadiness::QuoteReady && (!has_vault || !bins_ok) {
+        return ArbTrackReadiness::Warmable;
+    }
+    track_pool_readiness_to_wire(classified)
+}
+
 /// Wire format version for `TOPIC_ARB_TRACK_REQUESTS`.
 const ARB_TRACK_REQUESTS_WIRE_VERSION: u32 = 1;
 /// Default cap for baseline reconcile `active[]` (configurable via `arb_track_baseline_max_pools`).
@@ -185,6 +220,10 @@ const ARB_TRACK_INCREMENTAL_MINTS_MAX: usize = 64;
 const ARB_TWO_HOP_WORKER_QUEUE_CAP: usize = 4096;
 /// C1h5: min interval between sell-leg stale recovery rescreens per mint.
 const V2_SELL_STALE_RECOVERY_MIN_INTERVAL_MS: u64 = 30_000;
+/// C1vault completeness: shorter retry interval for MissingVault/MissingDlmmBins recovery.
+const V2_SELL_STALE_RECOVERY_COMPLETENESS_MIN_INTERVAL_MS: u64 = 5_000;
+/// Grace after republish before counting rescreen_still_stale (vault/bin apply latency).
+const V2_SELL_STALE_RECOVERY_RESCREEN_GRACE_MS: u64 = 2_000;
 /// C1h5: cap buy candidates scanned when detecting pinned sell-leg staleness.
 const V2_SELL_STALE_RECOVERY_MAX_BUY_CANDIDATES: usize = 4;
 
@@ -194,6 +233,8 @@ struct V2SellStaleRecoveryPending {
     scheduled_at: Instant,
     buy_pool: String,
     sell_pool: String,
+    sell_detail: Option<NoCrossDexSellDetailReason>,
+    completeness_seeded: bool,
 }
 /// Max PoolCache updates applied per burst before yielding (main-loop decoupling).
 const ARB_POOL_CACHE_APPLY_BATCH_MAX: usize = 20;
@@ -242,12 +283,14 @@ struct ArbConfig {
     arb_probe_lamports: u64,
     /// When true, arb_probe_lamports tracks max_position_lamports on load/update.
     arb_probe_follows_max_position: bool,
-    /// LastTradeMid quote TTL for v2 freshness. Default: 30_000 ms.
+    /// Legacy LastTradeMid TTL (freshness re-check on parsed quotes only; hot path does not emit LastTradeMid). Default: 30_000 ms.
     arb_quote_trade_ttl_ms: u64,
     /// ExecutableMarginal state TTL for v2 freshness. Default: 120_000 ms.
     arb_quote_state_ttl_ms: u64,
     /// Max allowed |buy.as_of_slot - sell.as_of_slot| for v2 round-trip (0 = gate off). Default: 2.
     arb_max_leg_slot_delta: u64,
+    /// Max allowed chain_head_slot - leg.as_of_slot for each v2 leg (0 = gate off). Default: 16.
+    arb_max_leg_age_slots: u64,
     /// Jito bundle auction parameters (from [execution_engine.fee_policy] + jito tip).
     bundle_auction: BundleAuctionParams,
 }
@@ -272,6 +315,7 @@ impl Default for ArbConfig {
             arb_quote_trade_ttl_ms: 30_000,
             arb_quote_state_ttl_ms: 120_000,
             arb_max_leg_slot_delta: 2,
+            arb_max_leg_age_slots: 16,
             bundle_auction: BundleAuctionParams::default(),
         };
         sync_arb_probe_to_max_position(&mut cfg);
@@ -493,11 +537,32 @@ fn vault_balance_from_live_cache_state(
 }
 
 fn live_pool_cache_fresher_than_vault(
-    cache_slot: u64,
-    cache_updated_at: Instant,
+    new_vault: &VaultBalanceCache,
     existing: &VaultBalanceCache,
 ) -> bool {
-    cache_slot > existing.update_slot || cache_updated_at > existing.updated_at
+    if state_fingerprint(&vault_cache_to_quote_input(new_vault))
+        == state_fingerprint(&vault_cache_to_quote_input(existing))
+    {
+        return false;
+    }
+    new_vault.update_slot > existing.update_slot || new_vault.updated_at > existing.updated_at
+}
+
+fn vault_material_unchanged(new_vault: &VaultBalanceCache, existing: &VaultBalanceCache) -> bool {
+    state_fingerprint(&vault_cache_to_quote_input(new_vault))
+        == state_fingerprint(&vault_cache_to_quote_input(existing))
+}
+
+fn bin_array_material_fingerprint(bins: &[BinData]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for bin in bins {
+        bin.offset.hash(&mut hasher);
+        bin.amount_x.hash(&mut hasher);
+        bin.amount_y.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// H3 / C1vault: seed missing vault row from SLAVE LivePoolCache (Geyser-only, all SOL-quoted DEXes).
@@ -544,7 +609,7 @@ fn try_refresh_vault_from_live_cache(
     let Some(new_vault) = vault_balance_from_live_cache_state(&state, slot, age_ms) else {
         return false;
     };
-    if !live_pool_cache_fresher_than_vault(slot, new_vault.updated_at, existing) {
+    if !live_pool_cache_fresher_than_vault(&new_vault, existing) {
         return false;
     }
     record_live_cache_age_at_snapshot("refresh", age_ms, pin_class);
@@ -1451,6 +1516,46 @@ fn pool_state_mints(state: &CachedPoolState) -> (String, String) {
     }
 }
 
+/// Geyser-only admission guard for Trade events.
+///
+/// A transaction parser may identify a candidate pool before its account update arrives. That
+/// candidate must not create or mutate an arb tracker until the SLAVE LivePoolCache confirms the
+/// pool address, DEX and complete mint pair from DEX-owned account data. Orca/Meteora TX-layout
+/// seeds are deliberately insufficient because they are not account-authoritative quote state.
+fn cached_pool_authorizes_arb_trade(
+    state: &CachedPoolState,
+    dex: &str,
+    mint: &str,
+    quote_mint: &str,
+) -> bool {
+    let dex_matches = match state {
+        CachedPoolState::Orca(_) => matches!(dex, "orca" | "orca_whirlpool"),
+        CachedPoolState::RaydiumAmm(_) => {
+            matches!(dex, "raydium" | "raydium_amm" | "raydium_amm_v4")
+        }
+        CachedPoolState::RaydiumCpmm(_) => dex == "raydium_cpmm",
+        CachedPoolState::Meteora(_) => matches!(dex, "meteora" | "meteora_dlmm"),
+        CachedPoolState::MeteoraCpmm(_) => dex == "meteora_cpmm",
+        CachedPoolState::PumpFun(_) => dex == "pumpfun",
+        CachedPoolState::PumpAmm(_) => matches!(dex, "pump_amm" | "pumpswap" | "pump_swap_amm"),
+    };
+    if !dex_matches {
+        return false;
+    }
+
+    let account_authoritative = match state {
+        CachedPoolState::Orca(s) => s.whirlpool_quote_account_seeded,
+        CachedPoolState::Meteora(s) => s.dlmm_bin_params_account_seeded,
+        _ => true,
+    };
+    if !account_authoritative {
+        return false;
+    }
+
+    let (mint_a, mint_b) = pool_state_mints(state);
+    (mint == mint_a && quote_mint == mint_b) || (mint == mint_b && quote_mint == mint_a)
+}
+
 fn pool_state_has_arb_relevant_quote(state: &CachedPoolState) -> bool {
     let (mint_a, mint_b) = pool_state_mints(state);
     is_arb_relevant_pool_pair(&mint_a, &mint_b)
@@ -1879,13 +1984,27 @@ fn seed_one_pool_from_live_cache(
     };
     let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
 
-    let (should_replace_vault, should_touch_vault_updated_at) = match vault_balances.get(&pool_addr)
-    {
-        Some(existing) => (
-            slot >= existing.update_slot,
-            cache_updated_at > existing.updated_at,
-        ),
-        None => (true, false),
+    let (should_replace_vault, should_touch_vault_updated_at) = {
+        let candidate_vault = VaultBalanceCache {
+            reserve_base: warmup.reserve_base,
+            reserve_quote: warmup.reserve_quote,
+            update_slot: slot,
+            active_id: warmup.active_id,
+            bin_step: warmup.bin_step,
+            updated_at: cache_updated_at,
+            dlmm_sol_is_x,
+            dlmm_token_x_mint: dlmm_token_x_mint.clone(),
+        };
+        match vault_balances.get(&pool_addr) {
+            Some(existing) if vault_material_unchanged(&candidate_vault, existing) => {
+                (false, false)
+            }
+            Some(existing) => (
+                slot >= existing.update_slot,
+                cache_updated_at > existing.updated_at,
+            ),
+            None => (true, false),
+        }
     };
 
     let tracker = trackers
@@ -2554,8 +2673,8 @@ fn v2_sell_quote_none_detail_to_metric(
         }
         SellQuoteNoneDetailReason::CpmmMathNone => ArbTwoHopV2SellQuoteNoneDetail::CpmmMathNone,
         SellQuoteNoneDetailReason::UnsupportedDex => ArbTwoHopV2SellQuoteNoneDetail::UnsupportedDex,
-        SellQuoteNoneDetailReason::TradeFallbackNone => {
-            ArbTwoHopV2SellQuoteNoneDetail::TradeFallbackNone
+        SellQuoteNoneDetailReason::NoExecutableMarginal => {
+            ArbTwoHopV2SellQuoteNoneDetail::NoExecutableMarginal
         }
         SellQuoteNoneDetailReason::MintDirectionInvalid => {
             ArbTwoHopV2SellQuoteNoneDetail::MintDirectionInvalid
@@ -2734,6 +2853,72 @@ static ARB_V2_INSUFFICIENT_LOG_THROTTLE: std::sync::LazyLock<
     ))
 });
 
+const V2_GATE_FORENSICS_CATEGORY_COUNT: usize = 4;
+static ARB_V2_GATE_FORENSICS_LOG_THROTTLE: std::sync::LazyLock<
+    parking_lot::Mutex<
+        fixed_category_log_throttle::FixedCategoryLogThrottle<V2_GATE_FORENSICS_CATEGORY_COUNT>,
+    >,
+> = std::sync::LazyLock::new(|| {
+    parking_lot::Mutex::new(fixed_category_log_throttle::FixedCategoryLogThrottle::new(
+        Duration::from_secs(HOT_PATH_LOG_THROTTLE_SECS),
+    ))
+});
+
+#[allow(clippy::too_many_arguments)]
+fn log_v2_gate_forensics(
+    category: usize,
+    outcome: &'static str,
+    mint: &str,
+    token_decimals: u8,
+    probe_lamports: u64,
+    buy_dex: &str,
+    buy_pool: &str,
+    buy_slot: u64,
+    buy_amount_out: u64,
+    sell_dex: &str,
+    sell_pool: &str,
+    sell_slot: u64,
+    sell_amount_out: u64,
+    slot_delta: u64,
+    spread_bps: Option<i128>,
+    profit_lamports: Option<i128>,
+) {
+    if !ARB_V2_GATE_FORENSICS_LOG_THROTTLE
+        .lock()
+        .should_emit(category, Instant::now())
+    {
+        return;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut screen_hasher = std::collections::hash_map::DefaultHasher::new();
+    mint.hash(&mut screen_hasher);
+    buy_pool.hash(&mut screen_hasher);
+    sell_pool.hash(&mut screen_hasher);
+    buy_slot.hash(&mut screen_hasher);
+    sell_slot.hash(&mut screen_hasher);
+    let screen_id = screen_hasher.finish();
+    warn!(
+        kind = "arb_round_trip_forensics",
+        screen_id,
+        outcome,
+        mint,
+        token_decimals,
+        probe_lamports,
+        buy_dex,
+        buy_pool,
+        buy_slot,
+        buy_amount_out,
+        sell_dex,
+        sell_pool,
+        sell_slot,
+        sell_amount_out,
+        slot_delta,
+        spread_bps = ?spread_bps,
+        profit_lamports = ?profit_lamports,
+        "arb v2 terminal gate forensic sample"
+    );
+}
+
 fn insufficient_subreason_metric_label(subreason: RoundTripInsufficientSubreason) -> &'static str {
     match subreason {
         RoundTripInsufficientSubreason::CandidatesLt2 => "candidates_lt2",
@@ -2809,7 +2994,7 @@ fn log_v2_cross_dex_pair_failures_debug_sample(
         ) else {
             continue;
         };
-        if !is_quote_fresh(&buy_quote, freshness, buy.vault, now) {
+        if !is_quote_fresh_with_bins(&buy_quote, freshness, buy.vault, buy.dlmm_bins, now) {
             continue;
         }
         for sell in candidates {
@@ -3009,6 +3194,8 @@ struct ArbCheckContext<'a> {
     selected_mints: Option<&'a HashSet<String>>,
     /// When set and the mint has pinned pools, round-trip candidates use only those pools.
     pinned_pools: Option<&'a HashSet<String>>,
+    /// Latest Geyser slot observed in this process (chain head watermark, no RPC).
+    chain_head_slot: u64,
 }
 
 fn pool_state_to_quote_input(
@@ -3376,7 +3563,13 @@ impl TokenArbTracker {
             let Some(buy_quote) = buy_quote else {
                 continue;
             };
-            if !is_quote_fresh(&buy_quote, freshness, candidate.vault, now) {
+            if !is_quote_fresh_with_bins(
+                &buy_quote,
+                freshness,
+                candidate.vault,
+                candidate.dlmm_bins,
+                now,
+            ) {
                 continue;
             }
             let replace = match pairing_token_amount {
@@ -3402,9 +3595,9 @@ impl TokenArbTracker {
                 freshness,
             );
             let buy_quote_ok = buy_quote.is_some();
-            let buy_quote_fresh = buy_quote
-                .as_ref()
-                .is_some_and(|q| is_quote_fresh(q, freshness, candidate.vault, now));
+            let buy_quote_fresh = buy_quote.as_ref().is_some_and(|q| {
+                is_quote_fresh_with_bins(q, freshness, candidate.vault, candidate.dlmm_bins, now)
+            });
 
             let token_amount_in = pairing_token_amount;
             let (
@@ -3429,7 +3622,13 @@ impl TokenArbTracker {
                 };
                 let ok = sell_quote.is_some();
                 let fresh = sell_quote.as_ref().is_some_and(|q| {
-                    is_quote_fresh(q, freshness, candidate.vault, now) && quotes_pairable(buy_q, q)
+                    is_quote_fresh_with_bins(
+                        q,
+                        freshness,
+                        candidate.vault,
+                        candidate.dlmm_bins,
+                        now,
+                    ) && quotes_pairable(buy_q, q)
                 });
                 let failure = if ok {
                     None
@@ -3580,14 +3779,71 @@ impl TokenArbTracker {
         };
 
         arb_two_hop_v2_round_trip_formable_inc();
+        record_arb_round_trip_by_dex_pair(&selection.buy_dex, &selection.sell_dex, "formable");
 
         let buy_as_of_slot = selection.buy_quote.as_of_slot;
         let sell_as_of_slot = selection.sell_quote.as_of_slot;
+        record_arb_pin_quality_stage(&selection.buy_pool_address, "quote_ready", "complete", None);
+        record_arb_pin_quality_stage(
+            &selection.sell_pool_address,
+            "quote_ready",
+            "complete",
+            None,
+        );
         let slot_delta = buy_as_of_slot.abs_diff(sell_as_of_slot);
         record_arb_quote_pair_slot_delta(buy_as_of_slot, sell_as_of_slot);
         if config.arb_max_leg_slot_delta > 0 && slot_delta > config.arb_max_leg_slot_delta {
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "slot_delta",
+            );
+            log_v2_gate_forensics(
+                0,
+                "slot_delta",
+                &self.base_mint,
+                token_decimals,
+                probe,
+                &selection.buy_dex,
+                &selection.buy_pool_address,
+                buy_as_of_slot,
+                selection.buy_quote.amount_out,
+                &selection.sell_dex,
+                &selection.sell_pool_address,
+                sell_as_of_slot,
+                selection.sell_quote.amount_out,
+                slot_delta,
+                None,
+                None,
+            );
             arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::SlotDeltaExceeded);
             return None;
+        }
+
+        if config.arb_max_leg_age_slots > 0 {
+            let chain_slot = check_ctx.chain_head_slot;
+            if chain_slot > 0 {
+                let buy_age = if buy_as_of_slot > 0 {
+                    chain_slot.saturating_sub(buy_as_of_slot)
+                } else {
+                    u64::MAX
+                };
+                let sell_age = if sell_as_of_slot > 0 {
+                    chain_slot.saturating_sub(sell_as_of_slot)
+                } else {
+                    u64::MAX
+                };
+                if buy_age > config.arb_max_leg_age_slots || sell_age > config.arb_max_leg_age_slots
+                {
+                    record_arb_round_trip_by_dex_pair(
+                        &selection.buy_dex,
+                        &selection.sell_dex,
+                        "leg_too_old",
+                    );
+                    arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::LegSlotTooOld);
+                    return None;
+                }
+            }
         }
 
         let buy_pool = self.pools.get(&selection.buy_pool_address)?;
@@ -3607,9 +3863,9 @@ impl TokenArbTracker {
             .unwrap_or(config.max_position_lamports)
             .max(probe);
 
-        let profit_lamports = selection.sell_quote.amount_out as i64
-            - probe as i64
-            - config.est_tx_cost_lamports as i64;
+        let profit_lamports_i128 = i128::from(selection.sell_quote.amount_out)
+            - i128::from(probe)
+            - i128::from(config.est_tx_cost_lamports);
 
         let buy_liquidity_unknown =
             !buy_pool.has_reserve_data && buy_pool.liquidity_sol <= Decimal::ZERO;
@@ -3621,11 +3877,47 @@ impl TokenArbTracker {
             config.min_profit_lamports
         };
 
-        let spread_bps = if probe > 0 {
-            let gross = selection.sell_quote.amount_out as i64 - probe as i64;
-            (gross * 10_000 / probe as i64).clamp(i64::MIN, i64::MAX) as i32
-        } else {
-            0
+        if probe == 0 {
+            record_arb_quote_invariant_violation(&selection.buy_dex, "zero_probe");
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "arithmetic_invalid",
+            );
+            return None;
+        }
+        let spread_bps_i128 = (i128::from(selection.sell_quote.amount_out) - i128::from(probe))
+            .saturating_mul(10_000)
+            / i128::from(probe);
+        let (Ok(spread_bps), Ok(profit_lamports)) = (
+            i32::try_from(spread_bps_i128),
+            i64::try_from(profit_lamports_i128),
+        ) else {
+            record_arb_quote_invariant_violation(&selection.buy_dex, "arithmetic_range");
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "arithmetic_invalid",
+            );
+            log_v2_gate_forensics(
+                3,
+                "arithmetic_invalid",
+                &self.base_mint,
+                token_decimals,
+                probe,
+                &selection.buy_dex,
+                &selection.buy_pool_address,
+                buy_as_of_slot,
+                selection.buy_quote.amount_out,
+                &selection.sell_dex,
+                &selection.sell_pool_address,
+                sell_as_of_slot,
+                selection.sell_quote.amount_out,
+                slot_delta,
+                Some(spread_bps_i128),
+                Some(profit_lamports_i128),
+            );
+            return None;
         };
 
         let max_spread = if self.base_mint == USDC_MINT || self.base_mint == USDT_MINT {
@@ -3635,6 +3927,29 @@ impl TokenArbTracker {
         };
 
         if spread_bps < config.min_spread_bps as i32 {
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "spread_below",
+            );
+            log_v2_gate_forensics(
+                1,
+                "spread_below",
+                &self.base_mint,
+                token_decimals,
+                probe,
+                &selection.buy_dex,
+                &selection.buy_pool_address,
+                buy_as_of_slot,
+                selection.buy_quote.amount_out,
+                &selection.sell_dex,
+                &selection.sell_pool_address,
+                sell_as_of_slot,
+                selection.sell_quote.amount_out,
+                slot_delta,
+                Some(spread_bps_i128),
+                Some(profit_lamports_i128),
+            );
             record_arb_two_hop_v2_formable_gates(
                 spread_bps,
                 profit_lamports,
@@ -3645,6 +3960,29 @@ impl TokenArbTracker {
         }
 
         if spread_bps as i64 > max_spread {
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "spread_above",
+            );
+            log_v2_gate_forensics(
+                2,
+                "spread_above",
+                &self.base_mint,
+                token_decimals,
+                probe,
+                &selection.buy_dex,
+                &selection.buy_pool_address,
+                buy_as_of_slot,
+                selection.buy_quote.amount_out,
+                &selection.sell_dex,
+                &selection.sell_pool_address,
+                sell_as_of_slot,
+                selection.sell_quote.amount_out,
+                slot_delta,
+                Some(spread_bps_i128),
+                Some(profit_lamports_i128),
+            );
             record_arb_two_hop_v2_formable_gates(
                 spread_bps,
                 profit_lamports,
@@ -3655,6 +3993,11 @@ impl TokenArbTracker {
         }
 
         if profit_lamports < effective_min_profit as i64 {
+            record_arb_round_trip_by_dex_pair(
+                &selection.buy_dex,
+                &selection.sell_dex,
+                "profit_below",
+            );
             record_arb_two_hop_v2_formable_gates(
                 spread_bps,
                 profit_lamports,
@@ -3669,6 +4012,7 @@ impl TokenArbTracker {
             profit_lamports,
             ArbTwoHopV2FormableGateOutcome::PassedGates,
         );
+        record_arb_round_trip_by_dex_pair(&selection.buy_dex, &selection.sell_dex, "passed");
 
         let buy_price = Decimal::from(selection.buy_quote.amount_in)
             / Decimal::from(1_000_000_000u64)
@@ -4644,6 +4988,34 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
                             .read()
                             .contains_key(&mint)
                     {
+                        let pending = ctx
+                            .v2_sell_stale_recovery_pending
+                            .read()
+                            .get(&mint)
+                            .cloned();
+                        if let Some(pending) = pending {
+                            if ctx.try_v2_recovery_completeness_from_live_cache(&mint, &pending) {
+                                continue;
+                            }
+                            if pending.scheduled_at.elapsed()
+                                < Duration::from_millis(V2_SELL_STALE_RECOVERY_RESCREEN_GRACE_MS)
+                            {
+                                continue;
+                            }
+                            match pending.sell_detail {
+                                Some(NoCrossDexSellDetailReason::SellMissingVault) => {
+                                    inc_arb_v2_sell_stale_recovery_outcome_total(
+                                        "still_missing_vault",
+                                    );
+                                }
+                                Some(NoCrossDexSellDetailReason::SellMissingDlmmBins) => {
+                                    inc_arb_v2_sell_stale_recovery_outcome_total(
+                                        "still_missing_bins",
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
                         inc_arb_v2_sell_stale_recovery_outcome_total("rescreen_still_stale");
                     }
                     let Some(opp) = opp else {
@@ -4920,6 +5292,9 @@ struct ArbContext {
     /// This is different from per-pool staleness: inactive pools are still "fresh" data.
     last_market_event: RwLock<Instant>,
 
+    /// Monotonic Geyser chain head (max slot from MarketEvents in this process). I-7: no RPC.
+    chain_head_slot: AtomicU64,
+
     // =========================================================================
     // Geyser-based Pool State Cache (from PoolStateUpdate / BinArrayUpdate)
     // =========================================================================
@@ -5021,6 +5396,31 @@ impl ArbContext {
     /// Record that a MarketEvent was received on the NATS wire (Geyser liveness).
     fn mark_market_event_seen(&self) {
         *self.last_market_event.write() = Instant::now();
+    }
+
+    fn bump_chain_head_slot(&self, slot: Option<u64>) {
+        let Some(slot) = slot else {
+            return;
+        };
+        if slot == 0 {
+            return;
+        }
+        let mut current = self.chain_head_slot.load(Ordering::Relaxed);
+        while slot > current {
+            match self.chain_head_slot.compare_exchange_weak(
+                current,
+                slot,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn chain_head_slot_value(&self) -> u64 {
+        self.chain_head_slot.load(Ordering::Relaxed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5304,6 +5704,20 @@ impl ArbContext {
                         } else {
                             rejected
                                 .push((key.clone(), "Must be 0-32 (0 disables gate)".to_string()));
+                        }
+                    } else {
+                        rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
+                    }
+                }
+                "arb_max_leg_age_slots" => {
+                    if let Some(v) = value.as_u64() {
+                        if v <= 512 {
+                            config.arb_max_leg_age_slots = v;
+                            applied.push(key.clone());
+                            info!(key = %key, new_value = %v, "Config updated");
+                        } else {
+                            rejected
+                                .push((key.clone(), "Must be 0-512 (0 disables gate)".to_string()));
                         }
                     } else {
                         rejected.push((key.clone(), "Invalid type, expected u64".to_string()));
@@ -5875,14 +6289,6 @@ impl ArbContext {
         let vault_wait = Instant::now();
         let mut cache = self.vault_balances.write();
         record_arb_writer_lock_wait(ArbWriterLockKind::VaultBalancesWrite, vault_wait.elapsed());
-        let should_update_vault = match cache.get(pool_address) {
-            Some(existing) => update_slot >= existing.update_slot,
-            None => true,
-        };
-        if !should_update_vault {
-            return;
-        }
-        let is_new = !cache.contains_key(pool_address);
         let dlmm_token_x_mint = if dex == "meteora_dlmm" {
             resolve_dlmm_token_x_mint_for_pool_update(pool_address, &cache, &self.live_pool_cache)
         } else {
@@ -5891,19 +6297,26 @@ impl ArbContext {
                 .and_then(|v| v.dlmm_token_x_mint.clone())
         };
         let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
-        cache.insert(
-            pool_address.to_string(),
-            VaultBalanceCache {
-                reserve_base,
-                reserve_quote,
-                update_slot,
-                active_id,
-                bin_step,
-                updated_at: Instant::now(),
-                dlmm_sol_is_x,
-                dlmm_token_x_mint,
-            },
-        );
+        let new_vault = VaultBalanceCache {
+            reserve_base,
+            reserve_quote,
+            update_slot,
+            active_id,
+            bin_step,
+            updated_at: Instant::now(),
+            dlmm_sol_is_x,
+            dlmm_token_x_mint,
+        };
+        if let Some(existing) = cache.get(pool_address) {
+            if vault_material_unchanged(&new_vault, existing) {
+                return;
+            }
+            if update_slot < existing.update_slot {
+                return;
+            }
+        }
+        let is_new = !cache.contains_key(pool_address);
+        cache.insert(pool_address.to_string(), new_vault);
         if is_new {
             debug!(
                 pool = %pool_address,
@@ -5986,21 +6399,27 @@ impl ArbContext {
         update_slot: u64,
     ) {
         inc_arb_dlmm_bin_array_update_received_total();
+        let new_fp = bin_array_material_fingerprint(&bins);
         let mut cache = self.bin_arrays.write();
         let pool_cache = cache.entry(pool_address.to_string()).or_default();
-        let bins_count = bins.len();
-        let should_update = match pool_cache.get(&bin_array_index) {
-            Some(existing) => update_slot >= existing.update_slot,
+        let material_changed = match pool_cache.get(&bin_array_index) {
+            Some(existing) => bin_array_material_fingerprint(&existing.bins) != new_fp,
             None => true,
         };
-        if !should_update {
+        if !material_changed {
             return;
+        }
+        let bins_count = bins.len();
+        if let Some(existing) = pool_cache.get(&bin_array_index) {
+            if update_slot < existing.update_slot {
+                return;
+            }
         }
         pool_cache.insert(bin_array_index, BinArrayCache { bins, update_slot });
         inc_arb_dlmm_bin_array_update_applied_total();
         drop(cache);
 
-        // Bin liquidity updates are a valid DLMM price signal (H3): refresh vault + pool timestamps.
+        // Bin liquidity updates are a valid DLMM price signal: refresh vault material slot.
         let now = Instant::now();
         {
             let pinned = self.arb_pinned_pools.read();
@@ -6016,17 +6435,18 @@ impl ArbContext {
                 &self.live_pool_cache,
                 &mut vault_cache,
             );
-            if vault_cache.contains_key(pool_address)
-                && !try_refresh_vault_from_live_cache(
-                    pool_address,
-                    &self.live_pool_cache,
-                    &mut vault_cache,
-                    pin_class,
-                )
-            {
-                if let Some(v) = vault_cache.get_mut(pool_address) {
-                    v.updated_at = now;
+            if try_refresh_vault_from_live_cache(
+                pool_address,
+                &self.live_pool_cache,
+                &mut vault_cache,
+                pin_class,
+            ) {
+                // refreshed from live cache with material change
+            } else if let Some(v) = vault_cache.get_mut(pool_address) {
+                if update_slot >= v.update_slot {
+                    v.update_slot = update_slot;
                 }
+                v.updated_at = now;
             }
         }
         let read_wait = Instant::now();
@@ -6280,6 +6700,32 @@ impl ArbContext {
             return None;
         }
 
+        let Ok(pool_pk) = Pubkey::from_str(pool_address) else {
+            record_arb_pool_identity_check(dex, "invalid_pubkey");
+            debug!(pool = %pool_address, mint = %mint, dex = %dex, "Trade rejected: invalid pool pubkey");
+            return None;
+        };
+        let Some((cached_state, _, _)) = self.live_pool_cache.get_with_metadata(&pool_pk) else {
+            record_arb_pool_identity_check(dex, "absent");
+            debug!(pool = %pool_address, mint = %mint, dex = %dex, "Trade deferred: pool absent from authoritative Geyser cache");
+            return None;
+        };
+        if !cached_pool_authorizes_arb_trade(&cached_state, dex, mint, quote_mint) {
+            record_arb_pool_identity_check(dex, "mismatch");
+            record_arb_pin_quality_stage(pool_address, "slave_update", "identity_mismatch", None);
+            record_arb_pin_quality_completeness(pool_address, dex, "identity_mismatch");
+            debug!(
+                pool = %pool_address,
+                mint = %mint,
+                quote_mint = %quote_mint,
+                trade_dex = %dex,
+                cached_dex = %cached_state.dex_name(),
+                "Trade rejected: pool identity does not match authoritative Geyser cache"
+            );
+            return None;
+        }
+        record_arb_pool_identity_check(dex, "match");
+
         // DATA QUALITY: Reject trades with zero amounts (parser failed to extract token balance)
         if token_amount == 0 || sol_amount == 0 {
             self.zero_amount_trades.fetch_add(1, Ordering::Relaxed);
@@ -6409,17 +6855,15 @@ impl ArbContext {
         };
 
         self.apply_pending_pool_accounts(pool_address, mint, quote_mint);
-        if let Ok(pool_pk) = Pubkey::from_str(pool_address) {
-            if let Some((state, _, _)) = self.live_pool_cache.get_with_metadata(&pool_pk) {
-                let mut trackers = self.trackers.write();
-                if let Some(tracker) = trackers.get_mut(mint) {
-                    maybe_backfill_tracker_pool_accounts_from_cache(
-                        pool_pk,
-                        pool_address,
-                        &state,
-                        tracker,
-                    );
-                }
+        {
+            let mut trackers = self.trackers.write();
+            if let Some(tracker) = trackers.get_mut(mint) {
+                maybe_backfill_tracker_pool_accounts_from_cache(
+                    pool_pk,
+                    pool_address,
+                    &cached_state,
+                    tracker,
+                );
             }
         }
 
@@ -6509,6 +6953,7 @@ impl ArbContext {
                 v2_forensics: Some(&self.v2_eligibility_forensics),
                 selected_mints: Some(&selected_mints),
                 pinned_pools: Some(&pinned_pools),
+                chain_head_slot: self.chain_head_slot_value(),
             },
         )
     }
@@ -6579,7 +7024,7 @@ impl ArbContext {
             Some(q) => q,
             None => return false,
         };
-        if !is_quote_fresh(&buy_quote, &freshness, buy.vault, now) {
+        if !is_quote_fresh_with_bins(&buy_quote, &freshness, buy.vault, buy.dlmm_bins, now) {
             return false;
         }
         classify_cross_dex_sell_failure(
@@ -6592,7 +7037,7 @@ impl ArbContext {
         .is_none()
     }
 
-    /// Force QuoteReady republish for both cross-DEX legs (bypasses unchanged-pin skip).
+    /// Force QuoteReady/Executable republish for both cross-DEX legs (bypasses unchanged-pin skip).
     fn publish_v2_sell_leg_recovery_repins(self: &Arc<Self>, buy_pool: &str, sell_pool: &str) {
         use ironcrab::nats::arb_track_requests::{
             ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness,
@@ -6606,11 +7051,71 @@ impl ArbContext {
             ArbTrackActiveEntry {
                 pool: sell_pool.to_string(),
                 reason: ArbTrackActiveReason::MultiDex,
-                readiness: ArbTrackReadiness::QuoteReady,
+                readiness: ArbTrackReadiness::Executable,
             },
         ];
         inc_arb_v2_sell_stale_recovery_outcome_total("republish_both_legs");
         self.spawn_publish_arb_track_requests(active, Vec::new(), false);
+    }
+
+    /// C1vault: after sell-leg recovery repin, seed/refresh vault from SLAVE LivePoolCache (Geyser-only).
+    fn try_v2_recovery_completeness_from_live_cache(
+        self: &Arc<Self>,
+        mint: &str,
+        pending: &V2SellStaleRecoveryPending,
+    ) -> bool {
+        let sell_pool = pending.sell_pool.as_str();
+        let pin_class = "pin";
+        let seeded = {
+            let mut vault_cache = self.vault_balances.write();
+            if try_refresh_vault_from_live_cache(
+                sell_pool,
+                &self.live_pool_cache,
+                &mut vault_cache,
+                pin_class,
+            ) {
+                inc_arb_vault_live_snapshot_refreshed_total();
+                true
+            } else if try_seed_vault_from_live_cache(
+                sell_pool,
+                &self.live_pool_cache,
+                &mut vault_cache,
+                pin_class,
+            ) {
+                inc_arb_vault_live_snapshot_seeded_total();
+                true
+            } else {
+                false
+            }
+        };
+        if seeded {
+            inc_arb_vault_seed_from_cache_ok_total();
+            let bins_still_missing = self
+                .trackers
+                .read()
+                .get(mint)
+                .and_then(|t| t.pools.get(sell_pool))
+                .is_some_and(|p| {
+                    p.dex == "meteora_dlmm"
+                        && self
+                            .bin_arrays
+                            .read()
+                            .get(sell_pool)
+                            .is_none_or(|bins| bins.is_empty())
+                });
+            if bins_still_missing {
+                // Vault refresh alone does not resolve missing DLMM bins; keep 5s completeness retry.
+                return false;
+            }
+            inc_arb_v2_sell_stale_recovery_outcome_total("fresh_after_vault_seed");
+            if let Some(entry) = self.v2_sell_stale_recovery_pending.write().get_mut(mint) {
+                entry.completeness_seeded = true;
+            }
+            self.schedule_arb_vault_rescreen_for_mints(sell_pool, &[mint.to_string()]);
+            return true;
+        }
+        inc_arb_vault_seed_from_cache_miss_total();
+        false
     }
 
     /// Two-hop v2 screen plus optional C1h5 sell-leg recovery (spawn_blocking only).
@@ -6664,9 +7169,14 @@ impl ArbContext {
         {
             let pending = self.v2_sell_stale_recovery_pending.read();
             if let Some(prev) = pending.get(mint) {
-                if prev.scheduled_at.elapsed()
-                    < Duration::from_millis(V2_SELL_STALE_RECOVERY_MIN_INTERVAL_MS)
+                let interval_ms = if v2_sell_recovery_is_completeness_detail(prev.sell_detail)
+                    && !prev.completeness_seeded
                 {
+                    V2_SELL_STALE_RECOVERY_COMPLETENESS_MIN_INTERVAL_MS
+                } else {
+                    V2_SELL_STALE_RECOVERY_MIN_INTERVAL_MS
+                };
+                if prev.scheduled_at.elapsed() < Duration::from_millis(interval_ms) {
                     inc_arb_v2_sell_stale_recovery_outcome_total("skipped_rate_limit");
                     return;
                 }
@@ -6719,6 +7229,7 @@ impl ArbContext {
         if !recoverable {
             return;
         }
+        let sell_detail = insufficient.no_cross_dex_sell_detail;
 
         let now = Instant::now();
         let mut recovery_pair: Option<(String, String)> = None;
@@ -6738,7 +7249,7 @@ impl ArbContext {
             ) else {
                 continue;
             };
-            if !is_quote_fresh(&buy_quote, &freshness, buy.vault, now) {
+            if !is_quote_fresh_with_bins(&buy_quote, &freshness, buy.vault, buy.dlmm_bins, now) {
                 continue;
             }
             buy_checks += 1;
@@ -6768,18 +7279,21 @@ impl ArbContext {
             return;
         };
 
-        self.v2_sell_stale_recovery_pending.write().insert(
-            mint.clone(),
-            V2SellStaleRecoveryPending {
-                scheduled_at: Instant::now(),
-                buy_pool: buy_pool.clone(),
-                sell_pool: sell_pool.clone(),
-            },
-        );
+        let pending = V2SellStaleRecoveryPending {
+            scheduled_at: Instant::now(),
+            buy_pool: buy_pool.clone(),
+            sell_pool: sell_pool.clone(),
+            sell_detail,
+            completeness_seeded: false,
+        };
+        self.v2_sell_stale_recovery_pending
+            .write()
+            .insert(mint.clone(), pending.clone());
         inc_arb_v2_screen_sell_stale_recovery_scheduled_total();
         inc_arb_v2_sell_stale_recovery_outcome_total("scheduled");
         self.arb_track_selection.mark_dirty(mint);
         self.publish_v2_sell_leg_recovery_repins(&buy_pool, &sell_pool);
+        self.try_v2_recovery_completeness_from_live_cache(mint, &pending);
     }
 
     /// Re-screen selected mints when DLMM bins arrive after the last trade-driven screen (H4).
@@ -6940,6 +7454,7 @@ impl ArbContext {
                 v2_forensics: Some(&self.v2_eligibility_forensics),
                 selected_mints: Some(&selected_mints),
                 pinned_pools: Some(&pinned_pools),
+                chain_head_slot: self.chain_head_slot_value(),
             },
         )?;
         self.finalize_trade_opportunity(mint, config.intent_cooldown_ms, opp)
@@ -7019,6 +7534,12 @@ impl ArbContext {
 
         if chunks.is_empty() {
             return;
+        }
+
+        for chunk in &chunks {
+            for entry in &chunk.active {
+                record_arb_pin_quality_pin(&entry.pool, chunk.ts_unix_ms);
+            }
         }
 
         self.arb_track_published
@@ -7224,6 +7745,17 @@ impl ArbContext {
         };
         drop(config);
 
+        let vault_balances_snapshot = self.vault_balances.read().clone();
+        let bin_arrays_snapshot = self.bin_arrays.read().clone();
+        let pool_dex: HashMap<String, String> = mint_inputs
+            .iter()
+            .flat_map(|mint| {
+                mint.pools
+                    .iter()
+                    .map(|pool| (pool.pool_address.clone(), pool.dex.clone()))
+            })
+            .collect();
+
         let result = select_arb_track_pools(&mint_inputs, &selection_config);
         set_arb_track_selection_metrics(
             result.selected.len(),
@@ -7235,7 +7767,20 @@ impl ArbContext {
 
         let mut selected_pool_counts = TrackCandidateCounts::default();
         for pool in &result.selected {
-            selected_pool_counts.record(pool.readiness);
+            let dex = pool_dex.get(&pool.pool).map(String::as_str).unwrap_or("");
+            let wire = wire_readiness_for_selected_pool(
+                &pool.pool,
+                dex,
+                pool.readiness,
+                &vault_balances_snapshot,
+                &bin_arrays_snapshot,
+            );
+            selected_pool_counts.record(match wire {
+                ArbTrackReadiness::Executable => TrackPoolReadiness::Executable,
+                ArbTrackReadiness::QuoteReady => TrackPoolReadiness::QuoteReady,
+                ArbTrackReadiness::Warmable => TrackPoolReadiness::Warmable,
+                ArbTrackReadiness::Rejected => TrackPoolReadiness::Rejected,
+            });
         }
         set_arb_track_selected_pool_readiness_metrics(&selected_pool_counts);
 
@@ -7272,14 +7817,23 @@ impl ArbContext {
             result
                 .selected
                 .iter()
-                .map(|p| ArbTrackActiveEntry {
-                    pool: p.pool.clone(),
-                    reason: if p.active_reason == ArbTrackActiveReason::TradeSignal {
-                        ArbTrackActiveReason::TradeSignal
-                    } else {
-                        ArbTrackActiveReason::Baseline
-                    },
-                    readiness: track_pool_readiness_to_wire(p.readiness),
+                .map(|p| {
+                    let dex = pool_dex.get(&p.pool).map(String::as_str).unwrap_or("");
+                    ArbTrackActiveEntry {
+                        pool: p.pool.clone(),
+                        reason: if p.active_reason == ArbTrackActiveReason::TradeSignal {
+                            ArbTrackActiveReason::TradeSignal
+                        } else {
+                            ArbTrackActiveReason::Baseline
+                        },
+                        readiness: wire_readiness_for_selected_pool(
+                            &p.pool,
+                            dex,
+                            p.readiness,
+                            &vault_balances_snapshot,
+                            &bin_arrays_snapshot,
+                        ),
+                    }
                 })
                 .collect()
         } else {
@@ -7287,10 +7841,19 @@ impl ArbContext {
                 .selected
                 .iter()
                 .filter(|p| !old_pools.contains(&p.pool))
-                .map(|p| ArbTrackActiveEntry {
-                    pool: p.pool.clone(),
-                    reason: p.active_reason,
-                    readiness: track_pool_readiness_to_wire(p.readiness),
+                .map(|p| {
+                    let dex = pool_dex.get(&p.pool).map(String::as_str).unwrap_or("");
+                    ArbTrackActiveEntry {
+                        pool: p.pool.clone(),
+                        reason: p.active_reason,
+                        readiness: wire_readiness_for_selected_pool(
+                            &p.pool,
+                            dex,
+                            p.readiness,
+                            &vault_balances_snapshot,
+                            &bin_arrays_snapshot,
+                        ),
+                    }
                 })
                 .collect::<Vec<_>>()
         };
@@ -7682,6 +8245,21 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
 
 fn apply_pool_cache_jetstream_message(ctx: &ArbContext, update: PoolCacheUpdate) {
     arb_strategy_pool_cache_update_seen_inc();
+    let cohort = arb_pin_quality_cohort_member(&update.pool_address);
+    if cohort {
+        let slot_outcome = record_arb_pin_quality_slot(&update.pool_address, update.geyser_slot);
+        if slot_outcome == "regression" {
+            warn!(
+                kind = "arb_pin_quality",
+                stage = "slave_update",
+                outcome = "slot_regression",
+                pool = %update.pool_address,
+                dex = %update.dex,
+                geyser_slot = update.geyser_slot,
+                "Cohort PoolCacheUpdate regressed in slot"
+            );
+        }
+    }
     if !matches!(update.update_type, PoolCacheUpdateType::PoolRemoved)
         && arb_tracked_token_mint(&update.base_mint, &update.quote_mint).is_none()
     {
@@ -7693,6 +8271,20 @@ fn apply_pool_cache_jetstream_message(ctx: &ArbContext, update: PoolCacheUpdate)
         ctx.multi_hop.as_ref(),
         &update,
     ) {
+        if cohort {
+            let outcome = if update.base_reserve == 0 || update.quote_reserve == 0 {
+                "missing_vault"
+            } else {
+                "complete"
+            };
+            record_arb_pin_quality_stage(
+                &update.pool_address,
+                "slave_update",
+                outcome,
+                Some(update.header.ts_unix_ms),
+            );
+            record_arb_pin_quality_completeness(&update.pool_address, &update.dex, outcome);
+        }
         ctx.multi_hop
             .touch_live_pool_quote_ready(&update.pool_address);
         if !ctx.tracker_write.try_enqueue(
@@ -7701,6 +8293,12 @@ fn apply_pool_cache_jetstream_message(ctx: &ArbContext, update: PoolCacheUpdate)
             },
             ArbTrackerWriteJobType::SeedPoolCache,
         ) {
+            record_arb_pin_quality_stage(
+                &update.pool_address,
+                "tracker_seeded",
+                "queue_drop",
+                Some(update.header.ts_unix_ms),
+            );
             debug!(
                 pool = %update.pool_address,
                 "Dropped PoolCache tracker seed (single-writer queue full)"
@@ -7741,6 +8339,12 @@ fn process_arb_tracker_write_job(ctx: Arc<ArbContext>, job: ArbTrackerWriteJob) 
             let vault_seeded = ctx.consume_vault_seed_from_pool_cache_update(&update);
             let tracker_seeded = ctx.seed_trackers_for_pool_cache_update(&update);
             if tracker_seeded || vault_seeded {
+                record_arb_pin_quality_stage(
+                    &update.pool_address,
+                    "tracker_seeded",
+                    "complete",
+                    Some(update.header.ts_unix_ms),
+                );
                 arb_strategy_pool_cache_update_seeded_inc();
                 if let Some(mint) = arb_tracked_token_mint(&update.base_mint, &update.quote_mint) {
                     ctx.publish_proactive_arb_track_for_mint(mint);
@@ -8389,6 +8993,7 @@ async fn main() -> Result<()> {
         zero_amount_trades: AtomicU64::new(0),
         data_quality_rejects: AtomicU64::new(0),
         last_market_event: RwLock::new(Instant::now()),
+        chain_head_slot: AtomicU64::new(0),
         vault_balances: RwLock::new(HashMap::new()),
         bin_arrays: RwLock::new(HashMap::new()),
         live_pool_cache,
@@ -8877,6 +9482,7 @@ async fn main() -> Result<()> {
 async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<TradeIntent> {
     // Update Geyser connection health timestamp on every event
     *ctx.last_market_event.write() = Instant::now();
+    ctx.bump_chain_head_slot(event.slot);
 
     match &event.kind {
         MarketEventKind::Trade {
@@ -9061,6 +9667,121 @@ mod event_pipeline_tests {
     const TEST_COMPONENT: &str = "test";
     const TEST_BUILD: &str = "0.0.0";
     const TEST_RUN: &str = "run-test";
+
+    fn seed_test_raydium_trade_identity(
+        cache: &SharedLivePoolCache,
+        pool: Pubkey,
+        mint: Pubkey,
+        slot: u64,
+    ) {
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(ironcrab::execution::live_pool_cache::RaydiumAmmState {
+                base_mint: mint,
+                quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 6,
+                quote_decimals: 9,
+                coin_reserve: Some(5_000_000),
+                pc_reserve: Some(10_000_000_000),
+                market_id: Pubkey::new_unique(),
+                serum_bids: Some(Pubkey::new_unique()),
+                serum_asks: Some(Pubkey::new_unique()),
+                serum_event_queue: Some(Pubkey::new_unique()),
+                serum_base_vault: Some(Pubkey::new_unique()),
+                serum_quote_vault: Some(Pubkey::new_unique()),
+            }),
+            slot,
+        );
+    }
+
+    #[test]
+    fn arb_trade_identity_requires_account_seeded_matching_pool_metadata() {
+        let mint = Pubkey::new_unique();
+        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let wrong_pool = Pubkey::new_unique();
+        let mut state = ironcrab::execution::live_pool_cache::orca_whirlpool_tx_layout_seed(
+            mint,
+            sol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let mint_str = mint.to_string();
+
+        assert!(!cached_pool_authorizes_arb_trade(
+            &CachedPoolState::Orca(state.clone()),
+            "orca",
+            &mint_str,
+            NATIVE_SOL_MINT,
+        ));
+
+        state.whirlpool_quote_account_seeded = true;
+        assert!(cached_pool_authorizes_arb_trade(
+            &CachedPoolState::Orca(state.clone()),
+            "orca",
+            &mint_str,
+            NATIVE_SOL_MINT,
+        ));
+        assert!(!cached_pool_authorizes_arb_trade(
+            &CachedPoolState::Orca(state),
+            "meteora_dlmm",
+            &mint_str,
+            NATIVE_SOL_MINT,
+        ));
+
+        let cache = ironcrab::execution::live_pool_cache::create_shared_cache();
+        let ctx = test_arb_context(cache.clone());
+        let apply = |pool: Pubkey, mint: &str, dex: &str| {
+            ctx.apply_trade_to_tracker(
+                &pool.to_string(),
+                mint,
+                NATIVE_SOL_MINT,
+                1_000_000,
+                1_000_000,
+                6,
+                true,
+                dex,
+            )
+        };
+
+        assert!(apply(pool, &mint_str, "orca").is_none(), "missing address");
+        let unseeded = ironcrab::execution::live_pool_cache::orca_whirlpool_tx_layout_seed(
+            mint,
+            sol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        cache.upsert(pool, CachedPoolState::Orca(unseeded.clone()), 1);
+        assert!(
+            apply(pool, &mint_str, "orca").is_none(),
+            "unseeded metadata"
+        );
+        let mut authoritative = unseeded;
+        authoritative.whirlpool_quote_account_seeded = true;
+        cache.upsert(pool, CachedPoolState::Orca(authoritative), 2);
+        assert!(
+            apply(pool, &mint_str, "meteora_dlmm").is_none(),
+            "wrong DEX"
+        );
+        assert!(
+            apply(pool, &Pubkey::new_unique().to_string(), "orca").is_none(),
+            "wrong mint pair"
+        );
+        assert!(
+            apply(wrong_pool, &mint_str, "orca").is_none(),
+            "wrong address"
+        );
+        assert!(
+            ctx.trackers.read().is_empty(),
+            "rejected trades must not mutate trackers"
+        );
+        assert!(
+            apply(pool, &mint_str, "orca").is_some(),
+            "all four checks pass"
+        );
+    }
 
     fn sample_trade_event(pool: &str) -> MarketEvent {
         MarketEvent::new(
@@ -9494,6 +10215,9 @@ mod event_pipeline_tests {
         use ironcrab::execution::live_pool_cache::create_shared_cache;
 
         let live_pool_cache = create_shared_cache();
+        let pool_pk = Pubkey::new_unique();
+        let mint_pk = Pubkey::new_unique();
+        seed_test_raydium_trade_identity(&live_pool_cache, pool_pk, mint_pk, 99);
         let log_dir = std::env::temp_dir().join(format!("arb_coalesce_snap_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&log_dir).expect("test log dir");
         let jsonl_writer =
@@ -9521,6 +10245,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -9549,13 +10274,13 @@ mod event_pipeline_tests {
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
-        let pool = "pool-coalesce-snap";
-        let mint = "TokenMint11111111111111111111111111111111";
-        ctx.handle_pool_created(pool, mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
+        let pool = pool_pk.to_string();
+        let mint = mint_pk.to_string();
+        ctx.handle_pool_created(&pool, &mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
 
         const COALESCED_SLOT: u64 = 99;
         ctx.coalesce_pool_state_update(
-            pool.to_string(),
+            pool.clone(),
             "raydium".to_string(),
             5_000_000,
             10_000_000_000,
@@ -9572,8 +10297,8 @@ mod event_pipeline_tests {
             ctx.tracker_write.try_enqueue(
                 ArbTrackerWriteJob::ApplyTrade {
                     job: ArbTwoHopTradeJob {
-                        pool_address: pool.to_string(),
-                        mint: mint.to_string(),
+                        pool_address: pool.clone(),
+                        mint: mint.clone(),
                         quote_mint: NATIVE_SOL_MINT.to_string(),
                         sol_amount: 10_000_000,
                         token_amount: 1_000_000,
@@ -9597,7 +10322,7 @@ mod event_pipeline_tests {
             .expect("ApplyTrade must succeed");
         let vault = apply_result
             .vault_balances
-            .get(pool)
+            .get(&pool)
             .expect("coalesced pool state must be in ApplyTrade snapshot");
         assert_eq!(
             vault.update_slot, COALESCED_SLOT,
@@ -9610,6 +10335,9 @@ mod event_pipeline_tests {
         use ironcrab::execution::live_pool_cache::create_shared_cache;
 
         let live_pool_cache = create_shared_cache();
+        let pool_pk = Pubkey::new_unique();
+        let mint_pk = Pubkey::new_unique();
+        seed_test_raydium_trade_identity(&live_pool_cache, pool_pk, mint_pk, 42);
         let log_dir = std::env::temp_dir().join(format!("arb_writer_test_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&log_dir).expect("test log dir");
         let jsonl_writer =
@@ -9637,6 +10365,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -9665,12 +10394,12 @@ mod event_pipeline_tests {
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
-        let pool = "pool-writer-decouple";
-        let mint = "TokenMint11111111111111111111111111111111";
-        ctx.handle_pool_created(pool, mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
+        let pool = pool_pk.to_string();
+        let mint = mint_pk.to_string();
+        ctx.handle_pool_created(&pool, &mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
 
         ctx.coalesce_pool_state_update(
-            pool.to_string(),
+            pool.clone(),
             "raydium".to_string(),
             5_000_000,
             10_000_000_000,
@@ -9687,8 +10416,8 @@ mod event_pipeline_tests {
             ctx.tracker_write.try_enqueue(
                 ArbTrackerWriteJob::ApplyTrade {
                     job: ArbTwoHopTradeJob {
-                        pool_address: pool.to_string(),
-                        mint: mint.to_string(),
+                        pool_address: pool.clone(),
+                        mint: mint.clone(),
                         quote_mint: NATIVE_SOL_MINT.to_string(),
                         sol_amount: 10_000_000,
                         token_amount: 1_000_000,
@@ -9713,7 +10442,7 @@ mod event_pipeline_tests {
         assert!(
             apply_result
                 .vault_balances
-                .get(pool)
+                .get(&pool)
                 .is_some_and(|v| v.update_slot == 42),
             "ApplyTrade snapshot must include flushed coalesced reserves"
         );
@@ -9751,6 +10480,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -9932,6 +10662,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -10074,6 +10805,15 @@ mod event_pipeline_tests {
         use ironcrab::execution::live_pool_cache::create_shared_cache;
 
         let live_pool_cache = create_shared_cache();
+        let mint_pk = Pubkey::new_unique();
+        let tracker_pool_pks = [
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        for pool in tracker_pool_pks {
+            seed_test_raydium_trade_identity(&live_pool_cache, pool, mint_pk, 42);
+        }
         let log_dir = std::env::temp_dir().join(format!("arb_scoped_snap_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&log_dir).expect("test log dir");
         let jsonl_writer =
@@ -10103,8 +10843,8 @@ mod event_pipeline_tests {
                 },
             );
         }
-        let tracker_pools = ["pool-a", "pool-b", "pool-c"];
-        for pool in tracker_pools {
+        let tracker_pools = tracker_pool_pks.map(|pool| pool.to_string());
+        for pool in &tracker_pools {
             vault_balances.insert(
                 pool.to_string(),
                 VaultBalanceCache {
@@ -10134,6 +10874,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(vault_balances),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -10162,9 +10903,9 @@ mod event_pipeline_tests {
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
-        let mint = "TokenMint11111111111111111111111111111111";
-        for pool in tracker_pools {
-            ctx.handle_pool_created(pool, mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
+        let mint = mint_pk.to_string();
+        for pool in &tracker_pools {
+            ctx.handle_pool_created(pool, &mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
         }
 
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -10174,7 +10915,7 @@ mod event_pipeline_tests {
                 ArbTrackerWriteJob::ApplyTrade {
                     job: ArbTwoHopTradeJob {
                         pool_address: tracker_pools[0].to_string(),
-                        mint: mint.to_string(),
+                        mint: mint.clone(),
                         quote_mint: NATIVE_SOL_MINT.to_string(),
                         sol_amount: 10_000_000,
                         token_amount: 1_000_000,
@@ -10207,7 +10948,7 @@ mod event_pipeline_tests {
             tracker_pools.len(),
             "scoped snapshot must include only tracker pools, not global cache"
         );
-        for pool in tracker_pools {
+        for pool in &tracker_pools {
             assert!(
                 apply_result.vault_balances.contains_key(pool),
                 "tracker pool {pool} missing from scoped vault snapshot"
@@ -10220,6 +10961,9 @@ mod event_pipeline_tests {
         use ironcrab::execution::live_pool_cache::create_shared_cache;
 
         let live_pool_cache = create_shared_cache();
+        let pool_pk = Pubkey::new_unique();
+        let mint_pk = Pubkey::new_unique();
+        seed_test_raydium_trade_identity(&live_pool_cache, pool_pk, mint_pk, 1);
         let log_dir = std::env::temp_dir().join(format!("arb_hb_release_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&log_dir).expect("test log dir");
         let jsonl_writer =
@@ -10246,6 +10990,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -10274,9 +11019,9 @@ mod event_pipeline_tests {
         });
         spawn_arb_tracker_write_worker(ctx.clone(), tracker_write_rx);
 
-        let pool = "pool-hb-release";
-        let mint = "TokenMint11111111111111111111111111111111";
-        ctx.handle_pool_created(pool, mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
+        let pool = pool_pk.to_string();
+        let mint = mint_pk.to_string();
+        ctx.handle_pool_created(&pool, &mint, NATIVE_SOL_MINT, "raydium", Decimal::ONE);
 
         let heartbeat_ctx = ctx.clone();
         let heartbeat_sim = std::thread::spawn(move || {
@@ -10294,8 +11039,8 @@ mod event_pipeline_tests {
             ctx.tracker_write.try_enqueue(
                 ArbTrackerWriteJob::ApplyTrade {
                     job: ArbTwoHopTradeJob {
-                        pool_address: pool.to_string(),
-                        mint: mint.to_string(),
+                        pool_address: pool.clone(),
+                        mint: mint.clone(),
                         quote_mint: NATIVE_SOL_MINT.to_string(),
                         sol_amount: 10_000_000,
                         token_amount: 1_000_000,
@@ -10362,6 +11107,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -10449,6 +11195,7 @@ mod event_pipeline_tests {
             zero_amount_trades: AtomicU64::new(0),
             data_quality_rejects: AtomicU64::new(0),
             last_market_event: RwLock::new(Instant::now()),
+            chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
@@ -10542,6 +11289,7 @@ fn test_arb_context(live_pool_cache: SharedLivePoolCache) -> ArbContext {
         zero_amount_trades: AtomicU64::new(0),
         data_quality_rejects: AtomicU64::new(0),
         last_market_event: RwLock::new(Instant::now()),
+        chain_head_slot: AtomicU64::new(0),
         vault_balances: RwLock::new(HashMap::new()),
         bin_arrays: RwLock::new(HashMap::new()),
         live_pool_cache: live_pool_cache.clone(),
@@ -10925,6 +11673,7 @@ mod two_hop_price_tests {
                 bin_step: 25,
                 reserve_x_balance: Some(1_000_000),
                 reserve_y_balance: Some(2_000_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             10,
         );
@@ -11066,6 +11815,7 @@ mod two_hop_price_tests {
                 bin_step: 20,
                 reserve_x_balance: Some(500_000),
                 reserve_y_balance: Some(1_500_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             5,
         );
@@ -11111,6 +11861,7 @@ mod two_hop_price_tests {
                 bin_step: 20,
                 reserve_x_balance: Some(800_000),
                 reserve_y_balance: Some(2_000_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             50,
         );
@@ -11384,6 +12135,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         // Same reserves → spread ~0, rejected by spread_below_min not insufficient_pools
@@ -11471,6 +12223,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         let opp = opp.expect("v2 round-trip should find cross-dex edge");
@@ -11558,11 +12311,104 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         assert!(opp.is_none(), "slot delta 99 should exceed default gate");
         assert!(
             ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED.load(Ordering::Relaxed)
+                > before
+        );
+    }
+
+    #[test]
+    fn check_arbitrage_v2_rejects_stale_leg_vs_chain_head() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool_a = Pubkey::new_unique();
+        let pool_b = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+
+        let update_orca = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_a.to_string(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            980_000_000,
+            10,
+        );
+        let update_pump = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_b.to_string(),
+            "pump_amm".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            1_020_000_000,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+
+        let mut trackers = HashMap::new();
+        let mut vault_balances = HashMap::new();
+        seed_token_tracker_from_live_pool_cache(
+            &mint_str,
+            &cache,
+            &mut trackers,
+            &mut vault_balances,
+            None,
+        );
+
+        let mut known_pools = HashSet::new();
+        known_pools.insert(pool_a.to_string());
+        known_pools.insert(pool_b.to_string());
+
+        let tracker = trackers.get_mut(&mint_str).unwrap();
+        tracker.token_decimals = Some(6);
+
+        let config = with_small_v2_probe(ArbConfig {
+            arb_two_hop_v2_enabled: true,
+            arb_max_leg_slot_delta: 512,
+            arb_max_leg_age_slots: 16,
+            min_spread_bps: 1,
+            min_profit_lamports: 1,
+            est_tx_cost_lamports: 1,
+            ..Default::default()
+        });
+
+        let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
+        let spread_warn_last = RwLock::new(HashMap::new());
+        let data_quality_rejects = AtomicU64::new(0);
+        let before =
+            ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD.load(Ordering::Relaxed);
+        let opp = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &bin_arrays,
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+                v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
+                chain_head_slot: 100,
+            },
+        );
+        assert!(
+            opp.is_none(),
+            "buy leg slot 10 vs chain 100 exceeds age gate"
+        );
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD.load(Ordering::Relaxed)
                 > before
         );
     }
@@ -11675,6 +12521,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         assert!(opp.is_none(), "equal reserves should fail spread gate");
@@ -11763,6 +12610,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         assert!(opp.is_none(), "tiny edge should fail profit gate");
@@ -11847,6 +12695,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
     }
@@ -12360,9 +13209,10 @@ mod two_hop_price_tests {
             protocol_fee_rate: orca.protocol_fee_rate,
             tick_spacing: orca.tick_spacing,
             vault_a_balance: orca.vault_a_balance,
-            vault_b_balance: orca.vault_b_balance,
+            vault_b_balance: Some(2_000_000_001),
             token_a_program: orca.token_a_program,
             token_b_program: orca.token_b_program,
+            whirlpool_quote_account_seeded: true,
         });
         cache.upsert(pool, bumped, 200);
 
@@ -12379,7 +13229,7 @@ mod two_hop_price_tests {
             mint_str.clone(),
             NATIVE_SOL_MINT.to_string(),
             1_000_000_000_000,
-            2_000_000_000,
+            2_000_000_001,
             100,
         );
         assert!(
@@ -12399,7 +13249,7 @@ mod two_hop_price_tests {
             pool_str.clone(),
             VaultBalanceCache {
                 reserve_base: 1_000_000_000_000,
-                reserve_quote: 2_000_000_000,
+                reserve_quote: 2_000_000_001,
                 update_slot: 200,
                 active_id: None,
                 bin_step: None,
@@ -12420,9 +13270,9 @@ mod two_hop_price_tests {
 
         let vault = vault_balances.get(&pool_str).expect("vault");
         assert_eq!(vault.update_slot, 200);
-        assert!(
-            vault.updated_at > stale_vault_updated_at,
-            "vault.updated_at must follow fresher cache age at seed"
+        assert_eq!(
+            vault.updated_at, stale_vault_updated_at,
+            "identical material state must not refresh vault.updated_at at seed"
         );
         let (_, _, age_ms) = cache.get_with_metadata(&pool).expect("cached");
         assert!(
@@ -12495,6 +13345,7 @@ mod two_hop_price_tests {
                 vault_b_balance: None,
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             }),
             1,
         );
@@ -12795,6 +13646,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         assert!(opp.is_none());
@@ -12870,6 +13722,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         )
     }
@@ -12898,6 +13751,7 @@ mod two_hop_price_tests {
                 v2_forensics: Some(v2_forensics),
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         )
     }
@@ -13353,6 +14207,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
+                chain_head_slot: 0,
             },
         );
         assert!(
@@ -13395,6 +14250,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: Some(&selected_mints),
                 pinned_pools: Some(&pinned_pools),
+                chain_head_slot: 0,
             },
         );
 
@@ -13460,6 +14316,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: Some(&selected_mints),
                 pinned_pools: Some(&pinned_pools),
+                chain_head_slot: 0,
             },
         );
 
@@ -14282,7 +15139,7 @@ mod two_hop_price_tests {
         );
     }
 
-    /// C1h5 v2: recovery republish includes both cross-DEX legs as QuoteReady.
+    /// C1h5 v2: recovery republish includes both cross-DEX legs; sell leg is Executable (must_hot).
     #[test]
     fn v2_sell_leg_recovery_republishes_both_legs() {
         use ironcrab::metrics::ARB_V2_SELL_STALE_RECOVERY_OUTCOME_REPUBLISH_BOTH_LEGS;
@@ -14293,6 +15150,101 @@ mod two_hop_price_tests {
         ctx.publish_v2_sell_leg_recovery_repins("buy_pool_addr", "sell_pool_addr");
         let after = ARB_V2_SELL_STALE_RECOVERY_OUTCOME_REPUBLISH_BOTH_LEGS.load(Ordering::Relaxed);
         assert_eq!(after, before + 1, "recovery must record both-leg republish");
+    }
+
+    #[test]
+    fn wire_readiness_executable_only_with_vault_and_bins() {
+        let pool = "pool_a";
+        let vaults = HashMap::from([(
+            pool.to_string(),
+            sample_vault(1_000, 1_000, None, None, false, None),
+        )]);
+        let empty_bins: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
+        assert_eq!(
+            wire_readiness_for_selected_pool(
+                pool,
+                "pump_amm",
+                TrackPoolReadiness::QuoteReady,
+                &vaults,
+                &empty_bins,
+            ),
+            ArbTrackReadiness::Executable
+        );
+        assert_eq!(
+            wire_readiness_for_selected_pool(
+                pool,
+                "pump_amm",
+                TrackPoolReadiness::QuoteReady,
+                &HashMap::new(),
+                &empty_bins,
+            ),
+            ArbTrackReadiness::Warmable
+        );
+        assert_eq!(
+            wire_readiness_for_selected_pool(
+                pool,
+                "meteora_dlmm",
+                TrackPoolReadiness::QuoteReady,
+                &vaults,
+                &empty_bins,
+            ),
+            ArbTrackReadiness::Warmable
+        );
+    }
+
+    /// C1vault: MissingVault recovery seeds sell vault from LivePoolCache and schedules rescreen.
+    #[test]
+    fn v2_recovery_missing_vault_seeds_from_live_cache() {
+        use ironcrab::metrics::ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_VAULT_SEED;
+        use solana_sdk::pubkey::Pubkey;
+
+        let cache = create_shared_cache();
+        let ctx = Arc::new(test_arb_context(cache.clone()));
+        let token_mint = Pubkey::new_unique();
+        let sell_pool = Pubkey::new_unique();
+        let buy_pool = Pubkey::new_unique();
+        let mint = token_mint.to_string();
+        let sell_pool_str = sell_pool.to_string();
+        let buy_pool_str = buy_pool.to_string();
+
+        let update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            sell_pool_str.clone(),
+            "pump_amm".to_string(),
+            mint.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            2_000_000_000,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update);
+
+        ctx.known_pools.write().insert(buy_pool_str.clone());
+        ctx.known_pools.write().insert(sell_pool_str.clone());
+        ctx.arb_selected_mints.write().insert(mint.clone());
+        ctx.arb_pinned_pools.write().insert(buy_pool_str.clone());
+        ctx.arb_pinned_pools.write().insert(sell_pool_str.clone());
+
+        let pending = V2SellStaleRecoveryPending {
+            scheduled_at: Instant::now(),
+            buy_pool: buy_pool_str,
+            sell_pool: sell_pool_str.clone(),
+            sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
+            completeness_seeded: false,
+        };
+
+        let seed_before =
+            ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_VAULT_SEED.load(Ordering::Relaxed);
+        assert!(
+            ctx.try_v2_recovery_completeness_from_live_cache(&mint, &pending),
+            "missing sell vault must seed from live cache when SLAVE row exists"
+        );
+        let seed_after =
+            ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_VAULT_SEED.load(Ordering::Relaxed);
+        assert!(seed_after > seed_before);
+        assert!(ctx.vault_balances.read().contains_key(&sell_pool_str));
     }
 }
 
@@ -14353,6 +15305,7 @@ mod pool_accounts_coverage_tests {
                 bin_step: 25,
                 reserve_x_balance: Some(1_000_000_000),
                 reserve_y_balance: Some(2_000_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             1,
         );
@@ -14373,6 +15326,7 @@ mod pool_accounts_coverage_tests {
                 vault_b_balance: Some(50_000_000),
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             }),
             1,
         );
@@ -14542,6 +15496,7 @@ mod pool_accounts_coverage_tests {
                 vault_b_balance: Some(1_000_000),
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             }),
             1,
         );

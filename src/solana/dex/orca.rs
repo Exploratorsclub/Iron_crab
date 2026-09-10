@@ -134,6 +134,29 @@ impl Orca {
             .store(skip, Ordering::Relaxed);
     }
 
+    /// True when DexPoolAccounts-style list lacks tick layout fields (accounts[5+]).
+    #[must_use]
+    pub fn orca_accounts_missing_tick_layout(accounts: &[String]) -> bool {
+        let mut has_tick = false;
+        let mut has_spacing = false;
+        for acct in accounts.iter().skip(5) {
+            if acct.starts_with("tick_current_index:") {
+                has_tick = true;
+            } else if acct.starts_with("tick_spacing:") {
+                has_spacing = true;
+            }
+        }
+        !has_tick || !has_spacing
+    }
+
+    /// LivePoolCache Orca state has tick layout required for hot-path swap build.
+    #[must_use]
+    pub fn orca_tick_layout_ready_in_cache(
+        state: &crate::execution::live_pool_cache::OrcaWhirlpoolState,
+    ) -> bool {
+        state.tick_spacing > 0
+    }
+
     /// Inject cached Orca Whirlpool state from LivePoolCache.
     ///
     /// This allows build_swap_ix to use fresh Geyser-sourced data
@@ -151,6 +174,12 @@ impl Orca {
             // Update existing entry with fresh tick data
             if let Some(mut entry) = self.pools.get_mut(pool_address) {
                 entry.tick_current_index = Some(state.tick_current_index);
+                if state.token_a_program.is_some() {
+                    entry.base_mint_program = state.token_a_program;
+                }
+                if state.token_b_program.is_some() {
+                    entry.quote_mint_program = state.token_b_program;
+                }
                 if let Some(balance_a) = state.vault_a_balance {
                     entry.reserve_base = balance_a as u128;
                 }
@@ -220,7 +249,7 @@ impl Orca {
     /// Returns None if pool is not cached.
     pub fn get_pool_accounts(&self, pool_address: &Pubkey) -> Option<Vec<String>> {
         self.pools.get(pool_address).map(|pool| {
-            vec![
+            let mut accounts = vec![
                 pool_address.to_string(),
                 pool.base_mint.to_string(),
                 pool.quote_mint.to_string(),
@@ -231,7 +260,14 @@ impl Orca {
                     pool.tick_current_index.unwrap_or(0)
                 ),
                 format!("tick_spacing:{}", pool.tick_spacing.unwrap_or(64)),
-            ]
+            ];
+            if let Some(program) = pool.base_mint_program {
+                accounts.push(format!("token_a_program:{program}"));
+            }
+            if let Some(program) = pool.quote_mint_program {
+                accounts.push(format!("token_b_program:{program}"));
+            }
+            accounts
         })
     }
 
@@ -1225,7 +1261,8 @@ impl Dex for Orca {
             AM {
                 pubkey: oracle,
                 is_signer: false,
-                is_writable: false,
+                // Adaptive-fee Whirlpools update oracle state during swaps.
+                is_writable: true,
             },
         ];
 
@@ -1470,7 +1507,8 @@ impl Dex for Orca {
             AM {
                 pubkey: oracle,
                 is_signer: false,
-                is_writable: false,
+                // Adaptive-fee Whirlpools update oracle state during swaps.
+                is_writable: true,
             },
         ];
 
@@ -1764,6 +1802,7 @@ mod tests {
                 vault_b_balance: None,
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             },
         )
         .expect("inject");
@@ -1901,6 +1940,55 @@ mod tests {
         assert_ne!(super::get_tick_array_start_index(2354285, 8), 2353573);
     }
 
+    #[test]
+    fn cached_orca_token_programs_survive_update_and_accounts_roundtrip() {
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let source = Orca::new(Arc::clone(&rpc));
+        let destination = Orca::new(rpc);
+        let pool = Pubkey::new_unique();
+        let token_a = Pubkey::new_unique();
+        let token_b = Pubkey::new_unique();
+        let token_2022 = Pubkey::new_unique();
+        let legacy_token = Pubkey::new_unique();
+        let mut state = crate::execution::live_pool_cache::OrcaWhirlpoolState {
+            token_mint_a: token_a,
+            token_mint_b: token_b,
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            tick_current_index: 0,
+            sqrt_price: 1,
+            liquidity: 1,
+            fee_rate: 300,
+            protocol_fee_rate: 0,
+            tick_spacing: 64,
+            vault_a_balance: Some(1),
+            vault_b_balance: Some(2),
+            token_a_program: None,
+            token_b_program: None,
+            whirlpool_quote_account_seeded: true,
+        };
+        source
+            .inject_cached_orca_state(&pool, &state)
+            .expect("initial inject");
+
+        state.token_a_program = Some(token_2022);
+        state.token_b_program = Some(legacy_token);
+        source
+            .inject_cached_orca_state(&pool, &state)
+            .expect("program merge");
+
+        let accounts = source.get_pool_accounts(&pool).expect("pool accounts");
+        assert!(accounts.contains(&format!("token_a_program:{token_2022}")));
+        assert!(accounts.contains(&format!("token_b_program:{legacy_token}")));
+
+        destination
+            .set_pool_from_accounts(&pool.to_string(), &accounts)
+            .expect("accounts import");
+        let imported = destination.pools.get(&pool).expect("imported pool");
+        assert_eq!(imported.base_mint_program, Some(token_2022));
+        assert_eq!(imported.quote_mint_program, Some(legacy_token));
+    }
+
     /// Cross-DEX arb: explicit pool_address_hint + injected pool must build swap IX without mint-pair scan failure.
     #[tokio::test]
     async fn test_build_swap_ix_async_uses_pool_address_hint() {
@@ -1946,6 +2034,16 @@ mod tests {
         assert!(
             ixs[0].accounts.iter().any(|a| a.pubkey == pool_pk),
             "swap ix must reference hinted whirlpool"
+        );
+        let oracle = super::derive_oracle_pda(&pool_pk);
+        let oracle_meta = ixs[0]
+            .accounts
+            .iter()
+            .find(|meta| meta.pubkey == oracle)
+            .expect("swap ix must contain oracle PDA");
+        assert!(
+            oracle_meta.is_writable,
+            "adaptive-fee Whirlpool swaps require a writable oracle"
         );
     }
 

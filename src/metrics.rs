@@ -7,6 +7,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::arb_quality::append_arb_pin_quality_metrics;
+
 /// Recent trade record for dashboard display
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecentTrade {
@@ -308,6 +310,41 @@ pub static MARKET_DATA_ARB_TRACKED_VAULTS_GAUGE: Lazy<AtomicU64> = Lazy::new(|| 
 /// Successful arb pin vault/bin Geyser registrations (one increment per register call that changed tracking).
 pub static MARKET_DATA_ARB_PIN_VAULT_REGISTER_OK_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Trade-path vault register attempts by pin tier (`pin=arb|momentum|skipped_not_hot`).
+static MARKET_DATA_TRADE_PATH_VAULT_REGISTER_ARB: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TRADE_PATH_VAULT_REGISTER_MOMENTUM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TRADE_PATH_VAULT_REGISTER_SKIPPED_NOT_HOT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Hot-gated TX `pool_accounts` apply outcomes (`result=upsert|register|skip_not_hot|skip_unparseable`).
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_UPSERT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_NOT_HOT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_UNPARSEABLE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// TX layout-only hot-apply preserved existing account quote fields (merge skip-overwrite).
+static MARKET_DATA_TX_LAYOUT_SEED_PRESERVE_QUOTE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// TX pin-seed Schicht C writes to LivePoolCache (`dex=pump_amm|orca|meteora_dlmm|...`).
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_PUMP_AMM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_ORCA: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_METEORA_DLMM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_RAYDIUM_CPMM: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_OTHER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// TX pin-seed Schicht C write misses (`reason=no_cache_entry|incomplete|verify_miss`).
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_NO_CACHE_ENTRY: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_INCOMPLETE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_VERIFY: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Account worker dispatch: tracked vault pubkey classified HIGH.
 pub static MARKET_DATA_VAULT_HIGH_PRIORITY_DISPATCH_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -435,6 +472,12 @@ pub static MARKET_DATA_DLMM_BIN_WINDOW_REFRESH_UNTRACKED_TOTAL: Lazy<AtomicU64> 
     Lazy::new(|| AtomicU64::new(0));
 /// Deferred hot-pool reserve retry enqueued after LivePoolCache fill (C1g).
 pub static MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Hot-pool Geyser explicit admit: pool account only when LivePoolCache layout is missing.
+pub static MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_ADMITTED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Hot-pool pool-account bootstrap rejected (cap / admission failure).
+pub static MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_REJECTED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// DLMM bin-array publishes from stashed Geyser replay (post-register / post-sync).
 pub static MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL: Lazy<AtomicU64> =
@@ -718,6 +761,78 @@ pub fn inc_market_data_arb_pin_vault_register_ok_total() {
     MARKET_DATA_ARB_PIN_VAULT_REGISTER_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradePathVaultRegisterPin {
+    Arb,
+    Momentum,
+    SkippedNotHot,
+}
+
+#[inline]
+pub fn inc_market_data_trade_path_vault_register_total(pin: TradePathVaultRegisterPin) {
+    let counter = match pin {
+        TradePathVaultRegisterPin::Arb => &*MARKET_DATA_TRADE_PATH_VAULT_REGISTER_ARB,
+        TradePathVaultRegisterPin::Momentum => &*MARKET_DATA_TRADE_PATH_VAULT_REGISTER_MOMENTUM,
+        TradePathVaultRegisterPin::SkippedNotHot => {
+            &*MARKET_DATA_TRADE_PATH_VAULT_REGISTER_SKIPPED_NOT_HOT
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_layout_seed_preserve_quote_total() {
+    MARKET_DATA_TX_LAYOUT_SEED_PRESERVE_QUOTE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `market_data_tx_pin_seed_pool_accounts_written_total{dex}`.
+#[inline]
+pub fn inc_market_data_tx_pin_seed_pool_accounts_written_total(dex: &str) {
+    let counter = match dex {
+        "pump_amm" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_PUMP_AMM,
+        "orca" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_ORCA,
+        "meteora_dlmm" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_METEORA_DLMM,
+        "raydium_cpmm" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_RAYDIUM_CPMM,
+        _ => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_OTHER,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment `market_data_tx_pin_seed_pool_accounts_write_miss_total{reason}`.
+#[inline]
+pub fn inc_market_data_tx_pin_seed_pool_accounts_write_miss_total(reason: &str) {
+    let counter = match reason {
+        "no_cache_entry" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_NO_CACHE_ENTRY,
+        "incomplete" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_INCOMPLETE,
+        "verify_miss" => &*MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_VERIFY,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxPoolAccountsHotApplyResult {
+    Upsert,
+    Register,
+    SkipNotHot,
+    SkipUnparseable,
+}
+
+#[inline]
+pub fn inc_market_data_tx_pool_accounts_hot_apply_total(result: TxPoolAccountsHotApplyResult) {
+    let counter = match result {
+        TxPoolAccountsHotApplyResult::Upsert => &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_UPSERT,
+        TxPoolAccountsHotApplyResult::Register => &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER,
+        TxPoolAccountsHotApplyResult::SkipNotHot => {
+            &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_NOT_HOT
+        }
+        TxPoolAccountsHotApplyResult::SkipUnparseable => {
+            &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_UNPARSEABLE
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 #[inline]
 pub fn inc_market_data_arb_pin_deferred_cleared_total() {
     MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -836,6 +951,16 @@ pub fn inc_market_data_dlmm_bin_window_refresh_untracked_total() {
 #[inline]
 pub fn inc_market_data_deferred_retry_pool_state_fill_total() {
     MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_hot_pool_account_bootstrap_admitted_total() {
+    MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_ADMITTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_hot_pool_account_bootstrap_rejected_total() {
+    MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -1302,6 +1427,9 @@ pub static MARKET_DATA_ARB_ADMISSION_REJECTED_TOTAL: Lazy<AtomicU64> =
 /// C1b: arb pins with incomplete vault/bin Geyser registration (gauge).
 pub static MARKET_DATA_ARB_PIN_REGISTRATION_INCOMPLETE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// C1b: momentum pins with incomplete vault/bin Geyser registration (gauge).
+pub static MARKET_DATA_MOMENTUM_PIN_REGISTRATION_INCOMPLETE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// C1b: arb shed skipped Must-hot (quote_ready / executable) owner groups.
 pub static MARKET_DATA_ARB_SHED_SKIPPED_MUST_HOT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1347,6 +1475,9 @@ pub static MARKET_DATA_TRACK_PROTOCOL_PENDING_COALESCED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// Scope H: TX ingest skipped TrackMint because mint is already in tracked-membership snapshot.
 pub static MARKET_DATA_TRACK_MINT_SKIPPED_ALREADY_TRACKED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// I-MD-5: unpinned tracker TrackMint rejected (TX ingest + legacy callers).
+pub static MARKET_DATA_TRACKER_TRACK_MINT_REJECTED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// Scope H: TrackMint messages absorbed by md-state burst coalesce (before dedupe).
 pub static MARKET_DATA_MD_STATE_TRACK_MINT_COALESCE_MESSAGES_IN_TOTAL: Lazy<AtomicU64> =
@@ -1443,6 +1574,36 @@ pub static MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// Phase-R-R4: jobs processed by the `md-sidefx` worker.
 pub static MARKET_DATA_MD_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub static MARKET_DATA_ACCOUNT_SIDEFX_QUEUE_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_SIDEFX_BACKPRESSURE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_FAIL_LOUD_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
+pub static MARKET_DATA_TX_PIN_SEED_SIDEFX_QUEUE_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_DISCOVERY_SIDEFX_QUEUE_DEPTH: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_DISCOVERY_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Deprecated combined TX depth/drops/processed (pin-seed + discovery); refreshed on pipeline updates.
+pub static MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static MARKET_DATA_TX_SIDEFX_JOBS_PROCESSED_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// Phase 1 P1: `DevWalletIdentified` published from TX ingest (PoolCreated / trade fast-path).
 pub static MARKET_DATA_DEVWALLET_TX_PUBLISHED_TOTAL: Lazy<AtomicU64> =
@@ -1646,6 +1807,11 @@ pub fn set_market_data_arb_pin_registration_incomplete_gauge(n: usize) {
 }
 
 #[inline]
+pub fn set_market_data_momentum_pin_registration_incomplete_gauge(n: usize) {
+    MARKET_DATA_MOMENTUM_PIN_REGISTRATION_INCOMPLETE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
 pub fn add_market_data_arb_shed_skipped_must_hot_total(n: u64) {
     if n > 0 {
         MARKET_DATA_ARB_SHED_SKIPPED_MUST_HOT_TOTAL.fetch_add(n, Ordering::Relaxed);
@@ -1724,6 +1890,11 @@ pub fn inc_market_data_track_protocol_pending_coalesced_total() {
 #[inline]
 pub fn inc_market_data_track_mint_skipped_already_tracked_total() {
     MARKET_DATA_TRACK_MINT_SKIPPED_ALREADY_TRACKED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tracker_track_mint_rejected_total() {
+    MARKET_DATA_TRACKER_TRACK_MINT_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -1867,6 +2038,86 @@ pub fn market_data_tracked_membership_snapshot_age_ms() -> u64 {
 #[inline]
 pub fn inc_market_data_ingest_membership_snapshot_hits_total() {
     MARKET_DATA_INGEST_MEMBERSHIP_SNAPSHOT_HITS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_account_sidefx_queue_depth(depth: usize) {
+    MARKET_DATA_ACCOUNT_SIDEFX_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_sidefx_enqueue_dropped_total() {
+    MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_sidefx_backpressure_total() {
+    MARKET_DATA_ACCOUNT_SIDEFX_BACKPRESSURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_sidefx_enqueue_fail_loud_total() {
+    MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_FAIL_LOUD_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_sidefx_jobs_processed_total() {
+    MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_tx_pin_seed_sidefx_queue_depth(depth: usize) {
+    MARKET_DATA_TX_PIN_SEED_SIDEFX_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_pin_seed_sidefx_enqueue_dropped_total() {
+    MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_pin_seed_sidefx_jobs_processed_total() {
+    MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_tx_discovery_sidefx_queue_depth(depth: usize) {
+    MARKET_DATA_TX_DISCOVERY_SIDEFX_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_discovery_sidefx_enqueue_dropped_total() {
+    MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_discovery_sidefx_jobs_processed_total() {
+    MARKET_DATA_TX_DISCOVERY_SIDEFX_JOBS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_tx_sidefx_queue_depth(depth: usize) {
+    MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH.store(depth as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_sidefx_enqueue_dropped_total() {
+    MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_sidefx_jobs_processed_total() {
+    MARKET_DATA_TX_SIDEFX_JOBS_PROCESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Deprecated combined depth = account + tx (pin-seed + discovery) pipeline depths.
+#[inline]
+pub fn refresh_market_data_md_sidefx_deprecated_metrics() {
+    let tx_combined = MARKET_DATA_TX_PIN_SEED_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
+        + MARKET_DATA_TX_DISCOVERY_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed);
+    MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH.store(tx_combined, Ordering::Relaxed);
+    let combined = MARKET_DATA_ACCOUNT_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed) + tx_combined;
+    MARKET_DATA_MD_SIDEFX_QUEUE_DEPTH.store(combined, Ordering::Relaxed);
 }
 
 #[inline]
@@ -2460,6 +2711,10 @@ pub static MARKET_DATA_JSONL_QUEUE_DEPTH: Lazy<AtomicU64> = Lazy::new(|| AtomicU
 pub static MARKET_DATA_JSONL_RECORDS_WRITTEN_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
+pub static JSONL_RETENTION_DELETED_FILES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+pub static JSONL_RETENTION_DELETED_BYTES_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
 /// Record Geyser ingest progress for Tokio liveness (cheap atomics only).
 #[inline]
 pub fn record_market_data_tokio_progress() {
@@ -2485,6 +2740,16 @@ pub fn set_market_data_jsonl_queue_depth(depth: usize) {
 #[inline]
 pub fn inc_market_data_jsonl_records_written_total() {
     MARKET_DATA_JSONL_RECORDS_WRITTEN_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_jsonl_retention_deleted_files_total(count: u64) {
+    JSONL_RETENTION_DELETED_FILES_TOTAL.fetch_add(count, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_jsonl_retention_deleted_bytes_total(bytes: u64) {
+    JSONL_RETENTION_DELETED_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// Update monotonic Geyser head slot (max). Safe from any market-data ingest arm.
@@ -3615,11 +3880,22 @@ pub fn record_momentum_exit_quote_legacy_stale_age_diag_total() {
 static MOMENTUM_EXIT_QUOTE_GUARD_REJECT_TOTAL: Lazy<RwLock<HashMap<&'static str, u64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
+static MOMENTUM_EXIT_SUPPRESSED_NO_QUOTE_TOTAL: Lazy<RwLock<HashMap<&'static str, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
 /// Labeled: `momentum_exit_quote_guard_reject_total{reason=...}`.
 #[inline]
 pub fn record_momentum_exit_quote_guard_reject_total(reason: &'static str) {
     let mut map = MOMENTUM_EXIT_QUOTE_GUARD_REJECT_TOTAL.write();
     *map.entry(reason).or_insert(0) += 1;
+}
+
+/// Labeled: `momentum_exit_suppressed_no_quote_total{exit_type=...}` — price/structural exit
+/// threshold met but no usable executable account quote (wait, no trade-mark fallback).
+#[inline]
+pub fn record_momentum_exit_suppressed_no_quote_total(exit_type: &'static str) {
+    let mut map = MOMENTUM_EXIT_SUPPRESSED_NO_QUOTE_TOTAL.write();
+    *map.entry(exit_type).or_insert(0) += 1;
 }
 
 static MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_UNSATISFIED_WARN_TOTAL: Lazy<AtomicU64> =
@@ -3954,6 +4230,7 @@ pub fn inc_momentum_wait_hot_set_enter_total() {
 pub enum MomentumWaitHotSetExitReason {
     Intent,
     Timeout,
+    TimeoutIncompleteGrace,
     FilterFailed,
 }
 
@@ -3962,6 +4239,9 @@ pub fn record_momentum_wait_hot_set_exit(reason: MomentumWaitHotSetExitReason, d
     let counter = match reason {
         MomentumWaitHotSetExitReason::Intent => &*MOMENTUM_WAIT_HOT_SET_EXIT_INTENT,
         MomentumWaitHotSetExitReason::Timeout => &*MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT,
+        MomentumWaitHotSetExitReason::TimeoutIncompleteGrace => {
+            &*MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT_INCOMPLETE_GRACE
+        }
         MomentumWaitHotSetExitReason::FilterFailed => &*MOMENTUM_WAIT_HOT_SET_EXIT_FILTER_FAILED,
     };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -4028,6 +4308,8 @@ static MOMENTUM_ENTRY_HOT_FRESH_FAIL_TOTAL: Lazy<RwLock<HashMap<String, u64>>> =
 static MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 static MOMENTUM_WAIT_HOT_SET_EXIT_INTENT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 static MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT_INCOMPLETE_GRACE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 static MOMENTUM_WAIT_HOT_SET_EXIT_FILTER_FAILED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 static MOMENTUM_WAIT_HOT_SET_DURATION_MS_BUCKET_COUNTS: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
     EXECUTION_INTENT_TO_CONFIRM_MS_BUCKETS
@@ -4061,6 +4343,7 @@ pub mod wait_hot_set_test_counters {
         MOMENTUM_WAIT_HOT_SET_ENTER_TOTAL.store(0, Ordering::Relaxed);
         MOMENTUM_WAIT_HOT_SET_EXIT_INTENT.store(0, Ordering::Relaxed);
         MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT.store(0, Ordering::Relaxed);
+        MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT_INCOMPLETE_GRACE.store(0, Ordering::Relaxed);
         MOMENTUM_WAIT_HOT_SET_EXIT_FILTER_FAILED.store(0, Ordering::Relaxed);
         MOMENTUM_WAIT_HOT_SET_DURATION_MS_COUNT.store(0, Ordering::Relaxed);
         MOMENTUM_INTENT_PATH_IMMEDIATE_HOT.store(0, Ordering::Relaxed);
@@ -4094,6 +4377,10 @@ pub mod wait_hot_set_test_counters {
 
     pub fn wait_hot_set_exit_timeout_total() -> u64 {
         MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT.load(Ordering::Relaxed)
+    }
+
+    pub fn wait_hot_set_exit_timeout_incomplete_grace_total() -> u64 {
+        MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT_INCOMPLETE_GRACE.load(Ordering::Relaxed)
     }
 
     pub fn wait_hot_set_duration_count() -> u64 {
@@ -5061,6 +5348,10 @@ pub static ARB_TWO_HOP_V2_REJECTED_INSUFFICIENT_POOLS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static LIVE_POOL_CACHE_FINGERPRINT_UNCHANGED_SKIP_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_BELOW_MIN: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_ABOVE_MAX: Lazy<AtomicU64> =
@@ -5231,7 +5522,7 @@ pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_LE_300S: Lazy<AtomicU6
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_COLD_REFRESH_GT_300S: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
-pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_QUOTE_NONE: Lazy<AtomicU64> =
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NO_EXECUTABLE_MARGINAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_STATE_STALE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -5260,6 +5551,12 @@ pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_NO_STALE_SELL: Lazy<Atomic
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_REPUBLISH_BOTH_LEGS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_VAULT_SEED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_VAULT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_BINS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_V2_SCREEN_METEORA_SELL_BIN_MISS_TOTAL: Lazy<AtomicU64> =
@@ -5274,7 +5571,7 @@ pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_CPMM_MATH_NONE: Lazy<AtomicU64>
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_UNSUPPORTED_DEX: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
-pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_TRADE_FALLBACK_NONE: Lazy<AtomicU64> =
+pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_NO_EXECUTABLE_MARGINAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_MINT_DIRECTION_INVALID: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -5300,6 +5597,82 @@ pub static ARB_TWO_HOP_V2_SCREEN_SKIPPED_MINT_NOT_SELECTED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_ROUND_TRIP_FORMABLE_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+
+// Bounded-cardinality arb forensics. Pool/mint/account addresses deliberately never become
+// Prometheus labels; exact identities belong in the throttled structured forensic log.
+const ARB_FORENSICS_DEX_LABELS: [&str; 5] =
+    ["orca", "meteora_dlmm", "pump_amm", "raydium", "other"];
+const ARB_FORENSICS_ROUND_TRIP_OUTCOMES: [&str; 8] = [
+    "formable",
+    "slot_delta",
+    "leg_too_old",
+    "spread_below",
+    "spread_above",
+    "profit_below",
+    "passed",
+    "arithmetic_invalid",
+];
+const ARB_FORENSICS_IDENTITY_OUTCOMES: [&str; 4] =
+    ["match", "absent", "mismatch", "invalid_pubkey"];
+const ARB_FORENSICS_INVARIANTS: [&str; 5] = [
+    "arithmetic_range",
+    "out_exceeds_i64",
+    "round_trip_amount_mismatch",
+    "zero_probe",
+    "other",
+];
+
+static ARB_ROUND_TRIP_BY_DEX_PAIR_TOTAL: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    (0..ARB_FORENSICS_DEX_LABELS.len()
+        * ARB_FORENSICS_DEX_LABELS.len()
+        * ARB_FORENSICS_ROUND_TRIP_OUTCOMES.len())
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+static ARB_POOL_IDENTITY_CHECK_TOTAL: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    (0..ARB_FORENSICS_DEX_LABELS.len() * ARB_FORENSICS_IDENTITY_OUTCOMES.len())
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+static ARB_QUOTE_INVARIANT_VIOLATION_TOTAL: Lazy<Vec<AtomicU64>> = Lazy::new(|| {
+    (0..ARB_FORENSICS_DEX_LABELS.len() * ARB_FORENSICS_INVARIANTS.len())
+        .map(|_| AtomicU64::new(0))
+        .collect()
+});
+
+fn arb_forensics_label_index(labels: &[&str], value: &str) -> usize {
+    labels
+        .iter()
+        .position(|candidate| *candidate == value)
+        .unwrap_or(labels.len() - 1)
+}
+
+/// Record one terminal v2 round-trip outcome with bounded canonical DEX labels.
+pub fn record_arb_round_trip_by_dex_pair(buy_dex: &str, sell_dex: &str, outcome: &str) {
+    let buy = arb_forensics_label_index(&ARB_FORENSICS_DEX_LABELS, buy_dex);
+    let sell = arb_forensics_label_index(&ARB_FORENSICS_DEX_LABELS, sell_dex);
+    let outcome = arb_forensics_label_index(&ARB_FORENSICS_ROUND_TRIP_OUTCOMES, outcome);
+    let idx = (buy * ARB_FORENSICS_DEX_LABELS.len() + sell)
+        * ARB_FORENSICS_ROUND_TRIP_OUTCOMES.len()
+        + outcome;
+    ARB_ROUND_TRIP_BY_DEX_PAIR_TOTAL[idx].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record authoritative pool-identity admission without address labels.
+pub fn record_arb_pool_identity_check(dex: &str, outcome: &str) {
+    let dex = arb_forensics_label_index(&ARB_FORENSICS_DEX_LABELS, dex);
+    let outcome = arb_forensics_label_index(&ARB_FORENSICS_IDENTITY_OUTCOMES, outcome);
+    let idx = dex * ARB_FORENSICS_IDENTITY_OUTCOMES.len() + outcome;
+    ARB_POOL_IDENTITY_CHECK_TOTAL[idx].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record checked-arithmetic and quote-contract violations with bounded labels.
+pub fn record_arb_quote_invariant_violation(dex: &str, invariant: &str) {
+    let dex = arb_forensics_label_index(&ARB_FORENSICS_DEX_LABELS, dex);
+    let invariant = arb_forensics_label_index(&ARB_FORENSICS_INVARIANTS, invariant);
+    let idx = dex * ARB_FORENSICS_INVARIANTS.len() + invariant;
+    ARB_QUOTE_INVARIANT_VIOLATION_TOTAL[idx].fetch_add(1, Ordering::Relaxed);
+}
 pub static ARB_TRACK_REMOVED_BUDGET_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_REMOVED_STALE_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TRACK_REMOVED_COOLDOWN_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -5770,6 +6143,7 @@ pub enum ArbTwoHopV2RejectReason {
     IncompatibleQuoteKind,
     InsufficientPools,
     SlotDeltaExceeded,
+    LegSlotTooOld,
 }
 
 /// Outcome label for `arb_two_hop_v2_formable_spread_bps` / `arb_two_hop_v2_formable_probe_profit_lamports`.
@@ -5829,6 +6203,11 @@ pub fn inc_arb_dlmm_bin_rescreen_scheduled_total() {
 /// Increment `arb_vault_balance_applied_total`.
 pub fn inc_arb_vault_balance_applied_total() {
     ARB_VAULT_BALANCE_APPLIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Increment when LivePoolCache skips material-slot/age tick (unchanged fingerprint).
+pub fn inc_live_pool_cache_fingerprint_unchanged_skip_total() {
+    LIVE_POOL_CACHE_FINGERPRINT_UNCHANGED_SKIP_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Increment `arb_vault_live_snapshot_seeded_total`.
@@ -5919,7 +6298,9 @@ pub fn arb_vault_live_snapshot_cache_age_pin_bucket_inc(op: &str, bucket: &str, 
 /// C1h2: `arb_two_hop_v2_no_fresh_buy_quote_detail_total{reason}`.
 pub fn arb_two_hop_v2_no_fresh_buy_quote_detail_inc(reason: &str) {
     let counter = match reason {
-        "quote_none" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_QUOTE_NONE,
+        "no_executable_marginal" => {
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NO_EXECUTABLE_MARGINAL
+        }
         "state_stale" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_STATE_STALE,
         "trade_stale" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_TRADE_STALE,
         "not_fresh_after_quote" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NOT_FRESH_AFTER,
@@ -5952,6 +6333,9 @@ pub fn inc_arb_v2_sell_stale_recovery_outcome_total(outcome: &str) {
         "skipped_rate_limit" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_RATE_LIMIT,
         "skipped_no_stale_sell" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_SKIPPED_NO_STALE_SELL,
         "republish_both_legs" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_REPUBLISH_BOTH_LEGS,
+        "fresh_after_vault_seed" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_VAULT_SEED,
+        "still_missing_vault" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_VAULT,
+        "still_missing_bins" => &ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_BINS,
         _ => return,
     };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -6042,7 +6426,7 @@ pub enum ArbTwoHopV2SellQuoteNoneDetail {
     DlmmMarginalReject,
     CpmmMathNone,
     UnsupportedDex,
-    TradeFallbackNone,
+    NoExecutableMarginal,
     MintDirectionInvalid,
 }
 
@@ -6070,8 +6454,8 @@ pub fn arb_two_hop_v2_sell_quote_none_detail_inc(reason: ArbTwoHopV2SellQuoteNon
         ArbTwoHopV2SellQuoteNoneDetail::UnsupportedDex => {
             &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_UNSUPPORTED_DEX
         }
-        ArbTwoHopV2SellQuoteNoneDetail::TradeFallbackNone => {
-            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_TRADE_FALLBACK_NONE
+        ArbTwoHopV2SellQuoteNoneDetail::NoExecutableMarginal => {
+            &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_NO_EXECUTABLE_MARGINAL
         }
         ArbTwoHopV2SellQuoteNoneDetail::MintDirectionInvalid => {
             &*ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_MINT_DIRECTION_INVALID
@@ -6146,6 +6530,7 @@ pub fn arb_two_hop_v2_rejected_inc(reason: ArbTwoHopV2RejectReason) {
         }
         ArbTwoHopV2RejectReason::InsufficientPools => &*ARB_TWO_HOP_V2_REJECTED_INSUFFICIENT_POOLS,
         ArbTwoHopV2RejectReason::SlotDeltaExceeded => &*ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED,
+        ArbTwoHopV2RejectReason::LegSlotTooOld => &*ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD,
     };
     counter.fetch_add(1, Ordering::Relaxed);
 }
@@ -7224,8 +7609,8 @@ fn append_arb_c1h2_freshness_forensics_total(out: &mut String) {
     }
     for (reason, counter) in [
         (
-            "quote_none",
-            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_QUOTE_NONE,
+            "no_executable_marginal",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NO_EXECUTABLE_MARGINAL,
         ),
         (
             "state_stale",
@@ -7300,9 +7685,9 @@ fn append_arb_two_hop_v2_sell_quote_none_detail_total(out: &mut String) {
             .to_string(),
     );
     out.push('\n');
-    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"trade_fallback_none\"} ");
+    out.push_str("arb_two_hop_v2_sell_quote_none_detail_total{reason=\"no_executable_marginal\"} ");
     out.push_str(
-        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_TRADE_FALLBACK_NONE
+        &ARB_TWO_HOP_V2_SELL_QUOTE_NONE_DETAIL_NO_EXECUTABLE_MARGINAL
             .load(Ordering::Relaxed)
             .to_string(),
     );
@@ -8397,6 +8782,62 @@ fn append_arb_two_hop_v2_formable_gate_histograms(out: &mut String) {
     }
 }
 
+fn append_arb_forensics_metrics(out: &mut String) {
+    for (buy_idx, buy_dex) in ARB_FORENSICS_DEX_LABELS.iter().enumerate() {
+        for (sell_idx, sell_dex) in ARB_FORENSICS_DEX_LABELS.iter().enumerate() {
+            for (outcome_idx, outcome) in ARB_FORENSICS_ROUND_TRIP_OUTCOMES.iter().enumerate() {
+                let idx = (buy_idx * ARB_FORENSICS_DEX_LABELS.len() + sell_idx)
+                    * ARB_FORENSICS_ROUND_TRIP_OUTCOMES.len()
+                    + outcome_idx;
+                out.push_str(&format!(
+                    "arb_round_trip_by_dex_pair_total{{buy_dex=\"{buy_dex}\",sell_dex=\"{sell_dex}\",outcome=\"{outcome}\"}} {}\n",
+                    ARB_ROUND_TRIP_BY_DEX_PAIR_TOTAL[idx].load(Ordering::Relaxed)
+                ));
+            }
+        }
+    }
+    for (dex_idx, dex) in ARB_FORENSICS_DEX_LABELS.iter().enumerate() {
+        for (outcome_idx, outcome) in ARB_FORENSICS_IDENTITY_OUTCOMES.iter().enumerate() {
+            let idx = dex_idx * ARB_FORENSICS_IDENTITY_OUTCOMES.len() + outcome_idx;
+            out.push_str(&format!(
+                "arb_pool_identity_check_total{{dex=\"{dex}\",outcome=\"{outcome}\"}} {}\n",
+                ARB_POOL_IDENTITY_CHECK_TOTAL[idx].load(Ordering::Relaxed)
+            ));
+        }
+        for (invariant_idx, invariant) in ARB_FORENSICS_INVARIANTS.iter().enumerate() {
+            let idx = dex_idx * ARB_FORENSICS_INVARIANTS.len() + invariant_idx;
+            out.push_str(&format!(
+                "arb_quote_invariant_violation_total{{dex=\"{dex}\",invariant=\"{invariant}\"}} {}\n",
+                ARB_QUOTE_INVARIANT_VIOLATION_TOTAL[idx].load(Ordering::Relaxed)
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod arb_forensics_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn dex_pair_and_identity_metrics_are_exported_with_bounded_labels() {
+        record_arb_round_trip_by_dex_pair("orca", "meteora_dlmm", "spread_above");
+        record_arb_pool_identity_check("pump_amm", "mismatch");
+        record_arb_quote_invariant_violation("unknown_future_dex", "unknown_future_reason");
+
+        let mut out = String::new();
+        append_arb_forensics_metrics(&mut out);
+        assert!(out.contains("arb_round_trip_by_dex_pair_total{buy_dex=\"orca\",sell_dex=\"meteora_dlmm\",outcome=\"spread_above\"}"));
+        assert!(
+            out.contains("arb_pool_identity_check_total{dex=\"pump_amm\",outcome=\"mismatch\"}")
+        );
+        assert!(
+            out.contains("arb_quote_invariant_violation_total{dex=\"other\",invariant=\"other\"}")
+        );
+        assert!(!out.contains("unknown_future_dex"));
+        assert!(!out.contains("unknown_future_reason"));
+    }
+}
+
 /// Append `_bucket{le=...}`, `_sum`, `_count` lines (same layout as `tx_slot_to_send_ms`).
 fn append_momentum_latency_histogram_prometheus(
     out: &mut String,
@@ -8635,6 +9076,10 @@ async fn metrics_response() -> Response<Body> {
         MARKET_DATA_ARB_PIN_REGISTRATION_INCOMPLETE.load(Ordering::Relaxed)
     );
     line!(
+        "market_data_momentum_pin_registration_incomplete",
+        MARKET_DATA_MOMENTUM_PIN_REGISTRATION_INCOMPLETE.load(Ordering::Relaxed)
+    );
+    line!(
         "market_data_arb_shed_skipped_must_hot_total{reason=\"must_hot\"}",
         MARKET_DATA_ARB_SHED_SKIPPED_MUST_HOT_TOTAL.load(Ordering::Relaxed)
     );
@@ -8703,6 +9148,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_track_mint_skipped_already_tracked_total",
         MARKET_DATA_TRACK_MINT_SKIPPED_ALREADY_TRACKED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tracker_track_mint_rejected_total",
+        MARKET_DATA_TRACKER_TRACK_MINT_REJECTED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_md_state_track_mint_coalesce_messages_in_total",
@@ -8811,6 +9260,62 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_md_sidefx_jobs_processed_total",
         MARKET_DATA_MD_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_sidefx_queue_depth",
+        MARKET_DATA_ACCOUNT_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_sidefx_enqueue_dropped_total",
+        MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_sidefx_backpressure_total",
+        MARKET_DATA_ACCOUNT_SIDEFX_BACKPRESSURE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_sidefx_enqueue_fail_loud_total",
+        MARKET_DATA_ACCOUNT_SIDEFX_ENQUEUE_FAIL_LOUD_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_account_sidefx_jobs_processed_total",
+        MARKET_DATA_ACCOUNT_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_pin_seed_sidefx_queue_depth",
+        MARKET_DATA_TX_PIN_SEED_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_pin_seed_sidefx_enqueue_dropped_total",
+        MARKET_DATA_TX_PIN_SEED_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_pin_seed_sidefx_jobs_processed_total",
+        MARKET_DATA_TX_PIN_SEED_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_discovery_sidefx_queue_depth",
+        MARKET_DATA_TX_DISCOVERY_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_discovery_sidefx_enqueue_dropped_total",
+        MARKET_DATA_TX_DISCOVERY_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_discovery_sidefx_jobs_processed_total",
+        MARKET_DATA_TX_DISCOVERY_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_sidefx_queue_depth",
+        MARKET_DATA_TX_SIDEFX_QUEUE_DEPTH.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_sidefx_enqueue_dropped_total",
+        MARKET_DATA_TX_SIDEFX_ENQUEUE_DROPPED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_sidefx_jobs_processed_total",
+        MARKET_DATA_TX_SIDEFX_JOBS_PROCESSED_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_devwallet_tx_published_total",
@@ -8994,6 +9499,14 @@ async fn metrics_response() -> Response<Body> {
         MARKET_DATA_DEFERRED_RETRY_POOL_STATE_FILL_TOTAL.load(Ordering::Relaxed)
     );
     line!(
+        "market_data_hot_pool_account_bootstrap_admitted_total",
+        MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_ADMITTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_hot_pool_account_bootstrap_rejected_total",
+        MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_REJECTED_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
         "market_data_dlmm_bin_replay_publish_total",
         MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL.load(Ordering::Relaxed)
     );
@@ -9009,6 +9522,120 @@ async fn metrics_response() -> Response<Body> {
         "market_data_arb_pin_vault_register_ok_total",
         MARKET_DATA_ARB_PIN_VAULT_REGISTER_OK_TOTAL.load(Ordering::Relaxed)
     );
+    out.push_str("market_data_trade_path_vault_register_total{pin=\"arb\"} ");
+    out.push_str(
+        &MARKET_DATA_TRADE_PATH_VAULT_REGISTER_ARB
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_trade_path_vault_register_total{pin=\"momentum\"} ");
+    out.push_str(
+        &MARKET_DATA_TRADE_PATH_VAULT_REGISTER_MOMENTUM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_trade_path_vault_register_total{pin=\"skipped_not_hot\"} ");
+    out.push_str(
+        &MARKET_DATA_TRADE_PATH_VAULT_REGISTER_SKIPPED_NOT_HOT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"upsert\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_UPSERT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"register\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"skip_not_hot\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_NOT_HOT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"skip_unparseable\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_UNPARSEABLE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_layout_seed_preserve_quote_total ");
+    out.push_str(
+        &MARKET_DATA_TX_LAYOUT_SEED_PRESERVE_QUOTE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_written_total{dex=\"pump_amm\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_PUMP_AMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_written_total{dex=\"orca\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_ORCA
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_written_total{dex=\"meteora_dlmm\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_METEORA_DLMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_written_total{dex=\"raydium_cpmm\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_RAYDIUM_CPMM
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_written_total{dex=\"other\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_OTHER
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "market_data_tx_pin_seed_pool_accounts_write_miss_total{reason=\"no_cache_entry\"} ",
+    );
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_NO_CACHE_ENTRY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_write_miss_total{reason=\"incomplete\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_INCOMPLETE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pin_seed_pool_accounts_write_miss_total{reason=\"verify_miss\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITE_MISS_VERIFY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
     line!(
         "market_data_arb_pin_deferred_cleared_total",
         MARKET_DATA_ARB_PIN_DEFERRED_CLEARED_TOTAL.load(Ordering::Relaxed)
@@ -9451,6 +10078,14 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_jsonl_records_written_total",
         MARKET_DATA_JSONL_RECORDS_WRITTEN_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "jsonl_retention_deleted_files_total",
+        JSONL_RETENTION_DELETED_FILES_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "jsonl_retention_deleted_bytes_total",
+        JSONL_RETENTION_DELETED_BYTES_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_last_trade_publish_ts_unix_ms",
@@ -9985,6 +10620,13 @@ async fn metrics_response() -> Response<Body> {
         out.push_str(&count.to_string());
         out.push('\n');
     }
+    for (exit_type, count) in MOMENTUM_EXIT_SUPPRESSED_NO_QUOTE_TOTAL.read().iter() {
+        out.push_str("momentum_exit_suppressed_no_quote_total{exit_type=\"");
+        out.push_str(exit_type);
+        out.push_str("\"} ");
+        out.push_str(&count.to_string());
+        out.push('\n');
+    }
     line!(
         "market_data_open_position_pumpfun_registration_unsatisfied_warn_total",
         MARKET_DATA_OPEN_POSITION_PUMPFUN_REGISTRATION_UNSATISFIED_WARN_TOTAL
@@ -10155,6 +10797,13 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("momentum_wait_hot_set_exit_total{reason=\"timeout\"} ");
     out.push_str(
         &MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("momentum_wait_hot_set_exit_total{reason=\"timeout_incomplete_grace\"} ");
+    out.push_str(
+        &MOMENTUM_WAIT_HOT_SET_EXIT_TIMEOUT_INCOMPLETE_GRACE
             .load(Ordering::Relaxed)
             .to_string(),
     );
@@ -11005,6 +11654,18 @@ async fn metrics_response() -> Response<Body> {
         ARB_V2_SELL_STALE_RECOVERY_OUTCOME_REPUBLISH_BOTH_LEGS.load(Ordering::Relaxed)
     );
     line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"fresh_after_vault_seed\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_FRESH_AFTER_VAULT_SEED.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"still_missing_vault\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_VAULT.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_v2_sell_stale_recovery_outcome_total{outcome=\"still_missing_bins\"}",
+        ARB_V2_SELL_STALE_RECOVERY_OUTCOME_STILL_MISSING_BINS.load(Ordering::Relaxed)
+    );
+    line!(
         "arb_v2_screen_meteora_sell_bin_hit_total",
         ARB_V2_SCREEN_METEORA_SELL_BIN_HIT_TOTAL.load(Ordering::Relaxed)
     );
@@ -11051,6 +11712,13 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("arb_two_hop_v2_rejected_total{reason=\"slot_delta_exceeded\"} ");
     out.push_str(
         &ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("arb_two_hop_v2_rejected_total{reason=\"leg_slot_too_old\"} ");
+    out.push_str(
+        &ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD
             .load(Ordering::Relaxed)
             .to_string(),
     );
@@ -11125,6 +11793,8 @@ async fn metrics_response() -> Response<Body> {
     );
     out.push('\n');
     append_arb_two_hop_v2_formable_gate_histograms(&mut out);
+    append_arb_forensics_metrics(&mut out);
+    append_arb_pin_quality_metrics(&mut out);
     append_momentum_latency_histogram_prometheus(
         &mut out,
         "arb_track_pin_before_first_screen_ms",
@@ -11249,6 +11919,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_strategy_bootstrap_live_pool_cache_rows",
         ARB_STRATEGY_BOOTSTRAP_LIVE_POOL_CACHE_ROWS.load(Ordering::Relaxed)
+    );
+    line!(
+        "live_pool_cache_fingerprint_unchanged_skip_total",
+        LIVE_POOL_CACHE_FINGERPRINT_UNCHANGED_SKIP_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "arb_strategy_bootstrap_known_pools_seeded",
@@ -12833,7 +13507,7 @@ mod arb_two_hop_v2_sell_quote_none_detail_metrics_tests {
             "dlmm_marginal_reject",
             "cpmm_math_none",
             "unsupported_dex",
-            "trade_fallback_none",
+            "no_executable_marginal",
             "mint_direction_invalid",
         ] {
             assert!(

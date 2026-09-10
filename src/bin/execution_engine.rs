@@ -4382,21 +4382,7 @@ impl ExecutionContext {
                         }
                     }
                     CachedPoolState::RaydiumAmm(ref s) => {
-                        raydium.inject_cached_amm_state(
-                            pool_addr,
-                            s.base_mint,
-                            s.quote_mint,
-                            s.coin_vault,
-                            s.pc_vault,
-                            s.base_decimals,
-                            s.quote_decimals,
-                            s.coin_reserve,
-                            s.pc_reserve,
-                            s.market_id,
-                            s.serum_bids,
-                            s.serum_asks,
-                            s.serum_event_queue,
-                        );
+                        raydium.inject_raydium_amm_from_live_cache(pool_addr, s);
                         raydium_amm_count += 1;
                     }
                     _ => {}
@@ -4491,7 +4477,7 @@ impl ExecutionContext {
             // SIM_INSUFFICIENT_BALANCE preflight check passes for SELL intents.
             for (mint_str, balance_raw, _decimals, _token_prog, _ta_pubkey) in &inventory {
                 ctx.lock_manager
-                    .set_available_token_balance(mint_str.clone(), *balance_raw);
+                    .apply_wallet_token_snapshot(mint_str.clone(), *balance_raw, None);
                 info!(
                     mint = %mint_str,
                     balance_raw = balance_raw,
@@ -4743,21 +4729,8 @@ impl ExecutionContext {
                                         for (pool_addr, st) in
                                             cache.raydium_amm_pools_for_mint(&mint)
                                         {
-                                            raydium.inject_cached_amm_state(
-                                                pool_addr,
-                                                st.base_mint,
-                                                st.quote_mint,
-                                                st.coin_vault,
-                                                st.pc_vault,
-                                                st.base_decimals,
-                                                st.quote_decimals,
-                                                st.coin_reserve,
-                                                st.pc_reserve,
-                                                st.market_id,
-                                                st.serum_bids,
-                                                st.serum_asks,
-                                                st.serum_event_queue,
-                                            );
+                                            raydium
+                                                .inject_raydium_amm_from_live_cache(pool_addr, &st);
                                         }
                                         info!(
                                             mint = %mint,
@@ -6150,21 +6123,7 @@ impl ExecutionContext {
                                 .await
                                 {
                                     for (pool_addr, st) in cache.raydium_amm_pools_for_mint(&mint) {
-                                        raydium.inject_cached_amm_state(
-                                            pool_addr,
-                                            st.base_mint,
-                                            st.quote_mint,
-                                            st.coin_vault,
-                                            st.pc_vault,
-                                            st.base_decimals,
-                                            st.quote_decimals,
-                                            st.coin_reserve,
-                                            st.pc_reserve,
-                                            st.market_id,
-                                            st.serum_bids,
-                                            st.serum_asks,
-                                            st.serum_event_queue,
-                                        );
+                                        raydium.inject_raydium_amm_from_live_cache(pool_addr, &st);
                                     }
                                     info!(
                                         request_id = %request_id,
@@ -7158,8 +7117,11 @@ impl ExecutionContext {
                 }
             } else {
                 let old = self.lock_manager.available_token_balance(mint);
-                self.lock_manager
-                    .set_available_token_balance(mint.clone(), *balance_raw);
+                self.lock_manager.apply_wallet_token_snapshot(
+                    mint.clone(),
+                    *balance_raw,
+                    event.slot,
+                );
 
                 if old != *balance_raw {
                     info!(
@@ -7536,7 +7498,11 @@ async fn bootstrap_token_balances_from_wallet_snapshot(
                 } else if mint != SOL_MINT {
                     // Regular token balance (skip SOL_MINT which equals WSOL_MINT
                     // but could appear from old JetStream entries)
-                    lock_manager.set_available_token_balance(mint.clone(), *balance_raw);
+                    lock_manager.apply_wallet_token_snapshot(
+                        mint.clone(),
+                        *balance_raw,
+                        event.slot,
+                    );
                     wallet_snapshot_kinds.push(event.kind.clone());
                 }
             } else if matches!(event.kind, MarketEventKind::WalletSnapshotComplete { .. }) {
@@ -9221,24 +9187,98 @@ async fn main() -> Result<()> {
         use ironcrab::nats::trade_intents_consumer_config;
 
         let jetstream = jetstream::new(nats.client().clone());
+        const TRADE_INTENTS_CONSUMER: &str = "execution-engine";
+
         match jetstream.get_stream(TRADE_INTENTS_STREAM_NAME).await {
-            Ok(stream) => match stream
-                .create_consumer(trade_intents_consumer_config())
-                .await
-            {
-                Ok(consumer) => {
-                    info!(
-                        stream = TRADE_INTENTS_STREAM_NAME,
-                        subject = TOPIC_TRADE_INTENTS,
-                        "Subscribed to TradeIntents via JetStream (persistent)"
-                    );
-                    Some(consumer)
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to create trade intents consumer");
+            Ok(stream) => {
+                let existing_consumer = if let Ok(info) =
+                    stream.consumer_info(TRADE_INTENTS_CONSUMER).await
+                {
+                    if info.config.deliver_policy != jetstream::consumer::DeliverPolicy::New {
+                        warn!(
+                            deliver_policy = ?info.config.deliver_policy,
+                            consumer = TRADE_INTENTS_CONSUMER,
+                            stream = TRADE_INTENTS_STREAM_NAME,
+                            "TRADE_INTENTS consumer has non-New deliver policy; deleting for recreate"
+                        );
+                        match stream.delete_consumer(TRADE_INTENTS_CONSUMER).await {
+                            Ok(_) => None,
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    consumer = TRADE_INTENTS_CONSUMER,
+                                    "Failed to delete stale TRADE_INTENTS consumer; falling back to existing consumer"
+                                );
+                                match stream
+                                    .get_consumer::<async_nats::jetstream::consumer::pull::Config>(
+                                        TRADE_INTENTS_CONSUMER,
+                                    )
+                                    .await
+                                {
+                                    Ok(consumer) => Some(consumer),
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            consumer = TRADE_INTENTS_CONSUMER,
+                                            "Failed to get existing TRADE_INTENTS consumer after delete failure"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        match stream
+                            .get_consumer::<async_nats::jetstream::consumer::pull::Config>(
+                                TRADE_INTENTS_CONSUMER,
+                            )
+                            .await
+                        {
+                            Ok(consumer) => Some(consumer),
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    consumer = TRADE_INTENTS_CONSUMER,
+                                    "Failed to get existing TRADE_INTENTS consumer"
+                                );
+                                None
+                            }
+                        }
+                    }
+                } else {
                     None
+                };
+
+                match existing_consumer {
+                    Some(consumer) => {
+                        info!(
+                            stream = TRADE_INTENTS_STREAM_NAME,
+                            subject = TOPIC_TRADE_INTENTS,
+                            deliver_policy = "New",
+                            "Subscribed to TradeIntents via JetStream (persistent)"
+                        );
+                        Some(consumer)
+                    }
+                    None => match stream
+                        .create_consumer(trade_intents_consumer_config())
+                        .await
+                    {
+                        Ok(consumer) => {
+                            info!(
+                                stream = TRADE_INTENTS_STREAM_NAME,
+                                subject = TOPIC_TRADE_INTENTS,
+                                deliver_policy = "New",
+                                "Subscribed to TradeIntents via JetStream (persistent)"
+                            );
+                            Some(consumer)
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to create trade intents consumer");
+                            None
+                        }
+                    },
                 }
-            },
+            }
             Err(e) => {
                 warn!(
                     error = %e,
@@ -13622,7 +13662,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
 
                 if s48.full_close {
                     ctx.lock_manager
-                        .set_available_token_balance(mint_str.clone(), 0);
+                        .clear_token_wallet_presence(mint_str.as_str(), tx_landing_slot);
                     info!(
                         intent_id = %intent.intent_id,
                         mint = %mint_str,
@@ -13630,7 +13670,7 @@ async fn process_intent(ctx: &ExecutionContext, mut intent: TradeIntent) -> Resu
                         total_pos,
                         is_cold_path_recovery,
                         sell_token_account_closed = s48.sell_token_account_closed,
-                        "LockManager: cleared token balance after confirmed full SELL"
+                        "LockManager: cleared token wallet presence after confirmed full SELL"
                     );
                 } else {
                     // Partial SELL: `available_tokens` already reflects post-sell unlocked balance
@@ -17393,6 +17433,7 @@ mod execution_engine_tests {
             bin_step: 10,
             reserve_x_balance: Some(100),
             reserve_y_balance: Some(200),
+            dlmm_bin_params_account_seeded: true,
         };
         cache.upsert(pool, CachedPoolState::Meteora(initial.clone()), 0);
         cache.merge_meteora_dlmm_pool_readiness(pool, DexPoolReadiness::Partial);
@@ -17661,10 +17702,14 @@ mod execution_engine_tests {
         let s48 = scope48_confirmed_sell_close_decision(false, total, total_pos, false);
         assert!(s48.full_close);
 
-        m.set_available_token_balance(M.to_string(), 0);
+        m.clear_token_wallet_presence(M, None);
         m.release_locks_after_confirmed_sell("sell-all");
         assert_eq!(m.available_token_balance(M), 0);
         assert_eq!(m.count_non_zero_token_balances(), 0);
+        assert!(
+            !m.token_wallet_snapshot_seen(M),
+            "full SELL close must clear ATA presence for next arb BUY"
+        );
     }
 
     /// No tx-meta fill (`confirmed_sell_fill_in_raw` None): still classify partial from

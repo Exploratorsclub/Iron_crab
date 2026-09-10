@@ -755,7 +755,7 @@ impl Default for AccountJanitorCfg {
 }
 
 /// Wallet Tracker Configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletTrackerCfg {
     /// Enable wallet tracking. Default: true
     #[serde(default = "default_wallet_tracking_enabled")]
@@ -800,6 +800,20 @@ fn default_whale_threshold() -> u64 {
 } // 10 SOL
 fn default_max_cached_wallets() -> usize {
     10_000
+}
+
+impl Default for WalletTrackerCfg {
+    fn default() -> Self {
+        Self {
+            enabled: default_wallet_tracking_enabled(),
+            smart_money_wallets: Vec::new(),
+            bad_actor_wallets: Vec::new(),
+            early_buyer_slots: default_early_buyer_slots(),
+            max_early_buyers_per_token: default_max_early_buyers(),
+            whale_threshold_lamports: default_whale_threshold(),
+            max_cached_wallets: default_max_cached_wallets(),
+        }
+    }
 }
 
 /// Momentum Strategy Configuration (for momentum-bot)
@@ -888,6 +902,9 @@ pub struct MomentumCfg {
     /// Max seconds in `WaitHotSet` awaiting fresh vault reserves before unpin (I-MD-9). Default: 45
     #[serde(default = "default_wait_hot_set_timeout_secs")]
     pub wait_hot_set_timeout_secs: u64,
+    /// Additional bounded hold while hot-set registration is incomplete (I-MD-9). Default: 30
+    #[serde(default = "default_wait_hot_set_incomplete_grace_secs")]
+    pub wait_hot_set_incomplete_grace_secs: u64,
 
     // === Token Safety: Mint/Freeze Authority (via TokenMintInfo MarketEvents) ===
     /// Require mint authority to be renounced (mint_authority == None) before entering.
@@ -1108,6 +1125,9 @@ fn default_dev_sell_revalidation_delay_secs() -> u64 {
 fn default_wait_hot_set_timeout_secs() -> u64 {
     45
 }
+fn default_wait_hot_set_incomplete_grace_secs() -> u64 {
+    30
+}
 fn default_require_mint_authority_renounced() -> bool {
     false
 }
@@ -1255,6 +1275,7 @@ impl Default for MomentumCfg {
             max_single_dump_lamports: default_max_single_dump(),
             dev_sell_revalidation_delay_secs: default_dev_sell_revalidation_delay_secs(),
             wait_hot_set_timeout_secs: default_wait_hot_set_timeout_secs(),
+            wait_hot_set_incomplete_grace_secs: default_wait_hot_set_incomplete_grace_secs(),
             require_mint_authority_renounced: default_require_mint_authority_renounced(),
             require_freeze_authority_none: default_require_freeze_authority_none(),
             hard_stop_min_hold_secs: default_hard_stop_min_hold_secs(),

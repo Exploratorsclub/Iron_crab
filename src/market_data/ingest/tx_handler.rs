@@ -7,20 +7,18 @@ use super::tx_parse::{
     resolve_pumpfun_creator_tx_path, tx_publish_segment, unparsed_tx_drop_reason,
 };
 use crate::ipc::{IntentTier, MarketEvent, MarketEventKind, PriorityFeePercentiles};
-use crate::market_data::ingest::host::IngestHost;
-use crate::market_data::md_state::{md_state_try_enqueue, MdStateCommand, MdStateSender};
+use crate::market_data::md_state::MdStateSender;
 use crate::market_data::publish::{
     account_path_enqueue_core_market_event, account_path_enqueue_priority_fee_sample,
     try_enqueue_account_path_nats_job, AccountPathNatsJob, AccountPublishSender,
 };
 use crate::market_data::sidefx::{
-    host::market_event_should_nats_core, md_sidefx_try_enqueue, MarketEventCorePublishTrace,
-    MdSidefxCommand, MdSidefxSender,
+    host::market_event_should_nats_core, md_tx_discovery_sidefx_try_enqueue,
+    md_tx_sidefx_route_enqueue, MarketEventCorePublishTrace, MdSidefxCommand, MdTxSidefxSenders,
 };
 use crate::metrics::{
-    inc_market_data_track_mint_skipped_already_tracked_total, market_data_bump_geyser_head_slot,
-    record_market_data_tx_channel_lag_ms, record_market_data_tx_handler_processed,
-    record_market_data_unparsed_tx_dropped,
+    market_data_bump_geyser_head_slot, record_market_data_tx_channel_lag_ms,
+    record_market_data_tx_handler_processed, record_market_data_unparsed_tx_dropped,
 };
 use crate::nats::TOPIC_PRIORITY_FEE_SAMPLES;
 use crate::solana::dex_parser::{
@@ -42,7 +40,7 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
     tx_count: &AtomicU64,
     account_publish_tx: Option<&AccountPublishSender>,
     md_state: &MdStateSender,
-    md_sidefx: &MdSidefxSender,
+    md_tx_sidefx: &MdTxSidefxSenders,
 ) {
     record_market_data_tx_handler_processed();
     let recv_at = Instant::now();
@@ -111,25 +109,6 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
     let parsed_event = parse_transaction_update_with_pool_lookup(&tx_update, Some(&pool_lookup));
 
     if let Some(parsed) = parsed_event.as_ref() {
-        let mint_and_dex: Option<(Pubkey, Option<DexType>)> = match parsed {
-            ParsedDexEvent::PoolCreated { base_mint, dex, .. } => Some((*base_mint, Some(*dex))),
-            ParsedDexEvent::Trade { mint, dex, .. } => Some((*mint, Some(*dex))),
-            ParsedDexEvent::LiquidityRemoved { mint, .. } => Some((*mint, None)),
-            ParsedDexEvent::BondingCurveUpdate { .. } => None,
-        };
-        if let Some((mint, dex_opt)) = mint_and_dex {
-            if IngestHost::ingest_membership_mint_contains(host, &mint) {
-                inc_market_data_track_mint_skipped_already_tracked_total();
-            } else {
-                md_state_try_enqueue(md_state, MdStateCommand::TrackMint { mint, pin: None });
-            }
-            debug!(
-                mint = %mint,
-                dex = ?dex_opt,
-                "Mint track enqueued for Geyser metadata (batched sync via md-state), waiting for mint account delivery"
-            );
-        }
-
         match parsed {
             ParsedDexEvent::PoolCreated {
                 pool_address,
@@ -138,8 +117,8 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
                 dex: DexType::PumpFun,
                 ..
             } => {
-                md_sidefx_try_enqueue(
-                    md_sidefx,
+                md_tx_discovery_sidefx_try_enqueue(
+                    &md_tx_sidefx.discovery,
                     MdSidefxCommand::PumpFunPoolMintMapInsert {
                         run_id: run_id.to_string(),
                         pool_address: *pool_address,
@@ -157,8 +136,8 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
                 dex: DexType::PumpFun,
                 ..
             } => {
-                md_sidefx_try_enqueue(
-                    md_sidefx,
+                md_tx_discovery_sidefx_try_enqueue(
+                    &md_tx_sidefx.discovery,
                     MdSidefxCommand::PumpFunPoolMintMapInsert {
                         run_id: run_id.to_string(),
                         pool_address: *pool_address,
@@ -171,15 +150,6 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
             }
             _ => {}
         }
-    }
-
-    if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
-        md_sidefx_try_enqueue(
-            md_sidefx,
-            MdSidefxCommand::TradePoolLruTouch {
-                pool: *pool_address,
-            },
-        );
     }
 
     let wallet_events = if let Some(ref parsed) = parsed_event {
@@ -244,8 +214,8 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
         ..
     }) = parsed_event.as_ref()
     {
-        md_sidefx_try_enqueue(
-            md_sidefx,
+        md_tx_discovery_sidefx_try_enqueue(
+            &md_tx_sidefx.discovery,
             MdSidefxCommand::PumpAmmCreatePoolObserved {
                 run_id: run_id.to_string(),
                 pool_address: *pool_address,
@@ -275,8 +245,8 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
         ..
     }) = parsed_event.as_ref()
     {
-        md_sidefx_try_enqueue(
-            md_sidefx,
+        md_tx_sidefx_route_enqueue(
+            md_tx_sidefx,
             MdSidefxCommand::PumpAmmTradeWithAccounts {
                 run_id: run_id.to_string(),
                 pool_address: *pool_address,
@@ -296,6 +266,7 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
                 pump_amm_sell_pre_fee_meta_1: *pump_amm_sell_pre_fee_meta_1,
                 tx_geyser_recv_at,
             },
+            host.ingest_is_hot_pool(pool_address),
         );
     }
 
@@ -309,8 +280,8 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
     }) = parsed_event.as_ref()
     {
         if !matches!(dex, DexType::PumpFunAmm) {
-            md_sidefx_try_enqueue(
-                md_sidefx,
+            md_tx_sidefx_route_enqueue(
+                md_tx_sidefx,
                 MdSidefxCommand::GenericDexFirstTradeAccounts {
                     run_id: run_id.to_string(),
                     pool_address: *pool_address,
@@ -321,8 +292,19 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
                     slot: tx_update.slot,
                     tx_geyser_recv_at,
                 },
+                host.ingest_is_hot_pool(pool_address),
             );
         }
+    }
+
+    if let Some(ParsedDexEvent::Trade { pool_address, .. }) = parsed_event.as_ref() {
+        md_tx_sidefx_route_enqueue(
+            md_tx_sidefx,
+            MdSidefxCommand::TradePoolLruTouch {
+                pool: *pool_address,
+            },
+            host.ingest_is_hot_pool(pool_address),
+        );
     }
 
     let Some(parsed) = parsed_event else {

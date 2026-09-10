@@ -1,3 +1,4 @@
+pub mod arb_quality;
 pub mod arbitrage;
 pub mod audit;
 pub mod config;

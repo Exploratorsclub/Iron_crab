@@ -55,8 +55,9 @@ SYSTEMD_SRC_DIR="$SCRIPT_DIR/docs/systemd"
 # -----------------------------------------------------------------------------
 # 1. Git Pull
 # -----------------------------------------------------------------------------
-log_info "Pulling latest changes from GitHub..."
-git pull origin architecture-rebuild
+DEPLOY_BRANCH="architecture-rebuild-next"
+log_info "Pulling latest changes from GitHub branch: $DEPLOY_BRANCH..."
+git pull --ff-only origin "$DEPLOY_BRANCH"
 
 # -----------------------------------------------------------------------------
 # 2. Build Rust Binaries
@@ -177,6 +178,24 @@ if pgrep -f 'trades_server.py' >/dev/null 2>&1; then
     log_warn "Killing manually started trades_server.py processes..."
     pkill -f 'trades_server.py' || true
     sleep 1
+fi
+
+# -----------------------------------------------------------------------------
+# 4b. Install Grafana dashboards from repo (no SCP — GH + deploy only)
+# -----------------------------------------------------------------------------
+GRAFANA_DASH_DIR="/var/lib/grafana/dashboards"
+if [ -d "$GRAFANA_DASH_DIR" ]; then
+    log_info "Installing Grafana dashboards from docs/..."
+    shopt -s nullglob
+    for dash in "$SCRIPT_DIR"/docs/grafana_*_dashboard.json; do
+        base="$(basename "$dash")"
+        sudo cp "$dash" "$GRAFANA_DASH_DIR/$base"
+        sudo chown grafana:grafana "$GRAFANA_DASH_DIR/$base"
+        log_info "  installed $base"
+    done
+    shopt -u nullglob
+else
+    log_warn "Grafana dash dir missing ($GRAFANA_DASH_DIR); skipping dashboard install"
 fi
 
 sudo systemctl daemon-reload

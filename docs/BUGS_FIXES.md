@@ -6,6 +6,18 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-ATA-3012: Arb ATA CreateIdempotent skip after full SELL + ATA close (Custom 3012)
+**Datum**: 2026-08-21  
+**Problem**: Cross-DEX Arb BUY sim-fail `InstructionError(2, Custom(3012))` — `token_wallet_snapshot_seen` war `true` weil `set_available_token_balance(mint, 0)` den Map-Key behielt; CreateIdempotent wurde fälschlich übersprungen.  
+**Fix**: Separates `token_wallet_ata_present`-Set; `token_wallet_snapshot_seen` nur bei Balance > 0 oder explizitem Geyser-Snapshot-Mark. Full-Close ruft `clear_token_wallet_presence` statt `set(..., 0)`. Geyser/Bootstrap/Liquidation nutzen `apply_wallet_token_snapshot`. **Invarianten**: I-7 kein RPC; I-9 Sim-Gate unverändert.  
+**Dateien**: `src/storage/locks.rs`, `src/bin/execution_engine.rs`, `src/solana/cross_dex_handler.rs`, `docs/BUGS_FIXES.md`
+
+### FIX-MD-I-MD-5-6: TX Tracker explicit subs removed; snapshot excludes Tracker (I-MD-5 / I-MD-6)
+**Datum**: 2026-08-19  
+**Problem** (Prod): ~99k `geyser_subscription_accounts`, ~97% unpinned Tracker-Mints aus TX-Ingest + I-MD-6 Snapshot-Restore — nicht aus Arb/Momentum-Pins. Scope H drosselte nur Amplifikation; TX-Pfad und blind Tracker-restore blieben spec-widrig.  
+**Fix**: (1) **TX-Ingest**: kein `MdStateCommand::TrackMint { pin: None }` mehr aus Trade/PoolCreated/LiquidityRemoved. (2) **Admission**: `apply_track_mint(..., None)` reject/no-op + `market_data_tracker_track_mint_rejected_total`; md-state coalesce/enqueue lehnt unpinned ab. (3) **Snapshot v4**: persist/restore nur Wallet/Momentum/MomentumPosition/Arb; Legacy v1–v3 Tracker-Groups beim Restore gestrippt; pure helpers `snapshot_owner_groups_for_persist`, `filter_tracker_consumer_from_snapshot`. **Invarianten**: I-MD-1 P1 TX unverändert (NATS/pool_mint_map); I-MD-7/8 Cap/Priorität unverändert; kein RPC Hot Path.  
+**Dateien**: `src/market_data/ingest/tx_handler.rs`, `src/market_data/md_state/worker.rs`, `src/market_data/track/snapshot.rs`, `src/market_data/track/mod.rs`, `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-C1h3: SLAVE Cache Age Sustain on Stale-Slot Heartbeat + NotFresh Detail Wiring (post-C1h2)
 **Datum**: 2026-08-04  
 **Problem**: Post-#366/C1h2: Seed/refresh `live_cache_age` ~95% `gt_300s`; `sell_not_fresh` ~72% bei `sell_not_fresh_detail_*` = 0. MD Heartbeat publisht BalanceUpdated mit MASTER-Slot; Arb-SLAVE kann durch lokalen Geyser voraus sein → `upsert` lehnt Slot-Regress ab und refresht `updated_at` nicht. `StateStale` → `sell_not_fresh` zählt ohne `sell_not_fresh_detail`. Vault-Seed ignorierte frischere Cache-`updated_at` wenn JetStream-Slot ≤ Geyser-Slot.  
@@ -1754,3 +1766,15 @@ BUY cost bevorzugt jetzt value_sol (fill_in) — die tatsächlich für den Swap 
 | **Betroffene Module** | `Cargo.lock` |
 | **Regression-Prüfung** | `cargo audit --deny warnings`, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`. |
 | **Tags** | [ci, security, rustsec, supply-chain, event-listener] |
+
+---
+
+## FIX-29b: Cross-DEX Raydium Serum Inject (2026-08-21)
+
+| Symptom | Cross-DEX `build_swap_plan` rejected Raydium legs with `serum market accounts not populated` despite LivePoolCache holding FIX-29 serum metadata (`arb-2402d175-000000`). |
+|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Root Cause** | `cross_dex_handler::try_inject_from_cache` returned `true` for `RaydiumAmm` cache hits without calling `inject_raydium_amm_from_live_cache`. |
+| **Fix** | Real cache injection via typed Raydium connector; fake hit removed (incomplete serum → `false` / `RAYDIUM_LAYOUT_NOT_READY`); Raydium legs always re-inject after optional intent accounts; optional serum vault pubkeys propagated through cache + `inject_cached_amm_state`. |
+| **Betroffene Module** | `src/solana/cross_dex_handler.rs`, `src/solana/dex/raydium.rs`, `src/execution/live_pool_cache.rs`, `src/execution/pool_cache_sync.rs` |
+| **Regression-Prüfung** | Unit tests `cross_dex_raydium_*`; `cargo fmt`, `cargo clippy -D warnings`, `cargo test`. |
+| **Tags** | [arb, cross-dex, raydium, serum, i-7, i-16, hot-path] |

@@ -9,12 +9,14 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// On-disk snapshot format version (v3 adds `MomentumPosition` consumer + position pool list).
-pub const EXPLICIT_SET_SNAPSHOT_VERSION: u32 = 3;
+/// On-disk snapshot format version (v4 excludes Tracker consumer groups from persist/restore).
+pub const EXPLICIT_SET_SNAPSHOT_VERSION: u32 = 4;
 /// Legacy v1 snapshots remain readable for restore.
 pub const EXPLICIT_SET_SNAPSHOT_VERSION_V1: u32 = 1;
 /// v2 adds complete owner groups (MomentumPosition still collapsed to Momentum).
 pub const EXPLICIT_SET_SNAPSHOT_VERSION_V2: u32 = 2;
+/// v3 adds `MomentumPosition` consumer + position pool list.
+pub const EXPLICIT_SET_SNAPSHOT_VERSION_V3: u32 = 3;
 /// Default production snapshot path (I-MD-6).
 pub const EXPLICIT_SET_SNAPSHOT_DEFAULT_PATH: &str = "/var/lib/ironcrab/explicit_set.snapshot";
 /// Periodic snapshot write interval (5 min).
@@ -117,6 +119,7 @@ impl ExplicitSetSnapshot {
     pub fn is_compatible(&self) -> bool {
         self.version == EXPLICIT_SET_SNAPSHOT_VERSION_V1
             || self.version == EXPLICIT_SET_SNAPSHOT_VERSION_V2
+            || self.version == EXPLICIT_SET_SNAPSHOT_VERSION_V3
             || self.version == EXPLICIT_SET_SNAPSHOT_VERSION
     }
 
@@ -293,6 +296,37 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether an explicit consumer may be written to or restored from disk (I-MD-6).
+pub fn snapshot_consumer_is_persistable(consumer: SnapshotConsumer) -> bool {
+    !matches!(consumer, SnapshotConsumer::Tracker)
+}
+
+/// Filter owner groups before snapshot persist (Wallet/Momentum/MomentumPosition/Arb only).
+pub fn snapshot_owner_groups_for_persist(groups: &[SnapshotOwnerGroup]) -> Vec<SnapshotOwnerGroup> {
+    groups
+        .iter()
+        .filter(|g| snapshot_consumer_is_persistable(g.consumer))
+        .cloned()
+        .collect()
+}
+
+/// Filter legacy row-based snapshots before persist.
+pub fn snapshot_rows_for_persist(rows: &[ExplicitSnapshotRow]) -> Vec<ExplicitSnapshotRow> {
+    rows.iter()
+        .filter(|r| snapshot_consumer_is_persistable(r.consumer))
+        .cloned()
+        .collect()
+}
+
+/// Strip Tracker consumer groups/rows from a snapshot before restore (legacy v1–v3).
+pub fn filter_tracker_consumer_from_snapshot(snapshot: ExplicitSetSnapshot) -> ExplicitSetSnapshot {
+    ExplicitSetSnapshot {
+        owner_groups: snapshot_owner_groups_for_persist(&snapshot.owner_groups),
+        rows: snapshot_rows_for_persist(&snapshot.rows),
+        ..snapshot
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +392,68 @@ mod tests {
         let groups = snap.to_owner_group_snapshots();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].owner_key, ExplicitOwnerKey::Pool(pool));
+    }
+
+    #[test]
+    fn explicit_set_snapshot_v4_excludes_tracker_on_persist() {
+        let mut snap = ExplicitSetSnapshot::new(Some("run-v4".to_string()));
+        let mint = Pubkey::new_unique();
+        snap.owner_groups.push(SnapshotOwnerGroup {
+            consumer: SnapshotConsumer::Tracker,
+            owner: SnapshotOwnerKey {
+                kind: "mint".to_string(),
+                pubkey: Some(mint.to_string()),
+            },
+            pubkeys: vec![mint.to_string()],
+        });
+        snap.owner_groups.push(SnapshotOwnerGroup {
+            consumer: SnapshotConsumer::Wallet,
+            owner: SnapshotOwnerKey {
+                kind: "wallet".to_string(),
+                pubkey: None,
+            },
+            pubkeys: vec![Pubkey::new_unique().to_string()],
+        });
+        snap.rows.push(ExplicitSnapshotRow {
+            pubkey: mint.to_string(),
+            consumer: SnapshotConsumer::Tracker,
+            pool: None,
+            kind: ExplicitAccountKind::Mint,
+        });
+
+        let filtered = filter_tracker_consumer_from_snapshot(snap.clone());
+        assert_eq!(filtered.version, EXPLICIT_SET_SNAPSHOT_VERSION);
+        assert!(filtered
+            .owner_groups
+            .iter()
+            .all(|g| { snapshot_consumer_is_persistable(g.consumer) }));
+        assert!(filtered
+            .rows
+            .iter()
+            .all(|r| snapshot_consumer_is_persistable(r.consumer)));
+        assert_eq!(filtered.owner_groups.len(), 1);
+        assert_eq!(filtered.rows.len(), 0);
+
+        let persisted_groups = snapshot_owner_groups_for_persist(&snap.owner_groups);
+        assert_eq!(persisted_groups.len(), 1);
+        assert_eq!(persisted_groups[0].consumer, SnapshotConsumer::Wallet);
+    }
+
+    #[test]
+    fn explicit_set_snapshot_legacy_v3_tracker_stripped_on_restore_groups() {
+        let mut snap = ExplicitSetSnapshot::new(None);
+        snap.version = EXPLICIT_SET_SNAPSHOT_VERSION_V3;
+        let tracker_mint = Pubkey::new_unique();
+        snap.owner_groups.push(SnapshotOwnerGroup {
+            consumer: SnapshotConsumer::Tracker,
+            owner: SnapshotOwnerKey {
+                kind: "mint".to_string(),
+                pubkey: Some(tracker_mint.to_string()),
+            },
+            pubkeys: vec![tracker_mint.to_string()],
+        });
+        let groups = filter_tracker_consumer_from_snapshot(snap).to_owner_group_snapshots();
+        assert!(groups.is_empty());
     }
 
     #[test]

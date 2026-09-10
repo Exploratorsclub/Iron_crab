@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [architecture-rebuild, main, 'release/**']
+    branches: [architecture-rebuild, architecture-rebuild-next, main, 'release/**']
   pull_request:
-    branches: [architecture-rebuild, main, 'release/**']
+    branches: [architecture-rebuild, architecture-rebuild-next, main, 'release/**']
 
 jobs:
   build-test:
@@ -72,8 +72,8 @@ jobs:
     name: Eval (Level 5)
     needs: [build-test]
     if: |
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/architecture-rebuild' || startsWith(github.ref, 'refs/heads/release'))) ||
-      (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'architecture-rebuild' || startsWith(github.base_ref, 'release')) && github.repository == github.event.pull_request.head.repo.full_name)
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/architecture-rebuild' || github.ref == 'refs/heads/architecture-rebuild-next' || startsWith(github.ref, 'refs/heads/release'))) ||
+      (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'architecture-rebuild' || github.base_ref == 'architecture-rebuild-next' || startsWith(github.base_ref, 'release')) && github.repository == github.event.pull_request.head.repo.full_name)
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: 0
@@ -132,6 +132,20 @@ jobs:
               perl -i -pe 's/(ArbTrackActiveEntry,)(?! ArbTrackReadiness)/$1 ArbTrackReadiness,/' "$f"
             fi
           done
+
+      # Scope 1 / PR418: OrcaWhirlpoolState + MeteoraState gained account-seeded quote flags.
+      - name: Align eval Orca/Meteora LivePoolCache literals with quote ownership flags
+        run: |
+          set -euo pipefail
+          EVAL="${{ github.workspace }}/Iron_crab-eval"
+          while IFS= read -r -d '' f; do
+            if grep -q 'OrcaWhirlpoolState' "$f"; then
+              perl -i -0777 -pe 's{(\bOrcaWhirlpoolState\s*\{.*?\btoken_b_program\s*:\s*[^\n]+)(\n\s*\})}{ ($1 =~ /whirlpool_quote_account_seeded/) ? $1.$2 : $1."\n                whirlpool_quote_account_seeded: true,".$2 }gse' "$f"
+            fi
+            if grep -q 'MeteoraState' "$f"; then
+              perl -i -0777 -pe 's{(\bMeteoraState\s*\{.*?\breserve_y_balance\s*:\s*[^\n]+)(\n\s*\})}{ ($1 =~ /dlmm_bin_params_account_seeded/) ? $1.$2 : $1."\n                dlmm_bin_params_account_seeded: true,".$2 }gse' "$f"
+            fi
+          done < <(find "$EVAL/tests" -name '*.rs' -print0)
 
       - name: Patch eval git-dep to use PR checkout
         run: |

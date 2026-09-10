@@ -53,7 +53,7 @@ pub use pool_quote::{
     diagnose_sell_quote_none, dlmm_marginal_price_plausible, dlmm_sol_output_from_bins,
     dlmm_token_output_from_bins, flatten_bin_array_bins, freshness_age_bucket,
     is_arb_route_executable, is_expected_token_output_plausible, is_quote_fresh,
-    is_usable_quote_kind, price_based_token_output_raw, quote_exact_in,
+    is_quote_fresh_with_bins, is_usable_quote_kind, price_based_token_output_raw, quote_exact_in,
     quote_exact_in_with_freshness, quote_from_cached_pool, quote_sell_round_trip,
     quote_sol_per_token_for_screening, quotes_pairable, round_trip_profit_lamports,
     round_trip_profit_lamports_with_freshness, select_round_trip_pools,

@@ -7,6 +7,7 @@
 
 use crate::ipc::schema::MarketEvent;
 use crate::metrics::{
+    inc_jsonl_retention_deleted_bytes_total, inc_jsonl_retention_deleted_files_total,
     inc_market_data_jsonl_records_written_total, set_market_data_jsonl_queue_depth,
 };
 use chrono::Utc;
@@ -17,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, error, warn};
 
 /// Size/record caps for same-day JSONL segments (P172: execution_results only).
@@ -71,6 +72,8 @@ pub struct JsonlWriterConfig {
     pub flush_each_write: bool,
     /// Same-day segment rotation when file grows too large (optional; P172 execution_results).
     pub segment_rotation: Option<SegmentRotationLimits>,
+    /// Delete closed JSONL files older than this many hours. Default: 24. 0 = disabled.
+    pub jsonl_retention_hours: u64,
 }
 
 impl Default for JsonlWriterConfig {
@@ -83,6 +86,7 @@ impl Default for JsonlWriterConfig {
             buffer_size: 8192,       // 8KB buffer
             flush_each_write: false, // batch writes for performance
             segment_rotation: None,
+            jsonl_retention_hours: 24,
         }
     }
 }
@@ -110,6 +114,11 @@ impl JsonlWriterConfig {
         self.segment_rotation = Some(limits);
         self
     }
+
+    pub fn with_retention_hours(mut self, hours: u64) -> Self {
+        self.jsonl_retention_hours = hours;
+        self
+    }
 }
 
 fn segment_filename(prefix: &str, date: &str, segment_index: u32) -> String {
@@ -118,6 +127,84 @@ fn segment_filename(prefix: &str, date: &str, segment_index: u32) -> String {
     } else {
         format!("{prefix}-{date}.{segment_index}.jsonl")
     }
+}
+
+/// Remove closed JSONL segment files older than `retention_hours` under `log_dir`.
+/// `open_path` is never deleted (current writer file).
+pub fn prune_expired_jsonl_files(
+    log_dir: &Path,
+    prefix: &str,
+    retention_hours: u64,
+    open_path: Option<&Path>,
+) -> std::io::Result<(u64, u64)> {
+    if retention_hours == 0 {
+        return Ok((0, 0));
+    }
+
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_hours.saturating_mul(3600)))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "jsonl retention cutoff underflow",
+            )
+        })?;
+
+    let prefix_with_dash = format!("{prefix}-");
+    let mut deleted_files = 0u64;
+    let mut deleted_bytes = 0u64;
+
+    for entry in fs::read_dir(log_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix_with_dash) || !name.ends_with(".jsonl") {
+            continue;
+        }
+        if open_path.is_some_and(|open| open == path) {
+            continue;
+        }
+        let metadata = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                debug!(path = %path.display(), error = %e, "JSONL retention: metadata failed");
+                continue;
+            }
+        };
+        let modified = match metadata.modified() {
+            Ok(t) => t,
+            Err(e) => {
+                debug!(path = %path.display(), error = %e, "JSONL retention: mtime failed");
+                continue;
+            }
+        };
+        if modified >= cutoff {
+            continue;
+        }
+        let file_bytes = metadata.len();
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                deleted_files += 1;
+                deleted_bytes += file_bytes;
+                debug!(path = %path.display(), bytes = file_bytes, "JSONL retention: deleted expired file");
+            }
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "JSONL retention: delete failed");
+            }
+        }
+    }
+
+    if deleted_files > 0 {
+        inc_jsonl_retention_deleted_files_total(deleted_files);
+        inc_jsonl_retention_deleted_bytes_total(deleted_bytes);
+    }
+
+    Ok((deleted_files, deleted_bytes))
 }
 
 fn resolve_append_segment(
@@ -357,6 +444,9 @@ impl QueuedJsonlWriter {
         let depth_for_thread = Arc::clone(&queue_depth);
         let flush_each_write = config.flush_each_write;
         let config_for_thread = config.clone();
+        let retention_hours = config.jsonl_retention_hours;
+        let retention_log_dir = config.log_dir.clone();
+        let retention_prefix = config.prefix.clone();
         let join = std::thread::Builder::new()
             .name("jsonl-writer".into())
             .spawn(move || {
@@ -368,7 +458,30 @@ impl QueuedJsonlWriter {
                     }
                 };
                 let periodic_flush = Duration::from_secs(1);
+                let retention_interval = Duration::from_secs(60);
                 let mut last_periodic_flush = Instant::now();
+                let mut last_retention_run = Instant::now();
+                // Retention must not rely on recv_timeout alone: under sustained ingest
+                // (~200+/s) the channel rarely idles, so timeout-only would skip the janitor
+                // until a lull.
+                let mut tick_retention_if_due = || {
+                    if retention_hours == 0 {
+                        return;
+                    }
+                    if last_retention_run.elapsed() < retention_interval {
+                        return;
+                    }
+                    let open_path = writer.current_path();
+                    if let Err(e) = prune_expired_jsonl_files(
+                        &retention_log_dir,
+                        &retention_prefix,
+                        retention_hours,
+                        open_path.as_deref(),
+                    ) {
+                        warn!(error = %e, "QueuedJsonlWriter: JSONL retention janitor failed");
+                    }
+                    last_retention_run = Instant::now();
+                };
                 let dec_queue_depth = || {
                     let mut cur = depth_for_thread.load(Ordering::Relaxed);
                     while cur > 0 {
@@ -402,16 +515,19 @@ impl QueuedJsonlWriter {
                         Ok(QueuedJsonlMsg::Line(json)) => {
                             write_line(json);
                             dec_queue_depth();
+                            tick_retention_if_due();
                         }
                         Ok(QueuedJsonlMsg::MarketEvent(event)) => {
                             let json =
                                 serde_json::to_string(&*event).unwrap_or_else(|_| "{}".to_string());
                             write_line(json);
                             dec_queue_depth();
+                            tick_retention_if_due();
                         }
                         Ok(QueuedJsonlMsg::Serialize(serialize)) => {
                             write_line(serialize());
                             dec_queue_depth();
+                            tick_retention_if_due();
                         }
                         Ok(QueuedJsonlMsg::Flush) => {
                             let _ = writer.flush();
@@ -426,6 +542,7 @@ impl QueuedJsonlWriter {
                                 let _ = writer.flush();
                                 last_periodic_flush = Instant::now();
                             }
+                            tick_retention_if_due();
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
@@ -845,5 +962,39 @@ mod tests {
         hold.store(false, AOrdering::Relaxed);
         std::thread::sleep(Duration::from_millis(100));
         drop(q);
+    }
+
+    #[test]
+    fn jsonl_retention_deletes_only_expired_closed_files() {
+        use std::time::UNIX_EPOCH;
+
+        let dir = tempdir().unwrap();
+        let open_path = dir.path().join("retention-open.jsonl");
+        let old_path = dir.path().join("retention-20250101.jsonl");
+        let recent_path = dir.path().join("retention-20250822.jsonl");
+
+        fs::write(&open_path, b"open\n").unwrap();
+        fs::write(&old_path, b"old\n").unwrap();
+        fs::write(&recent_path, b"recent\n").unwrap();
+
+        let old_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let recent_time = SystemTime::now() - Duration::from_secs(3600);
+        fs::File::open(&old_path)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        fs::File::open(&recent_path)
+            .unwrap()
+            .set_modified(recent_time)
+            .unwrap();
+
+        let (deleted_files, deleted_bytes) =
+            prune_expired_jsonl_files(dir.path(), "retention", 24, Some(&open_path)).unwrap();
+
+        assert_eq!(deleted_files, 1);
+        assert!(deleted_bytes > 0);
+        assert!(!old_path.exists());
+        assert!(recent_path.exists());
+        assert!(open_path.exists());
     }
 }

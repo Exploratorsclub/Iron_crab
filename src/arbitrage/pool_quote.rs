@@ -42,12 +42,38 @@ impl Default for QuoteFreshnessConfig {
 
 /// Hash of vault reserve snapshot used for ExecutableMarginal freshness.
 pub fn state_fingerprint(vault: &QuoteVaultInput) -> u64 {
+    state_fingerprint_with_bins(vault, None)
+}
+
+/// Hash of vault + optional DLMM bin liquidity for ExecutableMarginal freshness.
+pub fn state_fingerprint_with_bins(
+    vault: &QuoteVaultInput,
+    dlmm_bins: Option<&DlmmBinArrays>,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
     vault.reserve_base.hash(&mut hasher);
     vault.reserve_quote.hash(&mut hasher);
     vault.active_id.hash(&mut hasher);
     vault.bin_step.hash(&mut hasher);
+    if let Some(bins) = dlmm_bins {
+        hash_dlmm_bins_for_fingerprint(&mut hasher, bins);
+    }
     hasher.finish()
+}
+
+fn hash_dlmm_bins_for_fingerprint(hasher: &mut DefaultHasher, bins: &DlmmBinArrays) {
+    let mut keys: Vec<&i64> = bins.keys().collect();
+    keys.sort_unstable();
+    for array_idx in keys {
+        array_idx.hash(hasher);
+        if let Some(bin_list) = bins.get(array_idx) {
+            for bin in bin_list {
+                bin.offset.hash(hasher);
+                bin.amount_x.hash(hasher);
+                bin.amount_y.hash(hasher);
+            }
+        }
+    }
 }
 
 /// I-ARB-4: re-check quote freshness (trade TTL vs state fingerprint + state TTL).
@@ -57,7 +83,18 @@ pub fn is_quote_fresh(
     current_vault: Option<&QuoteVaultInput>,
     now: Instant,
 ) -> bool {
-    diagnose_quote_not_fresh(quote, config, current_vault, now).is_none()
+    is_quote_fresh_with_bins(quote, config, current_vault, None, now)
+}
+
+/// I-ARB-4: re-check quote freshness including optional DLMM bin snapshot.
+pub fn is_quote_fresh_with_bins(
+    quote: &PoolQuote,
+    config: &QuoteFreshnessConfig,
+    current_vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    now: Instant,
+) -> bool {
+    diagnose_quote_not_fresh_with_bins(quote, config, current_vault, dlmm_bins, now).is_none()
 }
 
 /// Age bucket for vault/state-stale forensics (C1h2).
@@ -151,6 +188,17 @@ pub fn diagnose_quote_not_fresh(
     current_vault: Option<&QuoteVaultInput>,
     now: Instant,
 ) -> Option<QuoteNotFreshDiagnosis> {
+    diagnose_quote_not_fresh_with_bins(quote, config, current_vault, None, now)
+}
+
+/// Returns `Some(diagnosis)` when quote fails freshness re-check (with DLMM bins).
+pub fn diagnose_quote_not_fresh_with_bins(
+    quote: &PoolQuote,
+    config: &QuoteFreshnessConfig,
+    current_vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    now: Instant,
+) -> Option<QuoteNotFreshDiagnosis> {
     let kind = QuoteNotFreshKind::from_quote_kind(quote.kind);
     match quote.kind {
         QuoteKind::LastTradeMid => {
@@ -170,7 +218,9 @@ pub fn diagnose_quote_not_fresh(
                 });
             }
             match current_vault {
-                Some(vault) if state_fingerprint(vault) != quote.state_fingerprint => {
+                Some(vault)
+                    if state_fingerprint_with_bins(vault, dlmm_bins) != quote.state_fingerprint =>
+                {
                     Some(QuoteNotFreshDiagnosis {
                         kind,
                         cause: QuoteNotFreshCause::FingerprintMismatch,
@@ -185,8 +235,10 @@ pub fn diagnose_quote_not_fresh(
 /// Subreason when no candidate produces a fresh buy quote (C1h2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NoFreshBuyQuoteSubreason {
-    QuoteNone,
+    /// Account-state quote could not be built (no vault, bad reserves, DLMM bins missing, etc.).
+    NoExecutableMarginal,
     StateStale,
+    /// Legacy LastTradeMid quote failed freshness (metrics / parsing only).
     TradeStale,
     NotFreshAfterQuote,
 }
@@ -194,7 +246,7 @@ pub enum NoFreshBuyQuoteSubreason {
 impl NoFreshBuyQuoteSubreason {
     pub fn as_metric_label(self) -> &'static str {
         match self {
-            Self::QuoteNone => "quote_none",
+            Self::NoExecutableMarginal => "no_executable_marginal",
             Self::StateStale => "state_stale",
             Self::TradeStale => "trade_stale",
             Self::NotFreshAfterQuote => "not_fresh_after_quote",
@@ -226,15 +278,12 @@ pub fn diagnose_no_fresh_buy_quote(
                 return NoFreshBuyQuoteSubreason::StateStale;
             }
         }
-        if trade_fresh(pool, now, freshness.trade_ttl_ms) {
-            return NoFreshBuyQuoteSubreason::QuoteNone;
-        }
-        return NoFreshBuyQuoteSubreason::TradeStale;
+        return NoFreshBuyQuoteSubreason::NoExecutableMarginal;
     };
-    if is_quote_fresh(&buy_quote, freshness, vault, now) {
+    if is_quote_fresh_with_bins(&buy_quote, freshness, vault, dlmm_bins, now) {
         return NoFreshBuyQuoteSubreason::NotFreshAfterQuote;
     }
-    match diagnose_quote_not_fresh(&buy_quote, freshness, vault, now) {
+    match diagnose_quote_not_fresh_with_bins(&buy_quote, freshness, vault, dlmm_bins, now) {
         Some(QuoteNotFreshDiagnosis {
             kind: QuoteNotFreshKind::LastTradeMid,
             ..
@@ -484,10 +533,6 @@ fn trade_mid_sol_per_token(pool: &QuotePoolInput) -> Option<Decimal> {
     }
 }
 
-fn trade_fresh(pool: &QuotePoolInput, now: Instant, trade_ttl_ms: u64) -> bool {
-    now.duration_since(pool.trade_updated_at) <= Duration::from_millis(trade_ttl_ms)
-}
-
 fn state_fresh(vault: &QuoteVaultInput, now: Instant, state_ttl_ms: u64) -> bool {
     now.duration_since(vault.updated_at) <= Duration::from_millis(state_ttl_ms)
 }
@@ -566,10 +611,6 @@ pub fn price_based_token_output_raw(
     raw.to_u64().filter(|v| *v > 0)
 }
 
-fn tokens_from_trade_price(sol_lamports: u64, price: Decimal, token_decimals: u8) -> Option<u64> {
-    price_based_token_output_raw(sol_lamports, price, token_decimals)
-}
-
 /// Minimum fraction of price-based raw estimate that `token_out` must reach (10%).
 pub const ARB_TOKEN_OUT_MIN_PRICE_FRACTION_BPS: u64 = 1_000;
 
@@ -615,17 +656,6 @@ pub fn is_expected_token_output_plausible(
     true
 }
 
-fn sol_from_trade_price(token_raw: u64, price: Decimal, token_decimals: u8) -> Option<u64> {
-    if price <= Decimal::ZERO || token_raw == 0 {
-        return None;
-    }
-    let token_divisor = Decimal::from(10u64.pow(token_decimals as u32));
-    let tokens_whole = Decimal::from(token_raw) / token_divisor;
-    let sol = tokens_whole * price;
-    let lamports = (sol * Decimal::from(1_000_000_000u64)).floor();
-    lamports.to_u64().filter(|v| *v > 0)
-}
-
 fn executable_marginal_quote(
     pool: &QuotePoolInput,
     vault: &QuoteVaultInput,
@@ -639,7 +669,7 @@ fn executable_marginal_quote(
         return None;
     }
 
-    let fingerprint = state_fingerprint(vault);
+    let fingerprint = state_fingerprint_with_bins(vault, dlmm_bins);
 
     if pool.dex == "meteora_dlmm" {
         let active_id = vault.active_id?;
@@ -732,41 +762,6 @@ fn executable_marginal_quote(
     })
 }
 
-fn last_trade_mid_quote(
-    pool: &QuotePoolInput,
-    side: QuoteSide,
-    amount_in: u64,
-    now: Instant,
-    freshness: &QuoteFreshnessConfig,
-) -> Option<PoolQuote> {
-    if !trade_fresh(pool, now, freshness.trade_ttl_ms) {
-        return None;
-    }
-    let price = match side {
-        QuoteSide::Buy => pool.trade_price_buy?,
-        QuoteSide::Sell => pool.trade_price_sell?,
-    };
-    if price <= Decimal::ZERO || !is_plausible_sol_per_token_price(&pool.token_mint, price) {
-        return None;
-    }
-    let amount_out = match side {
-        QuoteSide::Buy => tokens_from_trade_price(amount_in, price, pool.token_decimals)?,
-        QuoteSide::Sell => sol_from_trade_price(amount_in, price, pool.token_decimals)?,
-    };
-    Some(PoolQuote {
-        pool_address: pool.pool_address.clone(),
-        dex: pool.dex.clone(),
-        kind: QuoteKind::LastTradeMid,
-        side,
-        as_of_slot: 0,
-        as_of_ts: pool.trade_updated_at,
-        fresh: true,
-        state_fingerprint: 0,
-        amount_in,
-        amount_out,
-    })
-}
-
 /// SOL-quoted token reserves extracted from [`CachedPoolState`] (base = token, quote = SOL).
 #[derive(Debug, Clone)]
 pub struct SolQuotedPoolSeed {
@@ -778,12 +773,9 @@ pub struct SolQuotedPoolSeed {
     pub dlmm_token_x_mint: Option<String>,
 }
 
-/// True when a quote may drive beam expansion / quote-ready index.
+/// True when a quote may drive beam expansion / quote-ready index (hot path: account quotes only).
 pub fn is_usable_quote_kind(kind: QuoteKind) -> bool {
-    matches!(
-        kind,
-        QuoteKind::ExecutableMarginal | QuoteKind::LastTradeMid
-    )
+    matches!(kind, QuoteKind::ExecutableMarginal)
 }
 
 fn orca_sol_quoted_vault_reserves(
@@ -1211,7 +1203,7 @@ pub fn token_decimals_from_cached_state(state: &CachedPoolState, token_mint: &Pu
     }
 }
 
-/// Exact-in quote for SOL-quoted pools. Priority: ExecutableMarginal, then LastTradeMid.
+/// Exact-in quote for SOL-quoted pools. Hot path: [`QuoteKind::ExecutableMarginal`] only.
 pub fn quote_exact_in(
     pool: &QuotePoolInput,
     vault: Option<&QuoteVaultInput>,
@@ -1248,17 +1240,13 @@ pub fn quote_exact_in_with_freshness(
     let now = Instant::now();
 
     if let Some(vault) = vault {
-        if let Some(q) =
-            executable_marginal_quote(pool, vault, dlmm_bins, side, amount_in, now, freshness)
-        {
-            return Some(q);
-        }
+        return executable_marginal_quote(pool, vault, dlmm_bins, side, amount_in, now, freshness);
     }
 
-    last_trade_mid_quote(pool, side, amount_in, now, freshness)
+    None
 }
 
-/// SOL per whole token for screening (marginal probe > reserve mid > trade mid).
+/// SOL per whole token for screening via [`quote_exact_in`] (ExecutableMarginal only).
 pub fn quote_sol_per_token_for_screening(
     pool: &QuotePoolInput,
     vault: Option<&QuoteVaultInput>,
@@ -1353,7 +1341,7 @@ pub fn round_trip_profit_lamports_with_freshness(
         probe_sol_lamports,
         freshness,
     )?;
-    if !is_quote_fresh(&buy_quote, freshness, buy.vault, now) {
+    if !is_quote_fresh_with_bins(&buy_quote, freshness, buy.vault, buy.dlmm_bins, now) {
         return None;
     }
     let sell_quote = quote_exact_in_with_freshness(
@@ -1365,7 +1353,7 @@ pub fn round_trip_profit_lamports_with_freshness(
         buy_quote.amount_out,
         freshness,
     )?;
-    if !is_quote_fresh(&sell_quote, freshness, sell.vault, now) {
+    if !is_quote_fresh_with_bins(&sell_quote, freshness, sell.vault, sell.dlmm_bins, now) {
         return None;
     }
     if !quotes_pairable(&buy_quote, &sell_quote) {
@@ -1404,7 +1392,7 @@ pub enum SellQuoteNoneDetailReason {
     DlmmMarginalReject,
     CpmmMathNone,
     UnsupportedDex,
-    TradeFallbackNone,
+    NoExecutableMarginal,
     MintDirectionInvalid,
 }
 
@@ -1418,7 +1406,7 @@ impl SellQuoteNoneDetailReason {
             Self::DlmmMarginalReject => "dlmm_marginal_reject",
             Self::CpmmMathNone => "cpmm_math_none",
             Self::UnsupportedDex => "unsupported_dex",
-            Self::TradeFallbackNone => "trade_fallback_none",
+            Self::NoExecutableMarginal => "no_executable_marginal",
             Self::MintDirectionInvalid => "mint_direction_invalid",
         }
     }
@@ -1548,7 +1536,7 @@ pub fn diagnose_sell_quote_none(
         }
     }
 
-    SellQuoteNoneDetailReason::TradeFallbackNone
+    SellQuoteNoneDetailReason::NoExecutableMarginal
 }
 
 /// Max token input sellable via DLMM bins (sum of token-side liquidity from active bin).
@@ -1781,8 +1769,13 @@ pub fn classify_cross_dex_sell_failure(
         );
         return Some(CrossDexSellFailure::QuoteNone(sub));
     };
-    if let Some(diagnosis) = diagnose_quote_not_fresh(&sell_quote, freshness, candidate.vault, now)
-    {
+    if let Some(diagnosis) = diagnose_quote_not_fresh_with_bins(
+        &sell_quote,
+        freshness,
+        candidate.vault,
+        candidate.dlmm_bins,
+        now,
+    ) {
         return Some(CrossDexSellFailure::NotFresh(diagnosis));
     }
     let sol_per_token = sol_per_token_from_sell_quote(&sell_quote, token_decimals);
@@ -1845,7 +1838,13 @@ pub fn select_round_trip_pools(
         let Some(buy_quote) = buy_quote else {
             continue;
         };
-        if !is_quote_fresh(&buy_quote, freshness, candidate.vault, now) {
+        if !is_quote_fresh_with_bins(
+            &buy_quote,
+            freshness,
+            candidate.vault,
+            candidate.dlmm_bins,
+            now,
+        ) {
             continue;
         }
         let sol_per_token = sol_per_token_from_buy_quote(&buy_quote, token_decimals);
@@ -1962,9 +1961,13 @@ pub fn select_round_trip_pools(
                 *sell_fail_counts.entry(top).or_default() += 1;
                 continue;
             };
-            if let Some(diagnosis) =
-                diagnose_quote_not_fresh(&sell_quote, freshness, sell_candidate.vault, now)
-            {
+            if let Some(diagnosis) = diagnose_quote_not_fresh_with_bins(
+                &sell_quote,
+                freshness,
+                sell_candidate.vault,
+                sell_candidate.dlmm_bins,
+                now,
+            ) {
                 *sell_not_fresh_detail_counts.entry(diagnosis).or_default() += 1;
                 *sell_fail_counts
                     .entry(NoCrossDexSellDetailReason::SellNotFresh)
@@ -2120,6 +2123,23 @@ mod tests {
     }
 
     #[test]
+    fn fresh_trade_without_reserves_returns_none() {
+        let mut pool = sample_pool("pump_amm", "tradeOnly");
+        pool.trade_price_buy = Some(Decimal::new(1, 3));
+        pool.trade_price_sell = Some(Decimal::new(1, 3));
+        pool.trade_updated_at = Instant::now();
+        let quote = quote_exact_in(
+            &pool,
+            None,
+            None,
+            NATIVE_SOL_MINT,
+            &pool.token_mint,
+            DLMM_PROBE_SOL_LAMPORTS,
+        );
+        assert!(quote.is_none());
+    }
+
+    #[test]
     fn dlmm_marginal_vs_reserve_mid_divergence_bounded() {
         let active_id = 0i32;
         let bin_step = 100u16;
@@ -2233,6 +2253,7 @@ mod tests {
             bin_step,
             reserve_x_balance: Some(1_000_000_000_000),
             reserve_y_balance: Some(500_000_000),
+            dlmm_bin_params_account_seeded: true,
         });
         let sol_in = DLMM_PROBE_SOL_LAMPORTS;
         let cp_out = cpmm_amount_out(
@@ -2437,7 +2458,7 @@ mod tests {
                 &freshness,
             );
             let Some(buy_quote) = buy_quote else { continue };
-            if !is_quote_fresh(&buy_quote, &freshness, buy.vault, now) {
+            if !is_quote_fresh_with_bins(&buy_quote, &freshness, buy.vault, buy.dlmm_bins, now) {
                 continue;
             }
             for sell in &candidates {
@@ -2456,7 +2477,13 @@ mod tests {
                 let Some(sell_quote) = sell_quote else {
                     continue;
                 };
-                if !is_quote_fresh(&sell_quote, &freshness, sell.vault, now) {
+                if !is_quote_fresh_with_bins(
+                    &sell_quote,
+                    &freshness,
+                    sell.vault,
+                    sell.dlmm_bins,
+                    now,
+                ) {
                     continue;
                 }
                 if !quotes_pairable(&buy_quote, &sell_quote) {
@@ -2581,7 +2608,7 @@ mod tests {
     }
 
     #[test]
-    fn select_round_trip_pools_incompatible_kinds_only() {
+    fn select_round_trip_pools_trade_only_sell_pool_excluded() {
         use rust_decimal::Decimal;
         use std::str::FromStr;
 
@@ -2612,7 +2639,17 @@ mod tests {
             &QuoteFreshnessConfig::default(),
         )
         .unwrap_err();
-        assert_eq!(err, RoundTripSelectFailure::IncompatibleQuoteKind);
+        assert_eq!(
+            err,
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient {
+                subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
+                no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
+                sell_quote_none_detail_counts: None,
+                sell_not_fresh_detail_counts: None,
+                no_fresh_buy_quote_detail: None,
+                state_stale_age_bucket_counts: None,
+            })
+        );
     }
 
     #[test]
@@ -2647,7 +2684,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnose_sell_quote_none_trade_fallback_none() {
+    fn diagnose_sell_quote_none_no_executable_marginal() {
         let pool = sample_pool("orca", "noTrade");
         let reason = diagnose_sell_quote_none(
             &pool,
@@ -2657,7 +2694,7 @@ mod tests {
             &QuoteFreshnessConfig::default(),
             Instant::now(),
         );
-        assert_eq!(reason, SellQuoteNoneDetailReason::TradeFallbackNone);
+        assert_eq!(reason, SellQuoteNoneDetailReason::NoExecutableMarginal);
     }
 
     #[test]
@@ -2857,6 +2894,128 @@ mod tests {
                 .expect("fingerprint mismatch");
         assert_eq!(diagnosis.kind, QuoteNotFreshKind::ExecutableMarginal);
         assert_eq!(diagnosis.cause, QuoteNotFreshCause::FingerprintMismatch);
+    }
+
+    #[test]
+    fn state_fingerprint_includes_dlmm_bin_liquidity() {
+        let vault = sample_vault(1_000_000_000_000, 1_000_000_000);
+        let mut bins_a: DlmmBinArrays = HashMap::new();
+        bins_a.insert(
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 100,
+                amount_y: 200,
+            }],
+        );
+        let mut bins_b = bins_a.clone();
+        bins_b.get_mut(&0).unwrap()[0].amount_y = 201;
+        assert_ne!(
+            state_fingerprint_with_bins(&vault, Some(&bins_a)),
+            state_fingerprint_with_bins(&vault, Some(&bins_b))
+        );
+    }
+
+    #[test]
+    fn dlmm_executable_quote_recheck_requires_bins_fingerprint() {
+        let active_id = 0i32;
+        let bin_step = 100u16;
+        let token_amount = 1_000_000_000_000u64;
+        let sol_amount = 1_000_000_000u64;
+        let array_index = active_id as i64 / 70;
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            array_index,
+            vec![BinData {
+                offset: 0,
+                amount_x: token_amount,
+                amount_y: sol_amount,
+            }],
+        );
+        let pool = sample_pool("meteora_dlmm", "dlmmFresh");
+        let vault = QuoteVaultInput {
+            reserve_base: token_amount,
+            reserve_quote: sol_amount,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(active_id),
+            bin_step: Some(bin_step),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(pool.token_mint.clone()),
+        };
+        let freshness = QuoteFreshnessConfig::default();
+        let quote = quote_exact_in_with_freshness(
+            &pool,
+            Some(&vault),
+            Some(&bins),
+            NATIVE_SOL_MINT,
+            &pool.token_mint,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &freshness,
+        )
+        .expect("dlmm buy quote");
+        let now = Instant::now();
+        assert!(
+            is_quote_fresh_with_bins(&quote, &freshness, Some(&vault), Some(&bins), now),
+            "DLMM re-check must include bin snapshot"
+        );
+        assert!(
+            !is_quote_fresh(&quote, &freshness, Some(&vault), now),
+            "vault-only re-check must not gate DLMM executable quotes"
+        );
+    }
+
+    #[test]
+    fn select_round_trip_pools_keeps_dlmm_buy_with_bins() {
+        let active_id = 0i32;
+        let bin_step = 100u16;
+        let token_amount = 1_000_000_000_000u64;
+        let sol_amount = 1_000_000_000u64;
+        let array_index = active_id as i64 / 70;
+        let mut dlmm_bins: DlmmBinArrays = HashMap::new();
+        dlmm_bins.insert(
+            array_index,
+            vec![BinData {
+                offset: 0,
+                amount_x: token_amount,
+                amount_y: sol_amount,
+            }],
+        );
+        let dlmm_pool = sample_pool("meteora_dlmm", "dlmmBuy");
+        let pump_pool = sample_pool("pump_amm", "pumpSell");
+        let dlmm_vault = QuoteVaultInput {
+            reserve_base: token_amount,
+            reserve_quote: sol_amount,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(active_id),
+            bin_step: Some(bin_step),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(dlmm_pool.token_mint.clone()),
+        };
+        let pump_vault = sample_vault(1_000_000_000_000, 1_200_000_000);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &dlmm_pool,
+                vault: Some(&dlmm_vault),
+                dlmm_bins: Some(&dlmm_bins),
+                dex: "meteora_dlmm",
+            },
+            RoundTripPoolCandidate {
+                pool: &pump_pool,
+                vault: Some(&pump_vault),
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+        ];
+        let selection = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .expect("DLMM buy must survive bin-aware freshness re-check");
+        assert_eq!(selection.buy_dex, "meteora_dlmm");
+        assert_eq!(selection.sell_dex, "pump_amm");
     }
 
     #[test]

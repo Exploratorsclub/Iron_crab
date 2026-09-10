@@ -204,6 +204,12 @@ fn build_minimal_pool_state_with_reserves(
                 vault_b_balance,
                 token_a_program,
                 token_b_program,
+                whirlpool_quote_account_seeded: meta.is_some_and(|m| {
+                    m.contains_key(POOL_CACHE_UPDATE_ORCA_TICK_CURRENT_INDEX_KEY)
+                        || m.contains_key(POOL_CACHE_UPDATE_ORCA_TICK_SPACING_KEY)
+                        || m.contains_key(POOL_CACHE_UPDATE_ORCA_SQRT_PRICE_KEY)
+                        || m.contains_key(POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY)
+                }),
             })
         }
         "raydium" => {
@@ -242,6 +248,16 @@ fn build_minimal_pool_state_with_reserves(
                 serum_bids,
                 serum_asks,
                 serum_event_queue,
+                serum_base_vault: update
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("serum_base_vault"))
+                    .and_then(|s| Pubkey::from_str(s).ok()),
+                serum_quote_vault: update
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("serum_quote_vault"))
+                    .and_then(|s| Pubkey::from_str(s).ok()),
             })
         }
         "raydium_cpmm" => CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
@@ -304,6 +320,10 @@ fn build_minimal_pool_state_with_reserves(
                 bin_step,
                 reserve_x_balance: Some(reserve_x_balance),
                 reserve_y_balance: Some(reserve_y_balance),
+                dlmm_bin_params_account_seeded: meta.is_some_and(|m| {
+                    m.contains_key(POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY)
+                        || m.contains_key(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY)
+                }),
             })
         }
         "meteora_cpmm" => {
@@ -993,6 +1013,12 @@ fn apply_pool_cache_update_outcome_inner(
                             if new_am.serum_event_queue.is_none() {
                                 new_am.serum_event_queue = ex.serum_event_queue;
                             }
+                            if new_am.serum_base_vault.is_none() {
+                                new_am.serum_base_vault = ex.serum_base_vault;
+                            }
+                            if new_am.serum_quote_vault.is_none() {
+                                new_am.serum_quote_vault = ex.serum_quote_vault;
+                            }
                             if new_am.coin_vault == Pubkey::default() {
                                 new_am.coin_vault = ex.coin_vault;
                             }
@@ -1083,6 +1109,9 @@ fn apply_pool_cache_update_outcome_inner(
                             {
                                 new_o.token_b_program = ex.token_b_program;
                             }
+                            if ex.whirlpool_quote_account_seeded {
+                                new_o.whirlpool_quote_account_seeded = true;
+                            }
                         }
                     }
                 }
@@ -1140,6 +1169,9 @@ fn apply_pool_cache_update_outcome_inner(
                                 .is_none()
                             {
                                 new_m.bin_step = ex.bin_step;
+                            }
+                            if ex.dlmm_bin_params_account_seeded {
+                                new_m.dlmm_bin_params_account_seeded = true;
                             }
                         }
                     }
@@ -2012,10 +2044,18 @@ mod tests {
         assert!(apply_pool_cache_update(&cache, &bal));
 
         let (_, slot_after, age_after) = cache.get_with_metadata(&pool).expect("cached");
-        assert_eq!(slot_after, 11, "slot must advance from Geyser event");
+        assert_eq!(
+            slot_after, slot_before,
+            "identical reserves must not advance material slot"
+        );
         assert!(
-            age_after < 20,
-            "unchanged reserves with newer slot must refresh SLAVE cache age (event-driven pin path)"
+            age_after >= age_before,
+            "identical reserves must not reset SLAVE cache age"
+        );
+        assert_eq!(
+            cache.get_last_seen_slot(&pool),
+            Some(11),
+            "last_seen_slot tracks Geyser heartbeat"
         );
     }
 
@@ -3065,6 +3105,7 @@ mod tests {
                 vault_b_balance: Some(20),
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             }),
             1,
         );
@@ -3247,6 +3288,7 @@ mod tests {
                 vault_b_balance: Some(65_000_000),
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             }),
             1,
         );
@@ -3276,7 +3318,7 @@ mod tests {
         }
     }
 
-    /// P0-B: Ensure-equivalent JetStream publish must advance SLAVE slot when S ≫ prior cache.
+    /// P0-B: Ensure-equivalent JetStream publish with unchanged reserves must not spoof material slot.
     #[test]
     fn ensure_equivalent_pool_cache_update_advances_slave_slot() {
         let cache = LivePoolCache::new();
@@ -3321,9 +3363,15 @@ mod tests {
             "Ensure-equivalent BalanceUpdated must apply when slot advances"
         );
         let (_, slot_after, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(
+            slot_after, 436_771_116,
+            "unchanged reserves must preserve material slot despite newer Geyser slot"
+        );
         assert!(
-            slot_after >= 436_771_200,
-            "SLAVE slot must be >= publish_slot S after apply"
+            cache
+                .get_last_seen_slot(&pool)
+                .is_some_and(|s| s >= 436_771_200),
+            "last_seen_slot must track newer Geyser slot"
         );
     }
 

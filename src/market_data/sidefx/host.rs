@@ -1,9 +1,10 @@
 //! Sidefx worker host trait — bin implements via `MarketDataSidefxHost`.
 
 use super::worker::MdSidefxBurstScratch;
-use crate::execution::live_pool_cache::LivePoolCache;
+use crate::execution::live_pool_cache::{LivePoolCache, RaydiumAmmState};
 use crate::ipc::{MarketEvent, MarketEventKind};
 use crate::metrics::MarketDataLatencySegment;
+use crate::solana::dex_parser::DexType;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -75,6 +76,11 @@ pub trait SidefxWorkerHost: Send + Sync {
     /// True when pool is in momentum/arb hot set (arb-pinned DLMM PoolStateUpdate gate).
     fn is_hot_pool(&self, pool: &Pubkey) -> bool;
 
+    /// True only for the Arb consumer pin; used by bounded data-quality instrumentation.
+    fn is_arb_pinned(&self, _pool: &Pubkey) -> bool {
+        false
+    }
+
     /// Scope C: open-position pin on a PumpFun bonding-curve pool (EXEC_HOT publish guarantee).
     fn is_open_position_pumpfun_pin(&self, pool: &Pubkey) -> bool;
 
@@ -89,6 +95,20 @@ pub trait SidefxWorkerHost: Send + Sync {
 
     /// C1g: enqueue deferred vault/bin registration retry after LivePoolCache gains layout.
     fn maybe_retry_deferred_hot_pool_reserves_on_cache_fill(&self, pool: &Pubkey);
+
+    /// FIX-29: spawn cold-path Serum backfill when Geyser/cache row has bids but missing vaults.
+    fn maybe_spawn_raydium_serum_cold_backfill(&self, pool: Pubkey, state: &RaydiumAmmState);
+
+    /// Teil B: hot-gated TX `pool_accounts` → LivePoolCache seed + trade-path vault register.
+    fn apply_tx_pool_accounts_for_hot_pool(
+        &self,
+        pool: Pubkey,
+        dex: DexType,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        pool_accounts: &[Pubkey],
+        slot: u64,
+    );
 }
 
 #[inline]

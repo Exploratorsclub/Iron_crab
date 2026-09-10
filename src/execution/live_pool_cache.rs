@@ -35,6 +35,8 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use solana_sdk::pubkey::Pubkey;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -75,6 +77,35 @@ pub struct OrcaWhirlpoolState {
     /// Detected once when pool is discovered, never changes for a mint
     pub token_a_program: Option<Pubkey>,
     pub token_b_program: Option<Pubkey>,
+    /// Account/Geyser pool parse populated whirlpool quote numerics — never true for TX layout-only seed.
+    pub whirlpool_quote_account_seeded: bool,
+}
+
+/// TX layout-only Orca Whirlpool row: vault/mint pubkeys only; quote numerics are unset (not SSOT).
+#[must_use]
+pub fn orca_whirlpool_tx_layout_seed(
+    token_mint_a: Pubkey,
+    token_mint_b: Pubkey,
+    token_vault_a: Pubkey,
+    token_vault_b: Pubkey,
+) -> OrcaWhirlpoolState {
+    OrcaWhirlpoolState {
+        token_mint_a,
+        token_mint_b,
+        token_vault_a,
+        token_vault_b,
+        tick_current_index: 0,
+        sqrt_price: 0,
+        liquidity: 0,
+        fee_rate: 0,
+        protocol_fee_rate: 0,
+        tick_spacing: 0,
+        vault_a_balance: None,
+        vault_b_balance: None,
+        token_a_program: None,
+        token_b_program: None,
+        whirlpool_quote_account_seeded: false,
+    }
 }
 
 impl From<WhirlpoolParsed> for OrcaWhirlpoolState {
@@ -95,6 +126,7 @@ impl From<WhirlpoolParsed> for OrcaWhirlpoolState {
             // Token programs will be set separately when discovered
             token_a_program: None,
             token_b_program: None,
+            whirlpool_quote_account_seeded: true,
         }
     }
 }
@@ -111,6 +143,7 @@ impl From<WhirlpoolParsed> for OrcaWhirlpoolState {
 pub fn orca_readiness_for_pool_cache_update(s: &OrcaWhirlpoolState) -> DexPoolReadiness {
     let static_ok = s.token_vault_a != Pubkey::default()
         && s.token_vault_b != Pubkey::default()
+        && s.whirlpool_quote_account_seeded
         && s.tick_spacing > 0
         && s.sqrt_price > 0;
     let va = s.vault_a_balance.unwrap_or(0);
@@ -142,21 +175,42 @@ pub struct RaydiumAmmState {
     pub serum_bids: Option<Pubkey>,
     pub serum_asks: Option<Pubkey>,
     pub serum_event_queue: Option<Pubkey>,
+    /// Serum market vaults (from OpenBook market parse; static per pool)
+    pub serum_base_vault: Option<Pubkey>,
+    pub serum_quote_vault: Option<Pubkey>,
+}
+
+/// Static Serum/OpenBook accounts required for Raydium AMM swap IX building.
+///
+/// Shared by readiness scoring, Cross-DEX inject gates, and cold-path serum backfill triggers.
+#[must_use]
+pub fn raydium_amm_serum_static_accounts_ready(s: &RaydiumAmmState) -> bool {
+    s.market_id != Pubkey::default()
+        && s.serum_bids.is_some()
+        && s.serum_asks.is_some()
+        && s.serum_event_queue.is_some()
+        && s.serum_base_vault.is_some()
+        && s.serum_quote_vault.is_some()
+}
+
+/// True when a Raydium AMM row has `market_id` but still lacks any static Serum field
+/// (including serum vaults). Cold-path only — never call from hot-path TX building.
+#[must_use]
+pub fn raydium_amm_serum_needs_cold_backfill(s: &RaydiumAmmState) -> bool {
+    s.market_id != Pubkey::default() && !raydium_amm_serum_static_accounts_ready(s)
 }
 
 /// JetStream / MASTER [`DexPoolReadiness`] for Raydium AMM v4 (conservative, explicit).
 ///
 /// `Ready` only when the static Serum/OpenBook accounts required for swap building are present
-/// (`market_id`, bids, asks, event queue from Geyser parse or one-time cold-path fill) **and**
-/// both vault reserves are known and non-zero (matches [`crate::execution::quote_calculator`] needs).
+/// (`market_id`, bids, asks, event queue, serum base/quote vaults from Geyser parse or one-time
+/// cold-path fill) **and** both vault reserves are known and non-zero (matches
+/// [`crate::execution::quote_calculator`] needs).
 ///
 /// Reserves alone never imply `Ready` (swap path still needs Serum accounts — see `RaydiumSwapAccounts`).
 #[must_use]
 pub fn raydium_amm_readiness_for_pool_cache_update(s: &RaydiumAmmState) -> DexPoolReadiness {
-    let static_ok = s.market_id != Pubkey::default()
-        && s.serum_bids.is_some()
-        && s.serum_asks.is_some()
-        && s.serum_event_queue.is_some();
+    let static_ok = raydium_amm_serum_static_accounts_ready(s);
     let r_coin = s.coin_reserve.unwrap_or(0);
     let r_pc = s.pc_reserve.unwrap_or(0);
     // `coin_reserve` / `pc_reserve` are the two pool legs; both must be non-zero for a usable
@@ -193,6 +247,29 @@ pub struct MeteoraState {
     /// Vault reserves
     pub reserve_x_balance: Option<u64>,
     pub reserve_y_balance: Option<u64>,
+    /// Account/Geyser pool parse populated DLMM bin parameters — never true for TX layout-only seed.
+    pub dlmm_bin_params_account_seeded: bool,
+}
+
+/// TX layout-only Meteora DLMM row: reserve vault pubkeys/mints only; bin params unset (not SSOT).
+#[must_use]
+pub fn meteora_dlmm_tx_layout_seed(
+    token_x_mint: Pubkey,
+    token_y_mint: Pubkey,
+    reserve_x: Pubkey,
+    reserve_y: Pubkey,
+) -> MeteoraState {
+    MeteoraState {
+        token_x_mint,
+        token_y_mint,
+        reserve_x,
+        reserve_y,
+        active_id: 0,
+        bin_step: 0,
+        reserve_x_balance: None,
+        reserve_y_balance: None,
+        dlmm_bin_params_account_seeded: false,
+    }
 }
 
 impl From<DlmmPool> for MeteoraState {
@@ -206,6 +283,7 @@ impl From<DlmmPool> for MeteoraState {
             bin_step: p.bin_step,
             reserve_x_balance: None,
             reserve_y_balance: None,
+            dlmm_bin_params_account_seeded: true,
         }
     }
 }
@@ -240,6 +318,58 @@ pub struct PumpAmmState {
     pub pool_accounts: Vec<Pubkey>,
     /// Creator of the token (parsed from pool account at offset 11-43)
     pub creator: Option<Pubkey>,
+}
+
+/// TX layout-only PumpAmm row: vault/mint pubkeys only; reserves and `pool_accounts` unset (not SSOT).
+#[must_use]
+pub fn pump_amm_tx_layout_seed(
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    pool_base_token_account: Pubkey,
+    pool_quote_token_account: Pubkey,
+) -> CachedPoolState {
+    CachedPoolState::PumpAmm(PumpAmmState {
+        base_mint,
+        quote_mint,
+        pool_base_token_account,
+        pool_quote_token_account,
+        base_reserve: None,
+        quote_reserve: None,
+        pool_accounts: Vec::new(),
+        creator: None,
+    })
+}
+
+/// Schicht C complete for PumpSwap: full 14-account swap metas with pool at index 0.
+#[must_use]
+pub fn pump_amm_layer_c_complete(pool: &Pubkey, accounts: &[Pubkey]) -> bool {
+    accounts.len() >= 14 && accounts.first() == Some(pool)
+}
+
+/// Schicht C complete for a cached pool row (Arb `dex_pool_accounts_from_cached_state` contract).
+#[must_use]
+pub fn cached_state_layer_c_complete(pool: &Pubkey, state: &CachedPoolState) -> bool {
+    match state {
+        CachedPoolState::PumpAmm(s) => pump_amm_layer_c_complete(pool, &s.pool_accounts),
+        CachedPoolState::Orca(s) => {
+            s.token_vault_a != Pubkey::default() && s.token_vault_b != Pubkey::default()
+        }
+        CachedPoolState::Meteora(s) => {
+            s.reserve_x != Pubkey::default() && s.reserve_y != Pubkey::default()
+        }
+        CachedPoolState::RaydiumCpmm(s) => {
+            s.token_0_vault != Pubkey::default() && s.token_1_vault != Pubkey::default()
+        }
+        _ => false,
+    }
+}
+
+/// Outcome of [`LivePoolCache::set_pump_amm_pool_accounts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetPumpAmmPoolAccountsResult {
+    Written,
+    MissIncompleteAccounts,
+    MissNoCacheEntry,
 }
 
 /// Meteora CPMM (DAMM V2) cached state
@@ -341,6 +471,45 @@ impl CachedPoolState {
     }
 }
 
+/// Hash of quotable reserve snapshot — material changes only (not heartbeat slots).
+pub fn pool_state_material_fingerprint(state: &CachedPoolState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    match state {
+        CachedPoolState::RaydiumCpmm(s) => {
+            s.reserve_0.hash(&mut hasher);
+            s.reserve_1.hash(&mut hasher);
+        }
+        CachedPoolState::MeteoraCpmm(s) => {
+            s.reserve_0.hash(&mut hasher);
+            s.reserve_1.hash(&mut hasher);
+        }
+        CachedPoolState::Meteora(s) => {
+            s.reserve_x_balance.hash(&mut hasher);
+            s.reserve_y_balance.hash(&mut hasher);
+            s.active_id.hash(&mut hasher);
+            s.bin_step.hash(&mut hasher);
+        }
+        CachedPoolState::PumpAmm(s) => {
+            s.base_reserve.hash(&mut hasher);
+            s.quote_reserve.hash(&mut hasher);
+        }
+        CachedPoolState::Orca(s) => {
+            s.vault_a_balance.hash(&mut hasher);
+            s.vault_b_balance.hash(&mut hasher);
+        }
+        CachedPoolState::RaydiumAmm(s) => {
+            s.coin_reserve.hash(&mut hasher);
+            s.pc_reserve.hash(&mut hasher);
+        }
+        CachedPoolState::PumpFun(s) => {
+            s.virtual_sol_reserves.hash(&mut hasher);
+            s.virtual_token_reserves.hash(&mut hasher);
+            s.complete.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
 /// True when the cached pool row has at least one non-zero reserve / vault balance.
 pub fn pool_state_has_reserve_basis(state: &CachedPoolState) -> bool {
     let fresh = |opt: Option<u64>| opt.is_some_and(|v| v > 0);
@@ -366,8 +535,11 @@ pub fn pool_state_has_reserve_basis(state: &CachedPoolState) -> bool {
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub state: CachedPoolState,
+    /// Slot of the last **material** (fingerprint) change — used for quote freshness.
     pub slot: u64,
     pub updated_at: Instant,
+    /// Latest Geyser slot observed for this pool (not used for quotes).
+    pub last_seen_slot: u64,
 }
 
 impl CacheEntry {
@@ -376,6 +548,7 @@ impl CacheEntry {
             state,
             slot,
             updated_at: Instant::now(),
+            last_seen_slot: slot,
         }
     }
 
@@ -569,6 +742,11 @@ impl LivePoolCache {
         }
     }
 
+    /// Latest Geyser slot observed for this pool (not the material quote slot).
+    pub fn get_last_seen_slot(&self, pool: &Pubkey) -> Option<u64> {
+        self.pools.get(pool).map(|entry| entry.last_seen_slot)
+    }
+
     /// Check if pool is in cache
     pub fn contains(&self, pool: &Pubkey) -> bool {
         self.pools.contains_key(pool)
@@ -607,8 +785,20 @@ impl LivePoolCache {
     ///
     /// Updates without quotable reserve basis (e.g. 0/0 `PoolDiscovered`) do **not** refresh
     /// `updated_at` on an existing row — prevents age-gate spoofing without quote readiness.
-    pub fn upsert(&self, pool: Pubkey, state: CachedPoolState, slot: u64) -> bool {
+    pub fn upsert(&self, pool: Pubkey, mut state: CachedPoolState, slot: u64) -> bool {
+        // TokenMintInfo can arrive before the pool account. Preserve that immutable
+        // Geyser fact when the Orca row is created later instead of depending on
+        // event ordering.
+        if let CachedPoolState::Orca(ref mut orca) = state {
+            if orca.token_a_program.is_none() {
+                orca.token_a_program = self.get_mint_program(&orca.token_mint_a);
+            }
+            if orca.token_b_program.is_none() {
+                orca.token_b_program = self.get_mint_program(&orca.token_mint_b);
+            }
+        }
         let refresh_age = pool_state_has_reserve_basis(&state);
+        let new_fingerprint = pool_state_material_fingerprint(&state);
         match self.pools.entry(pool) {
             Entry::Vacant(v) => {
                 let stored_slot = if slot == 0 { 0 } else { slot };
@@ -618,16 +808,38 @@ impl LivePoolCache {
                 true
             }
             Entry::Occupied(mut o) => {
-                let prev_slot = o.get().slot;
-                if slot > 0 && prev_slot > slot {
+                let prev = o.get();
+                if slot > 0 && slot < prev.last_seen_slot {
                     return false;
                 }
-                let stored_slot = if slot == 0 { prev_slot } else { slot };
-                let prev_updated_at = o.get().updated_at;
+                let material_changed =
+                    new_fingerprint != pool_state_material_fingerprint(&prev.state);
+                let stored_slot = if slot == 0 {
+                    prev.slot
+                } else if material_changed {
+                    slot
+                } else {
+                    prev.slot
+                };
+                let last_seen_slot = if slot > 0 {
+                    prev.last_seen_slot.max(slot)
+                } else {
+                    prev.last_seen_slot
+                };
+                let prev_updated_at = prev.updated_at;
                 self.register_vaults(&pool, &state);
-                let mut entry = CacheEntry::new(state, stored_slot);
-                if !refresh_age {
-                    entry.updated_at = prev_updated_at;
+                let entry = CacheEntry {
+                    state,
+                    slot: stored_slot,
+                    updated_at: if refresh_age && material_changed {
+                        Instant::now()
+                    } else {
+                        prev_updated_at
+                    },
+                    last_seen_slot,
+                };
+                if refresh_age && !material_changed {
+                    crate::metrics::inc_live_pool_cache_fingerprint_unchanged_skip_total();
                 }
                 *o.get_mut() = entry;
                 self.updates_total.fetch_add(1, Ordering::Relaxed);
@@ -679,40 +891,73 @@ impl LivePoolCache {
         if let Some(mapping) = self.vault_to_pool.get(vault) {
             let (pool_addr, position) = *mapping;
             if let Some(mut entry) = self.pools.get_mut(&pool_addr) {
-                // Only update if slot is newer
-                if slot >= entry.slot {
-                    match &mut entry.state {
-                        CachedPoolState::Orca(ref mut s) => match position {
-                            VaultPosition::A => s.vault_a_balance = Some(balance),
-                            VaultPosition::B => s.vault_b_balance = Some(balance),
-                        },
-                        CachedPoolState::RaydiumAmm(ref mut s) => match position {
-                            VaultPosition::A => s.coin_reserve = Some(balance),
-                            VaultPosition::B => s.pc_reserve = Some(balance),
-                        },
-                        CachedPoolState::RaydiumCpmm(ref mut s) => match position {
-                            VaultPosition::A => s.reserve_0 = Some(balance),
-                            VaultPosition::B => s.reserve_1 = Some(balance),
-                        },
-                        CachedPoolState::Meteora(ref mut s) => match position {
-                            VaultPosition::A => s.reserve_x_balance = Some(balance),
-                            VaultPosition::B => s.reserve_y_balance = Some(balance),
-                        },
-                        CachedPoolState::MeteoraCpmm(ref mut s) => match position {
-                            VaultPosition::A => s.reserve_0 = balance,
-                            VaultPosition::B => s.reserve_1 = balance,
-                        },
-                        CachedPoolState::PumpAmm(ref mut s) => match position {
-                            VaultPosition::A => s.base_reserve = Some(balance),
-                            VaultPosition::B => s.quote_reserve = Some(balance),
-                        },
-                        CachedPoolState::PumpFun(_) => {
-                            // PumpFun bonding curve has virtual reserves in the account itself
-                        }
-                    }
-                    entry.slot = slot;
-                    entry.updated_at = Instant::now();
+                let balance_changed = match &entry.state {
+                    CachedPoolState::Orca(s) => match position {
+                        VaultPosition::A => s.vault_a_balance != Some(balance),
+                        VaultPosition::B => s.vault_b_balance != Some(balance),
+                    },
+                    CachedPoolState::RaydiumAmm(s) => match position {
+                        VaultPosition::A => s.coin_reserve != Some(balance),
+                        VaultPosition::B => s.pc_reserve != Some(balance),
+                    },
+                    CachedPoolState::RaydiumCpmm(s) => match position {
+                        VaultPosition::A => s.reserve_0 != Some(balance),
+                        VaultPosition::B => s.reserve_1 != Some(balance),
+                    },
+                    CachedPoolState::Meteora(s) => match position {
+                        VaultPosition::A => s.reserve_x_balance != Some(balance),
+                        VaultPosition::B => s.reserve_y_balance != Some(balance),
+                    },
+                    CachedPoolState::MeteoraCpmm(s) => match position {
+                        VaultPosition::A => s.reserve_0 != balance,
+                        VaultPosition::B => s.reserve_1 != balance,
+                    },
+                    CachedPoolState::PumpAmm(s) => match position {
+                        VaultPosition::A => s.base_reserve != Some(balance),
+                        VaultPosition::B => s.quote_reserve != Some(balance),
+                    },
+                    CachedPoolState::PumpFun(_) => false,
+                };
+                if !balance_changed {
+                    crate::metrics::inc_live_pool_cache_fingerprint_unchanged_skip_total();
+                    return;
                 }
+                if slot > 0 && slot < entry.slot {
+                    return;
+                }
+                match &mut entry.state {
+                    CachedPoolState::Orca(ref mut s) => match position {
+                        VaultPosition::A => s.vault_a_balance = Some(balance),
+                        VaultPosition::B => s.vault_b_balance = Some(balance),
+                    },
+                    CachedPoolState::RaydiumAmm(ref mut s) => match position {
+                        VaultPosition::A => s.coin_reserve = Some(balance),
+                        VaultPosition::B => s.pc_reserve = Some(balance),
+                    },
+                    CachedPoolState::RaydiumCpmm(ref mut s) => match position {
+                        VaultPosition::A => s.reserve_0 = Some(balance),
+                        VaultPosition::B => s.reserve_1 = Some(balance),
+                    },
+                    CachedPoolState::Meteora(ref mut s) => match position {
+                        VaultPosition::A => s.reserve_x_balance = Some(balance),
+                        VaultPosition::B => s.reserve_y_balance = Some(balance),
+                    },
+                    CachedPoolState::MeteoraCpmm(ref mut s) => match position {
+                        VaultPosition::A => s.reserve_0 = balance,
+                        VaultPosition::B => s.reserve_1 = balance,
+                    },
+                    CachedPoolState::PumpAmm(ref mut s) => match position {
+                        VaultPosition::A => s.base_reserve = Some(balance),
+                        VaultPosition::B => s.quote_reserve = Some(balance),
+                    },
+                    CachedPoolState::PumpFun(_) => {
+                        // PumpFun bonding curve has virtual reserves in the account itself
+                    }
+                }
+                if slot > 0 {
+                    entry.slot = slot;
+                }
+                entry.updated_at = Instant::now();
             }
         }
     }
@@ -990,9 +1235,36 @@ impl LivePoolCache {
     ///
     /// Without this, PumpAmm entries parsed from Geyser have empty pool_accounts,
     /// making them unusable for tx building.
-    pub fn set_pump_amm_pool_accounts(&self, pool: &Pubkey, mut accounts: Vec<Pubkey>) {
-        if accounts.len() >= 14 {
-            pump_amm_normalize_v14_pool_accounts(pool, &mut accounts);
+    ///
+    /// When the pool row is missing, inserts a layout-only PumpAmm entry (no reserve overwrite)
+    /// from accounts indices 2–5 before writing Schicht C.
+    pub fn set_pump_amm_pool_accounts(
+        &self,
+        pool: &Pubkey,
+        accounts: Vec<Pubkey>,
+    ) -> SetPumpAmmPoolAccountsResult {
+        self.set_pump_amm_pool_accounts_at_slot(pool, accounts, 0)
+    }
+
+    /// Same as [`Self::set_pump_amm_pool_accounts`] with an explicit Geyser slot for layout seed.
+    pub fn set_pump_amm_pool_accounts_at_slot(
+        &self,
+        pool: &Pubkey,
+        mut accounts: Vec<Pubkey>,
+        slot: u64,
+    ) -> SetPumpAmmPoolAccountsResult {
+        if !pump_amm_layer_c_complete(pool, &accounts) {
+            return SetPumpAmmPoolAccountsResult::MissIncompleteAccounts;
+        }
+        pump_amm_normalize_v14_pool_accounts(pool, &mut accounts);
+        if !self.pools.contains_key(pool)
+            && !self.ensure_pump_amm_tx_layout_from_accounts(pool, &accounts, slot)
+        {
+            tracing::warn!(
+                pool = %pool,
+                "LivePoolCache: set_pump_amm_pool_accounts layout ensure failed"
+            );
+            return SetPumpAmmPoolAccountsResult::MissNoCacheEntry;
         }
         if let Some(mut entry) = self.pools.get_mut(pool) {
             if let CachedPoolState::PumpAmm(ref mut s) = entry.value_mut().state {
@@ -1011,13 +1283,44 @@ impl LivePoolCache {
                         "LivePoolCache: PumpAmm pool_accounts updated"
                     );
                 }
+                return SetPumpAmmPoolAccountsResult::Written;
             }
-        } else {
-            tracing::debug!(
-                pool = %pool,
-                "LivePoolCache: set_pump_amm_pool_accounts called but pool not in cache"
-            );
         }
+        tracing::warn!(
+            pool = %pool,
+            "LivePoolCache: set_pump_amm_pool_accounts called but pool not in cache"
+        );
+        SetPumpAmmPoolAccountsResult::MissNoCacheEntry
+    }
+
+    /// Layout-only PumpAmm upsert from TX `pool_accounts` when the cache row is missing.
+    fn ensure_pump_amm_tx_layout_from_accounts(
+        &self,
+        pool: &Pubkey,
+        accounts: &[Pubkey],
+        slot: u64,
+    ) -> bool {
+        if self.pools.contains_key(pool) {
+            return true;
+        }
+        let Some(base_mint) = accounts.get(2).copied().filter(|p| *p != Pubkey::default()) else {
+            return false;
+        };
+        let Some(quote_mint) = accounts.get(3).copied().filter(|p| *p != Pubkey::default()) else {
+            return false;
+        };
+        let Some(base_vault) = accounts.get(4).copied().filter(|p| *p != Pubkey::default()) else {
+            return false;
+        };
+        let Some(quote_vault) = accounts.get(5).copied().filter(|p| *p != Pubkey::default()) else {
+            return false;
+        };
+        self.upsert(
+            *pool,
+            pump_amm_tx_layout_seed(base_mint, quote_mint, base_vault, quote_vault),
+            slot,
+        );
+        true
     }
 
     /// JetStream / Geyser: merge PumpSwap extended `sell` layout keys into side maps (not `PumpAmmState`).
@@ -1469,6 +1772,8 @@ impl LivePoolCache {
         serum_bids: Pubkey,
         serum_asks: Pubkey,
         serum_event_queue: Pubkey,
+        serum_base_vault: Option<Pubkey>,
+        serum_quote_vault: Option<Pubkey>,
     ) {
         if let Some(mut entry) = self.pools.get_mut(pool) {
             if let CachedPoolState::RaydiumAmm(ref mut s) = entry.value_mut().state {
@@ -1476,12 +1781,20 @@ impl LivePoolCache {
                 s.serum_bids = Some(serum_bids);
                 s.serum_asks = Some(serum_asks);
                 s.serum_event_queue = Some(serum_event_queue);
+                if let Some(bv) = serum_base_vault {
+                    s.serum_base_vault = Some(bv);
+                }
+                if let Some(qv) = serum_quote_vault {
+                    s.serum_quote_vault = Some(qv);
+                }
                 if was_none {
                     tracing::info!(
                         pool = %pool,
                         bids = %serum_bids,
                         asks = %serum_asks,
                         event_queue = %serum_event_queue,
+                        serum_base_vault = ?serum_base_vault,
+                        serum_quote_vault = ?serum_quote_vault,
                         "LivePoolCache: Raydium serum accounts populated"
                     );
                 }
@@ -2304,8 +2617,8 @@ fn parse_raydium_amm(data: &[u8]) -> Option<CachedPoolState> {
     let base_mint = Pubkey::new_from_array(data[400..432].try_into().ok()?);
     let quote_mint = Pubkey::new_from_array(data[432..464].try_into().ok()?);
 
-    // Offset 464: market_id (Serum/OpenBook)
-    let market_id = Pubkey::new_from_array(data[464..496].try_into().ok()?);
+    // Raydium AMM v4: offset 464 is LP mint; Serum/OpenBook market_id starts at 528.
+    let market_id = Pubkey::new_from_array(data[528..560].try_into().ok()?);
 
     Some(CachedPoolState::RaydiumAmm(RaydiumAmmState {
         base_mint,
@@ -2320,6 +2633,8 @@ fn parse_raydium_amm(data: &[u8]) -> Option<CachedPoolState> {
         serum_bids: None,
         serum_asks: None,
         serum_event_queue: None,
+        serum_base_vault: None,
+        serum_quote_vault: None,
     }))
 }
 
@@ -2646,6 +2961,138 @@ mod tests {
     }
 
     #[test]
+    fn upsert_identical_reserves_does_not_refresh_material_slot_or_age() {
+        use std::time::Duration;
+
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let state = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(1_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+
+        cache.upsert(pool, state.clone(), 10);
+        std::thread::sleep(Duration::from_millis(40));
+        let (_, slot_before, age_before) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(slot_before, 10);
+
+        cache.upsert(pool, state, 50);
+        let (_, slot_after, age_after) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(
+            slot_after, slot_before,
+            "identical reserves must not advance material slot"
+        );
+        assert!(
+            age_after >= age_before,
+            "identical reserves must not reset cache age"
+        );
+        assert_eq!(
+            cache.get_last_seen_slot(&pool),
+            Some(50),
+            "last_seen_slot tracks heartbeat"
+        );
+    }
+
+    #[test]
+    fn upsert_rejects_out_of_order_material_change_after_newer_last_seen() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let state_a = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(1_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+        let state_b = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(2_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+
+        cache.upsert(pool, state_a.clone(), 10);
+        cache.upsert(pool, state_a, 50);
+        assert!(
+            !cache.upsert(pool, state_b, 20),
+            "late update between material and last_seen must not apply"
+        );
+
+        let (_, material_slot, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(material_slot, 10, "material slot must stay at last change");
+        assert_eq!(
+            cache.get_last_seen_slot(&pool),
+            Some(50),
+            "last_seen_slot keeps newest observed Geyser slot"
+        );
+        let cached = cache.get(&pool).expect("cached state");
+        let CachedPoolState::PumpAmm(s) = cached else {
+            panic!("expected pump amm");
+        };
+        assert_eq!(
+            s.base_reserve,
+            Some(1_000_000),
+            "state must remain prior snapshot"
+        );
+    }
+
+    #[test]
+    fn update_vault_balance_applies_below_pool_last_seen_when_material_advances() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let state = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: base_vault,
+            pool_quote_token_account: quote_vault,
+            base_reserve: Some(1_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+
+        cache.upsert(pool, state.clone(), 10);
+        cache.upsert(pool, state, 50);
+
+        let (_, material_before, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(material_before, 10);
+        assert_eq!(cache.get_last_seen_slot(&pool), Some(50));
+
+        cache.update_vault_balance(&base_vault, 2_000_000, 40);
+
+        let (_, material_after, _) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(
+            material_after, 40,
+            "vault ATA slot advances material watermark"
+        );
+        assert_eq!(cache.get_last_seen_slot(&pool), Some(50));
+        let cached = cache.get(&pool).expect("cached state");
+        let CachedPoolState::PumpAmm(s) = cached else {
+            panic!("expected pump amm");
+        };
+        assert_eq!(
+            s.base_reserve,
+            Some(2_000_000),
+            "vault balance must apply despite pool last_seen ahead of vault slot"
+        );
+    }
+
+    #[test]
     fn touch_freshness_on_stale_slot_heartbeat_sustains_age_without_slot_regress() {
         use std::time::Duration;
 
@@ -2775,6 +3222,7 @@ mod tests {
                 vault_b_balance: Some(2_000_000_000),
                 token_a_program: None,
                 token_b_program: None,
+                whirlpool_quote_account_seeded: true,
             }),
             100,
         );
@@ -2796,6 +3244,8 @@ mod tests {
                 serum_bids: None,
                 serum_asks: None,
                 serum_event_queue: None,
+                serum_base_vault: None,
+                serum_quote_vault: None,
             }),
             100,
         );
@@ -2813,6 +3263,7 @@ mod tests {
                 bin_step: 20,
                 reserve_x_balance: Some(5_000_000_000),
                 reserve_y_balance: Some(10_000_000_000),
+                dlmm_bin_params_account_seeded: true,
             }),
             100,
         );
@@ -2916,6 +3367,7 @@ mod tests {
             vault_b_balance: Some(2_000_000),
             token_a_program: None,
             token_b_program: None,
+            whirlpool_quote_account_seeded: true,
         });
 
         cache.upsert(pool, state, 100);
@@ -3503,7 +3955,10 @@ mod tests {
         let pool_market = Pubkey::new_unique();
         let base_mint = Pubkey::new_unique();
         let quote_mint = Pubkey::new_unique();
-        let accounts_to_set: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let mut accounts_to_set: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        accounts_to_set[0] = pool_market;
+        accounts_to_set[2] = base_mint;
+        accounts_to_set[3] = quote_mint;
 
         cache.upsert(
             pool_market,
@@ -3511,7 +3966,8 @@ mod tests {
             100,
         );
 
-        cache.set_pump_amm_pool_accounts(&pool_market, accounts_to_set.clone());
+        let result = cache.set_pump_amm_pool_accounts(&pool_market, accounts_to_set.clone());
+        assert_eq!(result, SetPumpAmmPoolAccountsResult::Written);
 
         let canonical_gc = crate::solana::dex::pumpfun_amm::pump_amm_canonical_global_config();
         let canonical_ea =
@@ -3542,7 +3998,10 @@ mod tests {
         let creator = Pubkey::new_unique();
         let base_reserve = 1_000_000_000u64;
         let quote_reserve = 50_000_000_000u64;
-        let new_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let mut new_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        new_accounts[0] = pool_market;
+        new_accounts[2] = base_mint;
+        new_accounts[3] = quote_mint;
 
         cache.upsert(
             pool_market,
@@ -3559,7 +4018,8 @@ mod tests {
             100,
         );
 
-        cache.set_pump_amm_pool_accounts(&pool_market, new_accounts.clone());
+        let result = cache.set_pump_amm_pool_accounts(&pool_market, new_accounts.clone());
+        assert_eq!(result, SetPumpAmmPoolAccountsResult::Written);
 
         let canonical_gc = crate::solana::dex::pumpfun_amm::pump_amm_canonical_global_config();
         let canonical_ea =
@@ -3586,6 +4046,39 @@ mod tests {
         } else {
             panic!("expected PumpAmm state");
         }
+    }
+
+    /// Hot pin-seed: layout-only ensure + Schicht C when pool row was missing from cache.
+    #[test]
+    fn test_set_pump_amm_pool_accounts_ensures_layout_when_pool_missing() {
+        let cache = LivePoolCache::new();
+        let pool_market = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let mut accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        accounts[0] = pool_market;
+        accounts[2] = base_mint;
+        accounts[3] = quote_mint;
+        accounts[4] = base_vault;
+        accounts[5] = quote_vault;
+
+        assert!(cache.get(&pool_market).is_none());
+
+        let result = cache.set_pump_amm_pool_accounts_at_slot(&pool_market, accounts.clone(), 42);
+        assert_eq!(result, SetPumpAmmPoolAccountsResult::Written);
+
+        let Some(CachedPoolState::PumpAmm(s)) = cache.get(&pool_market) else {
+            panic!("expected PumpAmm cache row after layout ensure");
+        };
+        assert_eq!(s.base_mint, base_mint);
+        assert_eq!(s.quote_mint, quote_mint);
+        assert_eq!(s.pool_base_token_account, base_vault);
+        assert_eq!(s.pool_quote_token_account, quote_vault);
+        assert!(s.base_reserve.is_none());
+        assert!(s.quote_reserve.is_none());
+        assert!(pump_amm_layer_c_complete(&pool_market, &s.pool_accounts));
     }
 
     #[test]
@@ -3833,6 +4326,7 @@ mod tests {
             vault_b_balance,
             token_a_program: None,
             token_b_program: None,
+            whirlpool_quote_account_seeded: true,
         }
     }
 
@@ -3895,6 +4389,30 @@ mod tests {
             orca_readiness_for_pool_cache_update(&s),
             DexPoolReadiness::Ready
         );
+    }
+
+    #[test]
+    fn orca_upsert_hydrates_token_programs_seen_before_pool() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token_a = Pubkey::new_unique();
+        let token_b = Pubkey::new_unique();
+        let token_2022 = Pubkey::new_unique();
+        let legacy_token = Pubkey::new_unique();
+
+        cache.update_mint_program(&token_a, token_2022);
+        cache.update_mint_program(&token_b, legacy_token);
+        cache.upsert(
+            pool,
+            CachedPoolState::Orca(make_orca_state(token_a, token_b, Some(1), Some(2))),
+            100,
+        );
+
+        let CachedPoolState::Orca(state) = cache.get(&pool).expect("orca pool") else {
+            panic!("expected Orca state");
+        };
+        assert_eq!(state.token_a_program, Some(token_2022));
+        assert_eq!(state.token_b_program, Some(legacy_token));
     }
 
     #[test]
@@ -4043,6 +4561,8 @@ mod tests {
             serum_bids: None,
             serum_asks: None,
             serum_event_queue: None,
+            serum_base_vault: None,
+            serum_quote_vault: None,
         };
         assert_eq!(
             raydium_amm_readiness_for_pool_cache_update(&s),
@@ -4067,11 +4587,41 @@ mod tests {
             serum_bids: Some(Pubkey::new_unique()),
             serum_asks: Some(Pubkey::new_unique()),
             serum_event_queue: Some(Pubkey::new_unique()),
+            serum_base_vault: Some(Pubkey::new_unique()),
+            serum_quote_vault: Some(Pubkey::new_unique()),
         };
         assert_eq!(
             raydium_amm_readiness_for_pool_cache_update(&s),
             DexPoolReadiness::Ready
         );
+    }
+
+    #[test]
+    fn test_raydium_amm_readiness_helper_bids_without_vaults_is_partial() {
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let s = RaydiumAmmState {
+            base_mint: base,
+            quote_mint: quote,
+            coin_vault: Pubkey::new_unique(),
+            pc_vault: Pubkey::new_unique(),
+            base_decimals: 9,
+            quote_decimals: 9,
+            coin_reserve: Some(100),
+            pc_reserve: Some(200),
+            market_id: Pubkey::new_unique(),
+            serum_bids: Some(Pubkey::new_unique()),
+            serum_asks: Some(Pubkey::new_unique()),
+            serum_event_queue: Some(Pubkey::new_unique()),
+            serum_base_vault: None,
+            serum_quote_vault: None,
+        };
+        assert_eq!(
+            raydium_amm_readiness_for_pool_cache_update(&s),
+            DexPoolReadiness::Partial
+        );
+        assert!(!raydium_amm_serum_static_accounts_ready(&s));
+        assert!(raydium_amm_serum_needs_cold_backfill(&s));
     }
 
     #[test]
@@ -4095,12 +4645,50 @@ mod tests {
                 serum_bids: Some(Pubkey::new_unique()),
                 serum_asks: Some(Pubkey::new_unique()),
                 serum_event_queue: Some(Pubkey::new_unique()),
+                serum_base_vault: Some(Pubkey::new_unique()),
+                serum_quote_vault: Some(Pubkey::new_unique()),
             }),
             100,
         );
         cache.merge_raydium_amm_pool_readiness(pool, DexPoolReadiness::Ready);
         assert!(cache.base_mint_has_any_ready_pool(&base_mint));
         assert!(cache.base_mint_has_explicit_raydium_amm_ready_pool(&base_mint));
+    }
+
+    #[test]
+    fn test_base_mint_has_any_ready_pool_raydium_amm_explicit_ready_without_vaults_is_false() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint,
+                quote_mint,
+                coin_vault: Pubkey::new_unique(),
+                pc_vault: Pubkey::new_unique(),
+                base_decimals: 9,
+                quote_decimals: 9,
+                coin_reserve: Some(1),
+                pc_reserve: Some(2),
+                market_id: Pubkey::new_unique(),
+                serum_bids: Some(Pubkey::new_unique()),
+                serum_asks: Some(Pubkey::new_unique()),
+                serum_event_queue: Some(Pubkey::new_unique()),
+                serum_base_vault: None,
+                serum_quote_vault: None,
+            }),
+            100,
+        );
+        let readiness =
+            raydium_amm_readiness_for_pool_cache_update(match cache.get(&pool).unwrap() {
+                CachedPoolState::RaydiumAmm(ref s) => s,
+                _ => panic!("expected RaydiumAmm"),
+            });
+        assert_eq!(readiness, DexPoolReadiness::Partial);
+        cache.merge_raydium_amm_pool_readiness(pool, readiness);
+        assert!(!cache.base_mint_has_any_ready_pool(&base_mint));
     }
 
     #[test]
@@ -4124,6 +4712,8 @@ mod tests {
                 serum_bids: Some(Pubkey::new_unique()),
                 serum_asks: Some(Pubkey::new_unique()),
                 serum_event_queue: Some(Pubkey::new_unique()),
+                serum_base_vault: Some(Pubkey::new_unique()),
+                serum_quote_vault: Some(Pubkey::new_unique()),
             }),
             100,
         );
@@ -4365,6 +4955,7 @@ mod tests {
             bin_step,
             reserve_x_balance,
             reserve_y_balance,
+            dlmm_bin_params_account_seeded: true,
         }
     }
 
@@ -4576,5 +5167,37 @@ mod tests {
         // Sleep briefly and check again
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(entry.age_ms() >= 10);
+    }
+}
+#[cfg(test)]
+mod raydium_parser_tests {
+    use super::*;
+
+    #[test]
+    fn parse_raydium_amm_reads_market_id_not_lp_mint() {
+        let mut data = vec![0u8; 752];
+        data[0..8].copy_from_slice(&1u64.to_le_bytes());
+        data[32..40].copy_from_slice(&9u64.to_le_bytes());
+        data[40..48].copy_from_slice(&6u64.to_le_bytes());
+
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let lp_mint = Pubkey::new_unique();
+        let market_id = Pubkey::new_unique();
+        data[336..368].copy_from_slice(coin_vault.as_ref());
+        data[368..400].copy_from_slice(pc_vault.as_ref());
+        data[400..432].copy_from_slice(base_mint.as_ref());
+        data[432..464].copy_from_slice(quote_mint.as_ref());
+        data[464..496].copy_from_slice(lp_mint.as_ref());
+        data[528..560].copy_from_slice(market_id.as_ref());
+
+        let parsed = parse_raydium_amm(&data).expect("valid Raydium AMM v4 state");
+        let CachedPoolState::RaydiumAmm(state) = parsed else {
+            panic!("expected Raydium AMM state");
+        };
+        assert_eq!(state.market_id, market_id);
+        assert_ne!(state.market_id, lp_mint);
     }
 }

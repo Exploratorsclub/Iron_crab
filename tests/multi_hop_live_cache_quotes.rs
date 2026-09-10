@@ -40,6 +40,8 @@ fn live_pool_cache_quotes_rank_both_directions_without_trades() {
             serum_bids: None,
             serum_asks: None,
             serum_event_queue: None,
+            serum_base_vault: None,
+            serum_quote_vault: None,
         }),
         1,
     );

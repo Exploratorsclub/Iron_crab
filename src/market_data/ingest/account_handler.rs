@@ -19,8 +19,8 @@ use crate::market_data::publish::{
     account_path_enqueue_core_market_event, account_path_enqueue_jetstream, AccountPublishSender,
 };
 use crate::market_data::sidefx::{
-    md_sidefx_try_enqueue_classed, MarketEventCorePublishTrace, MdSidefxCommand, MdSidefxSender,
-    SidefxUpdateClass,
+    md_account_sidefx_try_enqueue_classed, MarketEventCorePublishTrace, MdAccountSidefxSender,
+    MdSidefxCommand, SidefxUpdateClass,
 };
 use crate::metrics::{
     inc_market_data_dlmm_bin_emit_skipped_empty_total,
@@ -61,13 +61,13 @@ pub async fn publish_meteora_dlmm_bin_array_from_geyser<H: AccountIngestHost>(
     account_update: &GeyserAccountUpdate,
     bin_array_info: AccountBinArrayView,
     publish_tx: Option<&AccountPublishSender>,
-    md_sidefx: Option<&MdSidefxSender>,
+    md_sidefx: Option<&MdAccountSidefxSender>,
     sidefx_class: SidefxUpdateClass,
     update_class: AccountUpdateClass,
     replay_from_stash: bool,
 ) -> DlmmBinArrayPublishOutcome {
     if let Some(md_sidefx) = md_sidefx {
-        md_sidefx_try_enqueue_classed(
+        md_account_sidefx_try_enqueue_classed(
             md_sidefx,
             sidefx_class,
             MdSidefxCommand::TouchBinArrayTick {
@@ -137,7 +137,7 @@ pub async fn publish_meteora_dlmm_bin_array_from_geyser<H: AccountIngestHost>(
 
             if host.ingest_is_hot_pool(&bin_array_info.pool_address) {
                 if let Some(md_sidefx) = md_sidefx {
-                    md_sidefx_try_enqueue_classed(
+                    md_account_sidefx_try_enqueue_classed(
                         md_sidefx,
                         SidefxUpdateClass::ExecHot,
                         MdSidefxCommand::DlmmPoolStatePublishSignal {
@@ -175,7 +175,7 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
     recv_at: Instant,
     publish_tx: Option<&AccountPublishSender>,
     _md_state: &MdStateSender,
-    md_sidefx: &MdSidefxSender,
+    md_sidefx: &MdAccountSidefxSender,
     update_class: AccountUpdateClass,
 ) {
     let sidefx_class = SidefxUpdateClass::from(update_class);
@@ -387,7 +387,7 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
             host.account_wallet_mint_decimals_insert(account_update.pubkey, decimals);
 
             // Phase-R-R4b: MASTER mint_decimals off account ingest (`md-sidefx`).
-            md_sidefx_try_enqueue_classed(
+            md_account_sidefx_try_enqueue_classed(
                 md_sidefx,
                 SidefxUpdateClass::ExecHot,
                 MdSidefxCommand::LivePoolCacheMintDecimals {
@@ -461,7 +461,7 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
     {
         // Phase-R-R4: vault pairing + publish off hot path (`md-sidefx`; no `tracked_vaults` read here).
         if let Some(balance) = try_parse_token_account_balance(&account_update.data) {
-            md_sidefx_try_enqueue_classed(
+            md_account_sidefx_try_enqueue_classed(
                 md_sidefx,
                 sidefx_class,
                 MdSidefxCommand::VaultBalanceTick {
@@ -516,7 +516,7 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
 
     // Phase-R-R4b: LivePoolCache populate + PoolCacheUpdate off account ingest (`md-sidefx`).
     if account_geyser_update_is_dex_pool_owner(&account_update.owner) {
-        md_sidefx_try_enqueue_classed(
+        md_account_sidefx_try_enqueue_classed(
             md_sidefx,
             sidefx_class,
             MdSidefxCommand::LivePoolCacheAccountUpdate {
@@ -550,7 +550,7 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
         slot,
     }) = &parsed
     {
-        md_sidefx_try_enqueue_classed(
+        md_account_sidefx_try_enqueue_classed(
             md_sidefx,
             sidefx_class,
             MdSidefxCommand::BondingCurveDevWallet {
