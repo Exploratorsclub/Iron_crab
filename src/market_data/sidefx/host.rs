@@ -109,6 +109,12 @@ pub trait SidefxWorkerHost: Send + Sync {
         pool_accounts: &[Pubkey],
         slot: u64,
     );
+
+    /// True when expected vault/bin rows for a hot pool are already tracked in explicit demand.
+    fn hot_pool_reserve_registration_satisfied(&self, pool: Pubkey) -> bool;
+
+    /// Pin-gated vault/bin register after account-decode cache upsert (same path as TX hot-apply).
+    fn register_geyser_reserves_after_hot_pool_cache_fill(&self, pool: Pubkey);
 }
 
 #[inline]

@@ -16,10 +16,10 @@ use crate::arb_quality::{
     record_arb_pin_quality_slot, record_arb_pin_quality_stage,
 };
 use crate::execution::live_pool_cache::{
-    cached_state_layer_c_complete, meteora_cpmm_readiness_for_pool_cache_update,
-    meteora_dlmm_readiness_for_pool_cache_update, orca_readiness_for_pool_cache_update,
-    parse_pool_account, pump_amm_layer_c_complete, raydium_amm_readiness_for_pool_cache_update,
-    CachedPoolState, PumpFunState, SetPumpAmmPoolAccountsResult,
+    meteora_cpmm_readiness_for_pool_cache_update, meteora_dlmm_readiness_for_pool_cache_update,
+    orca_readiness_for_pool_cache_update, parse_pool_account, pump_amm_layer_c_complete,
+    raydium_amm_readiness_for_pool_cache_update, CachedPoolState, PumpFunState,
+    SetPumpAmmPoolAccountsResult,
 };
 use crate::ipc::{
     DexPoolReadiness, MarketEvent, MarketEventKind, PoolCacheUpdate, NATIVE_SOL_MINT,
@@ -1227,10 +1227,8 @@ pub fn md_sidefx_process_generic_dex_first_trade(
         if !host.is_hot_pool(pool_address) {
             return;
         }
-        if let Some(state) = host.live_pool_cache().get(pool_address) {
-            if cached_state_layer_c_complete(pool_address, &state) {
-                return;
-            }
+        if host.hot_pool_reserve_registration_satisfied(*pool_address) {
+            return;
         }
     }
     let accounts_event = MarketEvent::new(
@@ -1594,9 +1592,13 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
             }
         }
 
+        if host.is_hot_pool(pool_pubkey) {
+            host.register_geyser_reserves_after_hot_pool_cache_fill(*pool_pubkey);
+        }
+
         host.maybe_retry_deferred_hot_pool_reserves_on_cache_fill(pool_pubkey);
 
-        // Phase1: sidefx only updates MASTER cache + JetStream; vault registration stays in md-state.
+        // Phase1: sidefx only updates MASTER cache + JetStream; vault registration via host hook above.
         // (No RegisterPoolVaultsFromAccount enqueue from account parse.)
 
         // Extract mint and reserve info from cached_state for PoolCacheUpdate

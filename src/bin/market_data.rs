@@ -781,6 +781,14 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
             slot,
         );
     }
+
+    fn hot_pool_reserve_registration_satisfied(&self, pool: Pubkey) -> bool {
+        self.ctx.hot_pool_reserve_registration_satisfied(pool)
+    }
+
+    fn register_geyser_reserves_after_hot_pool_cache_fill(&self, pool: Pubkey) {
+        register_geyser_reserves_for_hot_pool_with_completeness_metrics(&self.ctx, pool, false);
+    }
 }
 
 /// Phase 5b: md-sidefx workers (delegates to `sidefx/worker.rs`).
@@ -1954,7 +1962,7 @@ fn expected_pool_vault_pubkeys_from_cache(
 }
 
 /// True when a hot-pool cache upsert still needs vault registration (missing vault rows).
-#[cfg(test)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn pool_needs_tracking_refresh_after_cache_upsert(
     ctx: &MarketDataContext,
     pool: Pubkey,
@@ -1964,10 +1972,56 @@ fn pool_needs_tracking_refresh_after_cache_upsert(
         return false;
     }
     if ctx.pool_vaults_fully_tracked_for_cache(pool, cached_state) {
-        ironcrab::metrics::inc_market_data_md_state_register_skipped_idempotent_total();
         return false;
     }
     true
+}
+
+/// Record vault-register completeness after a hot-pool cache row exists (TX or account path).
+fn register_geyser_reserves_for_hot_pool_with_completeness_metrics(
+    ctx: &MarketDataContext,
+    pool: Pubkey,
+    tx_hot_apply: bool,
+) {
+    if !ctx.hot_pool_registry.is_hot_pool(pool) {
+        return;
+    }
+    let record_tx = |result: ironcrab::metrics::TxPoolAccountsHotApplyResult| {
+        if tx_hot_apply {
+            ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(result);
+        }
+    };
+    let record_account = |result: ironcrab::metrics::AccountPathHotVaultRegisterResult| {
+        if !tx_hot_apply {
+            ironcrab::metrics::inc_market_data_account_path_hot_vault_register_total(result);
+        }
+    };
+    let Some(_cached_state) = ctx.live_pool_cache.get(&pool) else {
+        record_tx(ironcrab::metrics::TxPoolAccountsHotApplyResult::CacheMiss);
+        return;
+    };
+    if ctx.hot_pool_reserve_registration_satisfied(pool) {
+        record_tx(ironcrab::metrics::TxPoolAccountsHotApplyResult::RegisterAlreadyComplete);
+        record_account(
+            ironcrab::metrics::AccountPathHotVaultRegisterResult::RegisterAlreadyComplete,
+        );
+        return;
+    }
+    let had_new_keys = ctx.register_geyser_reserves_after_trade(pool);
+    if ctx.hot_pool_reserve_registration_satisfied(pool) {
+        if had_new_keys {
+            record_tx(ironcrab::metrics::TxPoolAccountsHotApplyResult::Register);
+            record_account(ironcrab::metrics::AccountPathHotVaultRegisterResult::Register);
+        } else {
+            record_tx(ironcrab::metrics::TxPoolAccountsHotApplyResult::RegisterAlreadyComplete);
+            record_account(
+                ironcrab::metrics::AccountPathHotVaultRegisterResult::RegisterAlreadyComplete,
+            );
+        }
+    } else {
+        record_tx(ironcrab::metrics::TxPoolAccountsHotApplyResult::RegisterIncomplete);
+        record_account(ironcrab::metrics::AccountPathHotVaultRegisterResult::RegisterIncomplete);
+    }
 }
 
 /// True when expected vault rows for a pool are already registered with sibling links.
@@ -2218,11 +2272,7 @@ fn apply_tx_pool_accounts_for_hot_pool(
     ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(
         ironcrab::metrics::TxPoolAccountsHotApplyResult::Upsert,
     );
-    if ctx.register_geyser_reserves_after_trade(pool) {
-        ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(
-            ironcrab::metrics::TxPoolAccountsHotApplyResult::Register,
-        );
-    }
+    register_geyser_reserves_for_hot_pool_with_completeness_metrics(ctx, pool, true);
 }
 
 /// PR237: cache-first vault/bin pubkeys for trade-path LRU touch (no full-map scan).
@@ -18861,6 +18911,172 @@ mod pr_b_geyser_tracking_tests {
             ctx.tracked_vaults.read()[&base_vault].pin,
             Some(GeyserPinReason::MomentumActive),
             "dual pin must prefer Momentum over Arb (I-MD-8)"
+        );
+    }
+
+    #[test]
+    fn tx_layout_seed_orca_hot_arb_registers_both_vaults_in_explicit_demand() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let vault_a = Pubkey::new_unique();
+        let vault_b = Pubkey::new_unique();
+        let accounts = vec![pool, base, quote, vault_a, vault_b];
+
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_arb_pool_admitted(pool);
+
+        apply_tx_pool_accounts_for_hot_pool(
+            &ctx,
+            pool,
+            DexType::OrcaWhirlpool,
+            base,
+            quote,
+            &accounts,
+            1,
+        );
+
+        let demand = ctx.snapshot_explicit_demand_pubkeys();
+        assert!(demand.contains(&vault_a), "orca vault A must be explicit");
+        assert!(demand.contains(&vault_b), "orca vault B must be explicit");
+        let vs = ctx.tracked_vaults.read();
+        assert!(vs.contains_key(&vault_a));
+        assert!(vs.contains_key(&vault_b));
+    }
+
+    #[test]
+    fn account_path_hot_pool_register_vaults_without_deferred_entry() {
+        use ironcrab::market_data::sidefx::SidefxWorkerHost;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = Arc::new(minimal_market_data_context_for_pr_d_tests(jsonl));
+        let (md_state, _, _) = test_md_state_sender_no_worker();
+        let host = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_arb_pool_admitted(pool);
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint: base,
+                quote_mint: quote,
+                coin_vault,
+                pc_vault,
+                base_decimals: 9,
+                quote_decimals: 9,
+                coin_reserve: Some(1),
+                pc_reserve: Some(2),
+                market_id: Pubkey::new_unique(),
+                serum_bids: None,
+                serum_asks: None,
+                serum_event_queue: None,
+                serum_base_vault: None,
+                serum_quote_vault: None,
+            }),
+            1,
+        );
+        assert!(
+            !ctx.deferred_hot_pool_reserve_pins
+                .read()
+                .contains_key(&pool),
+            "test must not rely on deferred pin row"
+        );
+
+        host.register_geyser_reserves_after_hot_pool_cache_fill(pool);
+
+        let demand = ctx.snapshot_explicit_demand_pubkeys();
+        assert!(demand.contains(&coin_vault));
+        assert!(demand.contains(&pc_vault));
+        let vs = ctx.tracked_vaults.read();
+        assert!(vs.contains_key(&coin_vault));
+        assert!(vs.contains_key(&pc_vault));
+    }
+
+    #[test]
+    fn generic_dex_follow_trade_registers_when_layer_c_complete_but_vaults_untracked() {
+        use ironcrab::market_data::sidefx::md_sidefx_process_generic_dex_first_trade;
+        use ironcrab::market_data::sidefx::MdSidefxCommand;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = Arc::new(minimal_market_data_context_for_pr_d_tests(jsonl));
+        let (md_state, _, _) = test_md_state_sender_no_worker();
+        let host = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let vault_a = Pubkey::new_unique();
+        let vault_b = Pubkey::new_unique();
+        let accounts = vec![pool, base, quote, vault_a, vault_b];
+
+        ctx.known_trade_dex_pools.write().insert(pool);
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_arb_pool_admitted(pool);
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: base,
+                token_mint_b: quote,
+                token_vault_a: vault_a,
+                token_vault_b: vault_b,
+                tick_current_index: 0,
+                sqrt_price: 0,
+                liquidity: 0,
+                fee_rate: 0,
+                protocol_fee_rate: 0,
+                tick_spacing: 0,
+                vault_a_balance: None,
+                vault_b_balance: None,
+                token_a_program: None,
+                token_b_program: None,
+                whirlpool_quote_account_seeded: false,
+            }),
+            1,
+        );
+        assert!(
+            ironcrab::execution::live_pool_cache::cached_state_layer_c_complete(
+                &pool,
+                &ctx.live_pool_cache.get(&pool).unwrap()
+            ),
+            "layer C must be complete while vaults remain untracked"
+        );
+        assert!(ctx.tracked_vaults.read().is_empty());
+
+        let job = MdSidefxCommand::GenericDexFirstTradeAccounts {
+            run_id: "test".into(),
+            pool_address: pool,
+            mint: base,
+            quote_mint: quote,
+            dex: DexType::OrcaWhirlpool,
+            pool_accounts: accounts,
+            slot: 2,
+            tx_geyser_recv_at: Instant::now(),
+        };
+        md_sidefx_process_generic_dex_first_trade(&host, &job);
+
+        let vs = ctx.tracked_vaults.read();
+        assert!(
+            vs.contains_key(&vault_a),
+            "follow trade must register vault A"
+        );
+        assert!(
+            vs.contains_key(&vault_b),
+            "follow trade must register vault B"
         );
     }
 

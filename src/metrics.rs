@@ -316,14 +316,27 @@ static MARKET_DATA_TRADE_PATH_VAULT_REGISTER_MOMENTUM: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_TRADE_PATH_VAULT_REGISTER_SKIPPED_NOT_HOT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
-/// Hot-gated TX `pool_accounts` apply outcomes (`result=upsert|register|skip_not_hot|skip_unparseable`).
+/// Hot-gated TX `pool_accounts` apply outcomes.
 static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_UPSERT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER_ALREADY_COMPLETE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER_INCOMPLETE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_NOT_HOT: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_UNPARSEABLE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_CACHE_MISS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Hot account-decode path vault register completeness (pin-gated, no TX upsert).
+static MARKET_DATA_ACCOUNT_PATH_HOT_VAULT_REGISTER: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_PATH_HOT_VAULT_REGISTER_ALREADY_COMPLETE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_ACCOUNT_PATH_HOT_VAULT_REGISTER_INCOMPLETE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// TX layout-only hot-apply preserved existing account quote fields (merge skip-overwrite).
 static MARKET_DATA_TX_LAYOUT_SEED_PRESERVE_QUOTE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -814,8 +827,18 @@ pub fn inc_market_data_tx_pin_seed_pool_accounts_write_miss_total(reason: &str) 
 pub enum TxPoolAccountsHotApplyResult {
     Upsert,
     Register,
+    RegisterAlreadyComplete,
+    RegisterIncomplete,
     SkipNotHot,
     SkipUnparseable,
+    CacheMiss,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountPathHotVaultRegisterResult {
+    Register,
+    RegisterAlreadyComplete,
+    RegisterIncomplete,
 }
 
 #[inline]
@@ -823,11 +846,38 @@ pub fn inc_market_data_tx_pool_accounts_hot_apply_total(result: TxPoolAccountsHo
     let counter = match result {
         TxPoolAccountsHotApplyResult::Upsert => &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_UPSERT,
         TxPoolAccountsHotApplyResult::Register => &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER,
+        TxPoolAccountsHotApplyResult::RegisterAlreadyComplete => {
+            &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER_ALREADY_COMPLETE
+        }
+        TxPoolAccountsHotApplyResult::RegisterIncomplete => {
+            &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER_INCOMPLETE
+        }
         TxPoolAccountsHotApplyResult::SkipNotHot => {
             &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_NOT_HOT
         }
         TxPoolAccountsHotApplyResult::SkipUnparseable => {
             &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_UNPARSEABLE
+        }
+        TxPoolAccountsHotApplyResult::CacheMiss => {
+            &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_CACHE_MISS
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_account_path_hot_vault_register_total(
+    result: AccountPathHotVaultRegisterResult,
+) {
+    let counter = match result {
+        AccountPathHotVaultRegisterResult::Register => {
+            &*MARKET_DATA_ACCOUNT_PATH_HOT_VAULT_REGISTER
+        }
+        AccountPathHotVaultRegisterResult::RegisterAlreadyComplete => {
+            &*MARKET_DATA_ACCOUNT_PATH_HOT_VAULT_REGISTER_ALREADY_COMPLETE
+        }
+        AccountPathHotVaultRegisterResult::RegisterIncomplete => {
+            &*MARKET_DATA_ACCOUNT_PATH_HOT_VAULT_REGISTER_INCOMPLETE
         }
     };
     counter.fetch_add(1, Ordering::Relaxed);
@@ -9553,6 +9603,54 @@ async fn metrics_response() -> Response<Body> {
     out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"register\"} ");
     out.push_str(
         &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "market_data_tx_pool_accounts_hot_apply_total{result=\"register_already_complete\"} ",
+    );
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER_ALREADY_COMPLETE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"register_incomplete\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_REGISTER_INCOMPLETE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"cache_miss\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_CACHE_MISS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_account_path_hot_vault_register_total{result=\"register\"} ");
+    out.push_str(
+        &MARKET_DATA_ACCOUNT_PATH_HOT_VAULT_REGISTER
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "market_data_account_path_hot_vault_register_total{result=\"register_already_complete\"} ",
+    );
+    out.push_str(
+        &MARKET_DATA_ACCOUNT_PATH_HOT_VAULT_REGISTER_ALREADY_COMPLETE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        "market_data_account_path_hot_vault_register_total{result=\"register_incomplete\"} ",
+    );
+    out.push_str(
+        &MARKET_DATA_ACCOUNT_PATH_HOT_VAULT_REGISTER_INCOMPLETE
             .load(Ordering::Relaxed)
             .to_string(),
     );
