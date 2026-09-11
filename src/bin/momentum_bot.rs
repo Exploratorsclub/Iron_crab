@@ -54,11 +54,11 @@ use ironcrab::metrics::{
     record_momentum_core_market_events_received_kind, record_momentum_ingest_to_process_us,
     record_momentum_market_events_last_applied_slot,
     record_momentum_market_events_subscription_max_dequeued_slot,
-    record_momentum_nats_batch_prepare_us, record_momentum_overlay_closed_by_authority_total,
-    record_momentum_signal_eval_us, record_momentum_soft_exit_suppressed_authority_total,
-    record_momentum_tracker_rejected, record_momentum_tracker_trades_recorded,
-    record_momentum_trades_received_no_tracker, serve_metrics,
-    set_momentum_bot_process_start_unix_sec,
+    record_momentum_nats_batch_prepare_us, record_momentum_no_tracker_reason,
+    record_momentum_overlay_closed_by_authority_total, record_momentum_signal_eval_us,
+    record_momentum_soft_exit_suppressed_authority_total, record_momentum_tracker_rejected,
+    record_momentum_tracker_trades_recorded, record_momentum_trades_received_no_tracker,
+    serve_metrics, set_momentum_bot_process_start_unix_sec,
     set_momentum_market_events_ingest_max_wall_lag_ms_last_batch,
     set_position_authority_drift_momentum, set_readiness_nats_connected,
     try_record_momentum_event_to_ingest_ms, try_record_momentum_event_to_intent_publish_ms,
@@ -142,6 +142,43 @@ const MOMENTUM_STALE_DISCOVERY_SECS: u64 = 30 * 60;
 
 /// Rate-limit `trade without tracker` warnings (per mint+pool).
 const MOMENTUM_NO_TRACKER_WARN_COOLDOWN: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MomentumNoTrackerReason {
+    PoolNotDiscovered,
+    TradeBeforeDiscovery,
+    TrackerAbsentAfterDiscovery,
+    PoolKeyMismatch,
+}
+
+impl MomentumNoTrackerReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PoolNotDiscovered => "pool_not_discovered",
+            Self::TradeBeforeDiscovery => "trade_before_discovery",
+            Self::TrackerAbsentAfterDiscovery => "tracker_absent_after_discovery",
+            Self::PoolKeyMismatch => "pool_key_mismatch",
+        }
+    }
+}
+
+fn classify_momentum_no_tracker_reason(
+    has_sibling_tracker: bool,
+    pool_first_seen_slot: Option<u64>,
+    trade_slot: u64,
+) -> MomentumNoTrackerReason {
+    if has_sibling_tracker {
+        MomentumNoTrackerReason::PoolKeyMismatch
+    } else if let Some(first_seen_slot) = pool_first_seen_slot {
+        if trade_slot > 0 && first_seen_slot > trade_slot {
+            MomentumNoTrackerReason::TradeBeforeDiscovery
+        } else {
+            MomentumNoTrackerReason::TrackerAbsentAfterDiscovery
+        }
+    } else {
+        MomentumNoTrackerReason::PoolNotDiscovered
+    }
+}
 
 /// Emit `debug!` ingest forensics every N trades on an active (non-rejected) tracker row.
 const MOMENTUM_TRACKER_TRADE_INGEST_DEBUG_EVERY: usize = 50;
@@ -5474,7 +5511,15 @@ impl MomentumContext {
         }
     }
 
-    fn maybe_warn_trade_without_tracker(mint: &str, pool: &str, is_buy: bool) {
+    fn maybe_warn_trade_without_tracker(
+        mint: &str,
+        pool: &str,
+        is_buy: bool,
+        reason: MomentumNoTrackerReason,
+        trade_slot: u64,
+        pool_first_seen_slot: Option<u64>,
+        sibling_tracker_count: usize,
+    ) {
         let dedupe_key = format!("{mint}\x1f{pool}");
         let now = Instant::now();
         let mut last = MOMENTUM_NO_TRACKER_WARN_LAST.lock();
@@ -5488,7 +5533,11 @@ impl MomentumContext {
                 mint = %mint,
                 pool = %pool,
                 is_buy,
-                "Trade received but no pool-scoped tracker row (discovery guard or pool key mismatch)"
+                reason = reason.as_str(),
+                trade_slot,
+                pool_first_seen_slot = ?pool_first_seen_slot,
+                sibling_tracker_count,
+                "Trade received but no pool-scoped tracker row"
             );
         }
     }
@@ -14445,6 +14494,26 @@ mod tests {
         assert!(!is_non_tradeable_momentum_mint(
             "MintRealTokenHotfix111111111111111111"
         ));
+    }
+
+    #[test]
+    fn no_tracker_reason_distinguishes_ordering_and_pool_mismatch() {
+        assert_eq!(
+            classify_momentum_no_tracker_reason(false, None, 100),
+            MomentumNoTrackerReason::PoolNotDiscovered
+        );
+        assert_eq!(
+            classify_momentum_no_tracker_reason(false, Some(101), 100),
+            MomentumNoTrackerReason::TradeBeforeDiscovery
+        );
+        assert_eq!(
+            classify_momentum_no_tracker_reason(false, Some(99), 100),
+            MomentumNoTrackerReason::TrackerAbsentAfterDiscovery
+        );
+        assert_eq!(
+            classify_momentum_no_tracker_reason(true, Some(99), 100),
+            MomentumNoTrackerReason::PoolKeyMismatch
+        );
     }
 
     fn pool_cache_update_stub(
@@ -23883,7 +23952,28 @@ async fn process_market_event(
                 event.slot.unwrap_or(0),
             );
             if !recorded && !discovery_created {
-                MomentumContext::maybe_warn_trade_without_tracker(mint, pool_address, *is_buy);
+                let trade_slot = event.slot.unwrap_or(0);
+                let pool_first_seen_slot = ctx.pool_first_seen.read().get(pool_address).copied();
+                let sibling_tracker_count = ctx
+                    .tracker_keys_by_mint
+                    .read()
+                    .get(mint)
+                    .map_or(0, BTreeSet::len);
+                let reason = classify_momentum_no_tracker_reason(
+                    sibling_tracker_count > 0,
+                    pool_first_seen_slot,
+                    trade_slot,
+                );
+                record_momentum_no_tracker_reason(reason.as_str());
+                MomentumContext::maybe_warn_trade_without_tracker(
+                    mint,
+                    pool_address,
+                    *is_buy,
+                    reason,
+                    trade_slot,
+                    pool_first_seen_slot,
+                    sibling_tracker_count,
+                );
             }
 
             // P1: If Trade event carries token_program (from PumpFun Geyser parsing), cache it.
