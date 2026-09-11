@@ -2029,6 +2029,8 @@ pub fn md_sidefx_process_vault_balance_tick(
         return;
     }
 
+    let pair_publishable = final_base > 0 && final_quote > 0;
+
     let (publish_dex, publish_base_mint, publish_quote_mint) = if vault_view.dex == "restored" {
         host.live_pool_cache()
             .get(&vault_view.pool_address)
@@ -2048,6 +2050,7 @@ pub fn md_sidefx_process_vault_balance_tick(
     };
 
     let publish_jetstream = host.nats_enabled()
+        && pair_publishable
         && (update_class.is_exec_hot() || host.is_hot_pool(&vault_view.pool_address));
     if publish_jetstream {
         let mut balance_update = PoolCacheUpdate::new_balance_updated(

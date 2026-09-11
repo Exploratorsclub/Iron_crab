@@ -21457,6 +21457,11 @@ mod pr_b_geyser_tracking_tests {
             "vault tick JetStream publish must include hot-pool defense via is_hot_pool"
         );
         assert!(
+            body.contains("pair_publishable")
+                || (body.contains("final_base > 0") && body.contains("final_quote > 0")),
+            "JetStream publish must require both composed legs > 0 (KNOWN_BUG_PATTERNS #27)"
+        );
+        assert!(
             body.contains("update_vault_balance")
                 && body.find("update_vault_balance").expect("write")
                     < body.find("pair_zero").expect("pair_zero gate"),
@@ -21574,23 +21579,34 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
-    /// Task 3: first vault leg writes MASTER before pair is complete.
+    /// Task 3: first vault leg writes MASTER; incomplete pair skips JetStream (#27).
     #[test]
     #[serial_test::serial]
     fn vault_tick_obs_first_leg_writes_master() {
+        use ironcrab::metrics::MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL;
+
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
         let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
         let (md_state, _depth, _rx) = test_md_state_sender_no_worker();
-        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+        let (publish_tx, _publish_rx) = tokio::sync::mpsc::channel(8);
+        let worker = MarketDataSidefxHost {
+            ctx: ctx.clone(),
+            publish_tx: Some(publish_tx),
+            md_state,
+            track_worker: test_noop_track_worker_sender(),
+        };
         let pool = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
         let base_vault = Pubkey::new_unique();
         let quote_vault = Pubkey::new_unique();
         test_insert_raydium_cpmm_vault_pair(&ctx, pool, base_vault, quote_vault, 0, "raydium_cpmm");
         test_upsert_raydium_cpmm_pool_cache(&ctx, pool, base_vault, quote_vault, None, None, 1);
         ctx.refresh_tracked_membership_snapshot();
 
+        let jetstream_before =
+            MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL.load(Ordering::Relaxed);
         let applied = vault_tick_applied_delta("exec_hot", || {
             let mut scratch = MdSidefxBurstScratch::new();
             md_sidefx_process_vault_balance_tick(
@@ -21610,6 +21626,11 @@ mod pr_b_geyser_tracking_tests {
             applied, 1,
             "first leg must increment applied, not only pair_zero"
         );
+        assert_eq!(
+            MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL.load(Ordering::Relaxed),
+            jetstream_before,
+            "incomplete pair (100/0) must not enqueue JetStream even with nats_enabled"
+        );
 
         let state = match ctx.live_pool_cache.get(&pool).expect("pool in cache") {
             CachedPoolState::RaydiumCpmm(s) => s,
@@ -21619,14 +21640,20 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(state.reserve_1, None);
     }
 
-    /// Task 3: second leg completes pair; hot-pinned pool may publish via is_hot_pool defense.
+    /// Task 3: second leg completes pair → JetStream when hot + nats.
     #[test]
     #[serial_test::serial]
     fn vault_tick_obs_second_leg_hot_pin_publish_contract() {
+        use ironcrab::metrics::MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL;
+
         let handlers_src = include_str!("../market_data/sidefx/handlers.rs");
         assert!(
             handlers_src.contains("is_hot_pool(&vault_view.pool_address)"),
             "publish gate must include is_hot_pool defense for classify lag"
+        );
+        assert!(
+            handlers_src.contains("pair_publishable"),
+            "publish gate must require both legs > 0 before JetStream"
         );
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -21636,44 +21663,63 @@ mod pr_b_geyser_tracking_tests {
         let pool = Pubkey::new_unique();
         ctx.hot_pool_registry.pin_arb_pool(pool);
         let (md_state, _depth, _rx) = test_md_state_sender_no_worker();
-        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+        let (publish_tx, mut publish_rx) = tokio::sync::mpsc::channel(8);
+        let worker = MarketDataSidefxHost {
+            ctx: ctx.clone(),
+            publish_tx: Some(publish_tx),
+            md_state,
+            track_worker: test_noop_track_worker_sender(),
+        };
         let base_vault = Pubkey::new_unique();
         let quote_vault = Pubkey::new_unique();
-        test_insert_raydium_cpmm_vault_pair(
-            &ctx,
-            pool,
-            base_vault,
-            quote_vault,
-            5_000,
-            "raydium_cpmm",
-        );
-        test_upsert_raydium_cpmm_pool_cache(
-            &ctx,
-            pool,
-            base_vault,
-            quote_vault,
-            None,
-            Some(5_000),
-            1,
-        );
+        test_insert_raydium_cpmm_vault_pair(&ctx, pool, base_vault, quote_vault, 0, "raydium_cpmm");
+        test_upsert_raydium_cpmm_pool_cache(&ctx, pool, base_vault, quote_vault, None, None, 1);
         ctx.refresh_tracked_membership_snapshot();
 
-        let applied = vault_tick_applied_delta("exec_hot", || {
-            let mut scratch = MdSidefxBurstScratch::new();
-            md_sidefx_process_vault_balance_tick(
-                &worker,
-                &MdSidefxCommand::VaultBalanceTick {
-                    run_id: "test".into(),
-                    vault_pubkey: base_vault,
-                    balance: 10_000,
-                    slot: 42,
-                    grpc_recv_at: Instant::now(),
-                    update_class: SidefxUpdateClass::ExecHot,
-                },
-                &mut scratch,
-            );
-        });
-        assert_eq!(applied, 1);
+        let jetstream_before =
+            MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL.load(Ordering::Relaxed);
+        let mut scratch = MdSidefxBurstScratch::new();
+        md_sidefx_process_vault_balance_tick(
+            &worker,
+            &MdSidefxCommand::VaultBalanceTick {
+                run_id: "test".into(),
+                vault_pubkey: base_vault,
+                balance: 10_000,
+                slot: 40,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
+            },
+            &mut scratch,
+        );
+        assert_eq!(
+            MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL.load(Ordering::Relaxed),
+            jetstream_before,
+            "first leg alone must not JetStream-publish degenerate reserves"
+        );
+
+        ctx.refresh_tracked_membership_snapshot();
+        let jetstream_mid = MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL.load(Ordering::Relaxed);
+        md_sidefx_process_vault_balance_tick(
+            &worker,
+            &MdSidefxCommand::VaultBalanceTick {
+                run_id: "test".into(),
+                vault_pubkey: quote_vault,
+                balance: 5_000,
+                slot: 42,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::ExecHot,
+            },
+            &mut scratch,
+        );
+        assert_eq!(
+            MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL.load(Ordering::Relaxed),
+            jetstream_mid + 1,
+            "complete pair on hot pool must enqueue BalanceUpdated JetStream"
+        );
+        assert!(
+            publish_rx.try_recv().is_ok(),
+            "nats_enabled fixture must observe JetStream job after second leg"
+        );
         assert!(ctx.hot_pool_registry.is_hot_pool(pool));
     }
 
