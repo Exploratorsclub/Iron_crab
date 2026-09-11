@@ -2002,12 +2002,20 @@ pub fn md_sidefx_process_vault_balance_tick(
         "enrich"
     });
 
-    let (mut final_base, mut final_quote) = host
-        .snapshot_vault_pair_balances(vault_pubkey, *balance)
-        .unwrap_or((*balance, 0));
+    let (mut final_base, mut final_quote) = if vault_view.dex == "restored" {
+        // Restored membership rows lack reliable base/quote orientation; MASTER cache is authoritative.
+        host.live_pool_cache()
+            .get(&vault_view.pool_address)
+            .and_then(|state| pool_cache_balance_fields_from_state(&state))
+            .map(|(_, _, cache_base, cache_quote, _)| (cache_base, cache_quote))
+            .unwrap_or((0, 0))
+    } else {
+        host.snapshot_vault_pair_balances(vault_pubkey, *balance)
+            .unwrap_or((*balance, 0))
+    };
 
     // Prefer LivePoolCache MASTER when snapshot pair is incomplete.
-    if final_base == 0 || final_quote == 0 {
+    if vault_view.dex != "restored" && (final_base == 0 || final_quote == 0) {
         if let Some(state) = host.live_pool_cache().get(&vault_view.pool_address) {
             if let Some((_, _, cache_base, cache_quote, _)) =
                 pool_cache_balance_fields_from_state(&state)
