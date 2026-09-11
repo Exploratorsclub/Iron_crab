@@ -618,6 +618,26 @@ pub static MARKET_DATA_POOL_STATE_PUBLISH_OTHER: Lazy<AtomicU64> = Lazy::new(|| 
 /// VaultBalanceTick skipped because on-chain balance unchanged (H1 evidence).
 pub static MARKET_DATA_POOL_STATE_PUBLISH_SKIPPED_BALANCE_UNCHANGED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Labeled: `market_data_vault_tick_dropped_total{reason="membership_miss"}`.
+pub static MARKET_DATA_VAULT_TICK_DROPPED_MEMBERSHIP_MISS: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Labeled: `market_data_vault_tick_dropped_total{reason="pair_zero"}`.
+pub static MARKET_DATA_VAULT_TICK_DROPPED_PAIR_ZERO: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Labeled: `market_data_vault_tick_dropped_total{reason="unchanged"}`.
+pub static MARKET_DATA_VAULT_TICK_DROPPED_UNCHANGED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Labeled: `market_data_vault_tick_dropped_total{reason="restored"}`.
+pub static MARKET_DATA_VAULT_TICK_DROPPED_RESTORED: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Labeled: `market_data_vault_tick_applied_total{class="exec_hot"}`.
+pub static MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Labeled: `market_data_vault_tick_applied_total{class="enrich"}`.
+pub static MARKET_DATA_VAULT_TICK_APPLIED_ENRICH: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Vault balance tick BalanceUpdated JetStream enqueue (ExecHot + NATS enabled).
+pub static MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// BinArrayUpdate published to Core NATS (Meteora DLMM only).
 pub static MARKET_DATA_BIN_ARRAY_PUBLISH_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
@@ -1337,6 +1357,39 @@ pub fn market_data_pool_state_publish_inc(dex: &str) {
 #[inline]
 pub fn inc_market_data_pool_state_publish_skipped_balance_unchanged_total() {
     MARKET_DATA_POOL_STATE_PUBLISH_SKIPPED_BALANCE_UNCHANGED.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_vault_tick_dropped(reason: &'static str) {
+    let counter = match reason {
+        "membership_miss" => &*MARKET_DATA_VAULT_TICK_DROPPED_MEMBERSHIP_MISS,
+        "pair_zero" => &*MARKET_DATA_VAULT_TICK_DROPPED_PAIR_ZERO,
+        "unchanged" => &*MARKET_DATA_VAULT_TICK_DROPPED_UNCHANGED,
+        "restored" => &*MARKET_DATA_VAULT_TICK_DROPPED_RESTORED,
+        other => {
+            debug_assert!(false, "unknown vault tick drop reason: {other}");
+            return;
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_vault_tick_applied(class: &'static str) {
+    let counter = match class {
+        "exec_hot" => &*MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT,
+        "enrich" => &*MARKET_DATA_VAULT_TICK_APPLIED_ENRICH,
+        other => {
+            debug_assert!(false, "unknown vault tick apply class: {other}");
+            return;
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_vault_tick_jetstream_enqueued() {
+    MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn market_data_bin_array_publish_inc() {
@@ -10086,6 +10139,52 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_pool_state_publish_skipped_total{reason=\"balance_unchanged\"}",
         MARKET_DATA_POOL_STATE_PUBLISH_SKIPPED_BALANCE_UNCHANGED.load(Ordering::Relaxed)
+    );
+    out.push_str("market_data_vault_tick_dropped_total{reason=\"membership_miss\"} ");
+    out.push_str(
+        &MARKET_DATA_VAULT_TICK_DROPPED_MEMBERSHIP_MISS
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_vault_tick_dropped_total{reason=\"pair_zero\"} ");
+    out.push_str(
+        &MARKET_DATA_VAULT_TICK_DROPPED_PAIR_ZERO
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_vault_tick_dropped_total{reason=\"unchanged\"} ");
+    out.push_str(
+        &MARKET_DATA_VAULT_TICK_DROPPED_UNCHANGED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_vault_tick_dropped_total{reason=\"restored\"} ");
+    out.push_str(
+        &MARKET_DATA_VAULT_TICK_DROPPED_RESTORED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_vault_tick_applied_total{class=\"exec_hot\"} ");
+    out.push_str(
+        &MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_vault_tick_applied_total{class=\"enrich\"} ");
+    out.push_str(
+        &MARKET_DATA_VAULT_TICK_APPLIED_ENRICH
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "market_data_vault_tick_jetstream_enqueued_total",
+        MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL.load(Ordering::Relaxed)
     );
     out.push_str("market_data_pool_state_publish_total{dex=\"orca\"} ");
     out.push_str(
