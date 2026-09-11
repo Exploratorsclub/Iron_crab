@@ -21,8 +21,9 @@ use std::str::FromStr;
 use tracing::{debug, info, warn};
 
 use crate::execution::live_pool_cache::{
-    pool_state_has_reserve_basis, CachedPoolState, LivePoolCache, MeteoraCpmmState, MeteoraState,
-    OrcaWhirlpoolState, PumpAmmState, PumpFunState, RaydiumAmmState, RaydiumCpmmState,
+    pool_state_has_reserve_basis, pool_state_material_fingerprint, CachedPoolState, LivePoolCache,
+    MeteoraCpmmState, MeteoraState, OrcaWhirlpoolState, PumpAmmState, PumpFunState,
+    RaydiumAmmState, RaydiumCpmmState,
 };
 use crate::ipc::{
     PoolCacheUpdate, PoolCacheUpdateType, NATIVE_SOL_MINT,
@@ -597,13 +598,12 @@ fn apply_pool_cache_update_outcome_inner(
     match update.update_type {
         PoolCacheUpdateType::PoolDiscovered => {
             if let Some((pool_addr, mut minimal_state)) = build_minimal_pool_state(update) {
-                if update.dex == "pump_amm" {
-                    if let Some(existing) = cache.get(&pool_addr) {
-                        if let (
+                if let Some(existing) = cache.get(&pool_addr) {
+                    match (&existing, &mut minimal_state) {
+                        (
                             CachedPoolState::PumpAmm(ref existing_pump),
                             CachedPoolState::PumpAmm(ref mut new_pump),
-                        ) = (&existing, &mut minimal_state)
-                        {
+                        ) if update.dex == "pump_amm" => {
                             if new_pump.pool_accounts.is_empty()
                                 && !existing_pump.pool_accounts.is_empty()
                             {
@@ -627,6 +627,40 @@ fn apply_pool_cache_update_outcome_inner(
                             new_pump.base_reserve = Some(merged_base);
                             new_pump.quote_reserve = Some(merged_quote);
                         }
+                        (
+                            CachedPoolState::Orca(ref existing_o),
+                            CachedPoolState::Orca(ref mut new_o),
+                        ) if update.dex == "orca" => {
+                            let eb = existing_o.vault_a_balance.unwrap_or(0);
+                            let eq = existing_o.vault_b_balance.unwrap_or(0);
+                            let nb = new_o.vault_a_balance.unwrap_or(0);
+                            let nq = new_o.vault_b_balance.unwrap_or(0);
+                            new_o.vault_a_balance = Some(if nb > 0 { nb } else { eb });
+                            new_o.vault_b_balance = Some(if nq > 0 { nq } else { eq });
+                        }
+                        (
+                            CachedPoolState::RaydiumCpmm(ref existing_c),
+                            CachedPoolState::RaydiumCpmm(ref mut new_c),
+                        ) if update.dex == "raydium_cpmm" => {
+                            let eb = existing_c.reserve_0.unwrap_or(0);
+                            let eq = existing_c.reserve_1.unwrap_or(0);
+                            let nb = new_c.reserve_0.unwrap_or(0);
+                            let nq = new_c.reserve_1.unwrap_or(0);
+                            new_c.reserve_0 = Some(if nb > 0 { nb } else { eb });
+                            new_c.reserve_1 = Some(if nq > 0 { nq } else { eq });
+                        }
+                        (
+                            CachedPoolState::Meteora(ref existing_m),
+                            CachedPoolState::Meteora(ref mut new_m),
+                        ) if update.dex == "meteora_dlmm" => {
+                            let eb = existing_m.reserve_x_balance.unwrap_or(0);
+                            let eq = existing_m.reserve_y_balance.unwrap_or(0);
+                            let nb = new_m.reserve_x_balance.unwrap_or(0);
+                            let nq = new_m.reserve_y_balance.unwrap_or(0);
+                            new_m.reserve_x_balance = Some(if nb > 0 { nb } else { eb });
+                            new_m.reserve_y_balance = Some(if nq > 0 { nq } else { eq });
+                        }
+                        _ => {}
                     }
                 }
                 if update.dex == "raydium_cpmm" {
@@ -1177,6 +1211,7 @@ fn apply_pool_cache_update_outcome_inner(
                     }
                 }
                 let incoming_has_reserve_basis = pool_state_has_reserve_basis(&minimal_state);
+                let prev_fingerprint = existing.as_ref().map(pool_state_material_fingerprint);
                 let upserted = cache.upsert(addr, minimal_state, update.geyser_slot);
                 if !upserted {
                     if update.geyser_slot > 0 {
@@ -1191,6 +1226,15 @@ fn apply_pool_cache_update_outcome_inner(
                         }
                     } else {
                         return PoolCacheApplyOutcome::RejectedStaleSlot;
+                    }
+                } else if incoming_has_reserve_basis {
+                    let new_fingerprint = cache
+                        .get(&addr)
+                        .map(|s| pool_state_material_fingerprint(&s));
+                    if prev_fingerprint == new_fingerprint
+                        && cache.touch_freshness_on_existing_reserve_basis(&addr)
+                    {
+                        crate::metrics::inc_pool_cache_touch_freshness_on_stale_slot_total();
                     }
                 }
                 if update.dex == "pump_amm" {
@@ -2049,8 +2093,8 @@ mod tests {
             "identical reserves must not advance material slot"
         );
         assert!(
-            age_after >= age_before,
-            "identical reserves must not reset SLAVE cache age"
+            age_after < 20,
+            "identical reserves heartbeat must sustain SLAVE cache age"
         );
         assert_eq!(
             cache.get_last_seen_slot(&pool),
@@ -3419,6 +3463,55 @@ mod tests {
         let (_, slot, age_ms) = cache.get_with_metadata(&pool).expect("cached");
         assert_eq!(slot, 500, "slot must not regress");
         assert!(age_ms < 20, "age must refresh on stale-slot sustain");
+    }
+
+    #[test]
+    fn apply_balance_updated_same_reserves_sustains_age_on_successful_upsert() {
+        use std::time::Duration;
+
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        let seed = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1_000_000,
+            50_000_000_000,
+            500,
+        );
+        assert!(apply_pool_cache_update(&cache, &seed));
+
+        std::thread::sleep(Duration::from_millis(40));
+
+        let heartbeat = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            1_000_000,
+            50_000_000_000,
+            600,
+        );
+        assert!(apply_pool_cache_update(&cache, &heartbeat));
+        let (_, slot, age_ms) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(
+            slot, 500,
+            "identical reserves must not advance material slot"
+        );
+        assert!(
+            age_ms < 20,
+            "heartbeat with same reserves must refresh cache age"
+        );
     }
 
     #[test]

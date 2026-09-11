@@ -5153,6 +5153,7 @@ impl MarketDataContext {
             }
             let force_arb_seed = is_arb && !is_momentum;
             let coverage = heartbeat_balance_refresh_coverage_label(is_momentum, force_arb_seed);
+            let _ = self.try_touch_live_pool_reserve_basis_for_hot_pool(pool);
             self.try_publish_balance_updated_from_cache_with_heartbeat_observability(
                 pool,
                 force_arb_seed,
