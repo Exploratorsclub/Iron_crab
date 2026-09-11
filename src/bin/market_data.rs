@@ -5821,6 +5821,7 @@ impl MarketDataContext {
         if vaults_changed || self.hot_pool_reserve_registration_satisfied(pool) {
             self.clear_deferred_hot_pool_reserve_registration(pool);
         }
+        self.refresh_tracked_membership_snapshot();
         vaults_changed
             || explicit_subscription_has_new_keys(
                 &before_keys,
@@ -6413,6 +6414,10 @@ impl MarketDataContext {
             && self.hot_pool_registry.is_hot_pool(pool)
             && !self.pool_meteora_dlmm_bins_geyser_registration_satisfied(pool, &state, None);
 
+        if self.hot_pool_registry.is_hot_pool(pool) {
+            self.refresh_tracked_membership_snapshot();
+        }
+
         vaults_changed || bins_changed || mints_changed || needs_geyser_flush
     }
 
@@ -6639,6 +6644,7 @@ impl MarketDataContext {
         if had_position_pin {
             batch_dirty |= self.remediate_open_position_pumpfun_registration(admission);
         }
+        self.refresh_tracked_membership_snapshot();
         batch_dirty
     }
 
@@ -6882,6 +6888,7 @@ impl MarketDataContext {
             );
             let _ = &a.reason;
         }
+        self.refresh_tracked_membership_snapshot();
         self.refresh_arb_tracked_vaults_gauge();
         batch_dirty
     }
@@ -16925,6 +16932,180 @@ mod pr_b_geyser_tracking_tests {
             grpc_recv_at: Instant::now(),
         };
         assert!(account_geyser_dispatch_priority_high(&ctx, &u));
+    }
+
+    /// Task 2: arb pin + vault register must populate ExecHot membership without heartbeat.
+    #[test]
+    fn exec_hot_membership_refreshed_on_arb_pin_vault_register_without_heartbeat() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        assert!(
+            ctx.ingest_exec_hot_vault_contains(&coin),
+            "coin vault must be ExecHot immediately after arb pin register"
+        );
+        assert!(
+            ctx.ingest_exec_hot_vault_contains(&pc),
+            "quote vault must be ExecHot immediately after arb pin register"
+        );
+    }
+
+    /// Task 2: already-complete vault register after arb pin must still refresh ExecHot.
+    #[test]
+    fn exec_hot_membership_refreshed_when_arb_register_already_complete() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        let now = Instant::now();
+        let mk_vault = |is_base: bool| VaultInfo {
+            pool_address: pool,
+            dex: "raydium_cpmm".to_string(),
+            base_mint: base,
+            quote_mint: quote,
+            is_base_vault: is_base,
+            last_balance: std::sync::atomic::AtomicU64::new(0),
+            last_used_at: now,
+            pinned: true,
+            pin: Some(GeyserPinReason::ArbMultiDex),
+            active_id: None,
+            bin_step: None,
+            sibling_vault: None,
+        };
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            vaults.insert(coin, mk_vault(true));
+            vaults.insert(pc, mk_vault(false));
+        }
+        ctx.pool_tracked_legs_note_vault(pool, coin);
+        ctx.pool_tracked_legs_note_vault(pool, pc);
+        ctx.refresh_tracked_membership_snapshot();
+        assert!(
+            !ctx.ingest_exec_hot_vault_contains(&coin),
+            "tracked vaults without hot pool must not be ExecHot before pin"
+        );
+
+        assert!(ctx.tracked_vaults.read().contains_key(&coin));
+        assert!(ctx.tracked_vaults.read().contains_key(&pc));
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        let _ = ctx.register_geyser_reserves_for_arb_active_pool(pool);
+        assert!(
+            ctx.ingest_exec_hot_vault_contains(&coin),
+            "already-complete register after arb pin must still refresh ExecHot"
+        );
+        assert!(ctx.ingest_exec_hot_vault_contains(&pc));
+    }
+
+    /// Task 2: explicit vault membership without hot pool stays Enrich, not ExecHot.
+    #[test]
+    fn exec_hot_membership_excludes_explicit_vault_without_hot_pool() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let vault = Pubkey::new_unique();
+        ctx.tracked_vaults.write().insert(
+            vault,
+            VaultInfo {
+                pool_address: pool,
+                dex: "raydium_cpmm".to_string(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: Instant::now(),
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+                sibling_vault: None,
+            },
+        );
+        ctx.pool_tracked_legs_note_vault(pool, vault);
+        ctx.refresh_tracked_membership_snapshot();
+        assert!(
+            !ctx.hot_pool_registry.is_hot_pool(pool),
+            "pool must not be hot for enrich-only case"
+        );
+        assert!(
+            !ctx.ingest_exec_hot_vault_contains(&vault),
+            "explicit vault without hot pool must not be ExecHot"
+        );
+    }
+
+    /// Task 2: momentum pin + vault register must populate ExecHot without heartbeat.
+    #[test]
+    fn exec_hot_membership_refreshed_on_momentum_pin_vault_register_without_heartbeat() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let pool = Pubkey::new_unique();
+        let coin = Pubkey::new_unique();
+        let pc = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: base,
+                token_1_mint: quote,
+                token_0_vault: coin,
+                token_1_vault: pc,
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            1,
+        );
+        ctx.hot_pool_registry.pin_pool(base, pool);
+        assert!(ctx.register_geyser_reserves_for_momentum_active_pool(pool));
+        assert!(ctx.ingest_exec_hot_vault_contains(&coin));
+        assert!(ctx.ingest_exec_hot_vault_contains(&pc));
     }
 
     #[tokio::test]
