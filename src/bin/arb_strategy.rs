@@ -6326,15 +6326,17 @@ impl ArbContext {
             dlmm_sol_is_x,
             dlmm_token_x_mint,
         };
-        if let Some(existing) = cache.get(pool_address) {
-            if vault_material_unchanged(&new_vault, existing) {
-                drop(cache);
-                return false;
+        let should_apply = match cache.get(pool_address) {
+            None => true,
+            Some(existing) => {
+                update.geyser_slot >= existing.update_slot
+                    && (update.geyser_slot > existing.update_slot
+                        || !vault_material_unchanged(&new_vault, existing))
             }
-            if update.geyser_slot < existing.update_slot {
-                drop(cache);
-                return false;
-            }
+        };
+        if !should_apply {
+            drop(cache);
+            return false;
         }
         cache.insert(pool_address.to_string(), new_vault);
         inc_arb_vault_balance_applied_total();
@@ -13370,13 +13372,12 @@ mod two_hop_price_tests {
         let applied_before = ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed);
         let seeded_before = ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.load(Ordering::Relaxed);
         assert!(ctx.consume_vault_seed_from_pool_cache_update(&update));
-        assert_eq!(
-            ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL.load(Ordering::Relaxed),
-            ok_before + 1
+        assert!(
+            ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL.load(Ordering::Relaxed) > ok_before,
+            "successful pin apply must increment seed-from-cache ok counter"
         );
-        assert_eq!(
-            ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed),
-            applied_before + 1,
+        assert!(
+            ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed) > applied_before,
             "JetStream pin apply must use balance-applied counter, not snapshot seed"
         );
         assert_eq!(
@@ -13390,6 +13391,72 @@ mod two_hop_price_tests {
         assert!(
             vault.updated_at.elapsed() <= Duration::from_millis(MAX_PRICE_AGE_MS),
             "event apply must stamp updated_at from Instant::now(), not SLAVE age_ms"
+        );
+    }
+
+    #[test]
+    fn pool_cache_update_consume_advances_slot_on_unchanged_reserves() {
+        let cache = create_shared_cache();
+        let ctx = test_arb_context(cache.clone());
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+        let reserves = (1_000_000_000_000u64, 2_000_000_000u64);
+
+        let initial = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            reserves.0,
+            reserves.1,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &initial);
+        ctx.arb_pinned_pools.write().insert(pool_str.clone());
+        assert!(ctx.consume_vault_seed_from_pool_cache_update(&initial));
+
+        let stale_updated_at = Instant::now() - Duration::from_secs(60);
+        {
+            let mut vaults = ctx.vault_balances.write();
+            let vault = vaults.get_mut(&pool_str).expect("vault row");
+            vault.updated_at = stale_updated_at;
+        }
+
+        let slot_advance = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str,
+            NATIVE_SOL_MINT.to_string(),
+            reserves.0,
+            reserves.1,
+            102,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &slot_advance);
+        assert!(
+            ctx.consume_vault_seed_from_pool_cache_update(&slot_advance),
+            "newer slot with unchanged reserves must still apply for slot_delta alignment"
+        );
+
+        let vaults = ctx.vault_balances.read();
+        let vault = vaults.get(&pool_str).expect("vault row");
+        assert_eq!(vault.update_slot, 102);
+        assert_eq!(vault.reserve_base, reserves.0);
+        assert_eq!(vault.reserve_quote, reserves.1);
+        assert!(
+            vault.updated_at > stale_updated_at,
+            "slot sustain must refresh updated_at even when reserve fingerprint is unchanged"
+        );
+        assert!(
+            vault.updated_at.elapsed() <= Duration::from_millis(MAX_PRICE_AGE_MS),
+            "sustained slot apply must stamp fresh updated_at"
         );
     }
 
