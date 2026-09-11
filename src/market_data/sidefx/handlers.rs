@@ -1567,13 +1567,19 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
             return;
         }
 
-        md_sidefx_merge_pool_readiness_from_cached_state(host, pool_pubkey, &cached_state);
+        // I-MD-4: publish merged MASTER row (not partial account-parse clone with 0/0 reserves).
+        let merged_state = host
+            .live_pool_cache()
+            .get(pool_pubkey)
+            .unwrap_or(cached_state);
 
-        if let CachedPoolState::RaydiumAmm(ref s) = cached_state {
+        md_sidefx_merge_pool_readiness_from_cached_state(host, pool_pubkey, &merged_state);
+
+        if let CachedPoolState::RaydiumAmm(ref s) = merged_state {
             host.maybe_spawn_raydium_serum_cold_backfill(*pool_pubkey, s);
         }
 
-        if let CachedPoolState::Meteora(ref s) = cached_state {
+        if let CachedPoolState::Meteora(ref s) = merged_state {
             let meta_changed = match prev_meteora_meta {
                 None => host.is_hot_pool(pool_pubkey),
                 Some((prev_id, prev_step)) => prev_id != s.active_id || prev_step != s.bin_step,
@@ -1601,8 +1607,8 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
         // Phase1: sidefx only updates MASTER cache + JetStream; vault registration via host hook above.
         // (No RegisterPoolVaultsFromAccount enqueue from account parse.)
 
-        // Extract mint and reserve info from cached_state for PoolCacheUpdate
-        let (base_mint, quote_mint, base_reserve, quote_reserve) = match &cached_state {
+        // Extract mint and reserve info from post-upsert MASTER cache for PoolCacheUpdate
+        let (base_mint, quote_mint, base_reserve, quote_reserve) = match &merged_state {
             CachedPoolState::Orca(s) => (
                 s.token_mint_a,
                 s.token_mint_b,
@@ -1699,7 +1705,7 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
 
         // Publish PoolCacheUpdate to JetStream (Single Source of Truth for pool state)
         let open_position_pumpfun_pin =
-            md_sidefx_is_open_position_pumpfun_pin(host, pool_pubkey, &cached_state);
+            md_sidefx_is_open_position_pumpfun_pin(host, pool_pubkey, &merged_state);
         // I-MD-4: EXEC_HOT must never evaluate ENRICH-only skip gate (no enrich skip counter bump).
         let should_publish_pool_cache = if update_class.is_exec_hot() || open_position_pumpfun_pin {
             true
@@ -1708,7 +1714,7 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                 host,
                 pool_pubkey,
                 prev_state.as_ref(),
-                &cached_state,
+                &merged_state,
             )
         };
         if should_publish_pool_cache && host.nats_enabled() {
@@ -1717,7 +1723,7 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                 host.build_version(),
                 run_id,
                 pool_pubkey.to_string(),
-                cached_state.dex_name().to_string(),
+                merged_state.dex_name().to_string(),
                 base_mint.to_string(),
                 quote_mint.to_string(),
                 base_reserve,
@@ -1729,7 +1735,7 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
             // Propagate DEX-specific metadata to SLAVE caches via PoolCacheUpdate.metadata.
             // This ensures execution-engine receives creator, pool accounts, etc. from Geyser
             // without needing RPC fallbacks.
-            match &cached_state {
+            match &merged_state {
                 CachedPoolState::PumpFun(s) => {
                     // SLAVE minimal state uses quote_mint for SOL side; must not be default.
                     pool_update.quote_mint = NATIVE_SOL_MINT.to_string();
@@ -1938,7 +1944,7 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
             host,
             run_id,
             pool_pubkey,
-            &cached_state,
+            &merged_state,
             prev_state,
             *slot,
             *grpc_recv_at,
