@@ -586,10 +586,8 @@ fn resolve_dlmm_meta_for_pool_update(
                 .unwrap_or((None, None));
         }
     };
-    if let Some(state) = live_pool_cache.get(&pool_pk) {
-        if let CachedPoolState::Meteora(s) = state {
-            return (Some(s.active_id), Some(s.bin_step));
-        }
+    if let Some(CachedPoolState::Meteora(s)) = live_pool_cache.get(&pool_pk) {
+        return (Some(s.active_id), Some(s.bin_step));
     }
     vault_cache
         .get(pool_address)
