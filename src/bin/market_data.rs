@@ -20948,6 +20948,410 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(quote, 5_000);
     }
 
+    fn test_insert_raydium_cpmm_vault_pair(
+        ctx: &MarketDataContext,
+        pool: Pubkey,
+        base_vault: Pubkey,
+        quote_vault: Pubkey,
+        quote_balance: u64,
+        dex: &str,
+    ) {
+        let mut vaults = ctx.tracked_vaults.write();
+        vaults.insert(
+            base_vault,
+            VaultInfo {
+                pool_address: pool,
+                dex: dex.to_string(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                is_base_vault: true,
+                last_balance: std::sync::atomic::AtomicU64::new(0),
+                last_used_at: Instant::now(),
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+                sibling_vault: Some(quote_vault),
+            },
+        );
+        vaults.insert(
+            quote_vault,
+            VaultInfo {
+                pool_address: pool,
+                dex: dex.to_string(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                is_base_vault: false,
+                last_balance: std::sync::atomic::AtomicU64::new(quote_balance),
+                last_used_at: Instant::now(),
+                pinned: false,
+                pin: None,
+                active_id: None,
+                bin_step: None,
+                sibling_vault: Some(base_vault),
+            },
+        );
+    }
+
+    fn vault_tick_dropped_delta(reason: &'static str, f: impl FnOnce()) -> u64 {
+        use ironcrab::metrics::{
+            MARKET_DATA_VAULT_TICK_DROPPED_MEMBERSHIP_MISS,
+            MARKET_DATA_VAULT_TICK_DROPPED_PAIR_ZERO, MARKET_DATA_VAULT_TICK_DROPPED_RESTORED,
+            MARKET_DATA_VAULT_TICK_DROPPED_UNCHANGED,
+        };
+        let counter = match reason {
+            "membership_miss" => &*MARKET_DATA_VAULT_TICK_DROPPED_MEMBERSHIP_MISS,
+            "pair_zero" => &*MARKET_DATA_VAULT_TICK_DROPPED_PAIR_ZERO,
+            "unchanged" => &*MARKET_DATA_VAULT_TICK_DROPPED_UNCHANGED,
+            "restored" => &*MARKET_DATA_VAULT_TICK_DROPPED_RESTORED,
+            other => panic!("unknown vault tick drop reason: {other}"),
+        };
+        let before = counter.load(Ordering::Relaxed);
+        f();
+        counter.load(Ordering::Relaxed).saturating_sub(before)
+    }
+
+    fn vault_tick_applied_delta(class: &'static str, f: impl FnOnce()) -> u64 {
+        use ironcrab::metrics::{
+            MARKET_DATA_VAULT_TICK_APPLIED_ENRICH, MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT,
+        };
+        let counter = match class {
+            "exec_hot" => &*MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT,
+            "enrich" => &*MARKET_DATA_VAULT_TICK_APPLIED_ENRICH,
+            other => panic!("unknown vault tick apply class: {other}"),
+        };
+        let before = counter.load(Ordering::Relaxed);
+        f();
+        counter.load(Ordering::Relaxed).saturating_sub(before)
+    }
+
+    /// Task 1: unknown vault membership → membership_miss drop counter.
+    #[test]
+    #[serial_test::serial]
+    fn vault_tick_obs_membership_miss_drop() {
+        use ironcrab::metrics::{
+            MARKET_DATA_VAULT_TICK_APPLIED_ENRICH, MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+        let unknown_vault = Pubkey::new_unique();
+        let exec_hot_before = MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT.load(Ordering::Relaxed);
+        let enrich_before = MARKET_DATA_VAULT_TICK_APPLIED_ENRICH.load(Ordering::Relaxed);
+
+        let delta = vault_tick_dropped_delta("membership_miss", || {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_vault_balance_tick(
+                &worker,
+                &MdSidefxCommand::VaultBalanceTick {
+                    run_id: "test".into(),
+                    vault_pubkey: unknown_vault,
+                    balance: 1,
+                    slot: 1,
+                    grpc_recv_at: Instant::now(),
+                    update_class: SidefxUpdateClass::ExecHot,
+                },
+                &mut scratch,
+            );
+        });
+        assert_eq!(delta, 1);
+        assert_eq!(
+            MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT.load(Ordering::Relaxed),
+            exec_hot_before
+        );
+        assert_eq!(
+            MARKET_DATA_VAULT_TICK_APPLIED_ENRICH.load(Ordering::Relaxed),
+            enrich_before
+        );
+    }
+
+    /// Task 1: restored dex vault tick → restored drop counter.
+    #[test]
+    #[serial_test::serial]
+    fn vault_tick_obs_restored_drop() {
+        use ironcrab::metrics::MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        test_insert_raydium_cpmm_vault_pair(&ctx, pool, base_vault, quote_vault, 1, "restored");
+        ctx.refresh_tracked_membership_snapshot();
+        let exec_hot_before = MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT.load(Ordering::Relaxed);
+
+        let delta = vault_tick_dropped_delta("restored", || {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_vault_balance_tick(
+                &worker,
+                &MdSidefxCommand::VaultBalanceTick {
+                    run_id: "test".into(),
+                    vault_pubkey: base_vault,
+                    balance: 100,
+                    slot: 1,
+                    grpc_recv_at: Instant::now(),
+                    update_class: SidefxUpdateClass::ExecHot,
+                },
+                &mut scratch,
+            );
+        });
+        assert_eq!(delta, 1);
+        assert_eq!(
+            MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT.load(Ordering::Relaxed),
+            exec_hot_before
+        );
+    }
+
+    /// Task 1: incomplete pair (0/0) → pair_zero drop counter, no apply.
+    #[test]
+    #[serial_test::serial]
+    fn vault_tick_obs_pair_zero_drop() {
+        use ironcrab::metrics::MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        test_insert_raydium_cpmm_vault_pair(&ctx, pool, base_vault, quote_vault, 0, "raydium_cpmm");
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            vaults
+                .get_mut(&base_vault)
+                .expect("base vault")
+                .last_balance
+                .store(100, Ordering::Relaxed);
+        }
+        ctx.refresh_tracked_membership_snapshot();
+        let exec_hot_before = MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT.load(Ordering::Relaxed);
+
+        let delta = vault_tick_dropped_delta("pair_zero", || {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_vault_balance_tick(
+                &worker,
+                &MdSidefxCommand::VaultBalanceTick {
+                    run_id: "test".into(),
+                    vault_pubkey: base_vault,
+                    balance: 0,
+                    slot: 1,
+                    grpc_recv_at: Instant::now(),
+                    update_class: SidefxUpdateClass::ExecHot,
+                },
+                &mut scratch,
+            );
+        });
+        assert_eq!(delta, 1);
+        assert_eq!(
+            MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT.load(Ordering::Relaxed),
+            exec_hot_before
+        );
+    }
+
+    /// Task 1: unchanged balance → legacy skip + labelled unchanged drop.
+    #[test]
+    #[serial_test::serial]
+    fn vault_tick_obs_unchanged_drop() {
+        use ironcrab::metrics::{
+            MARKET_DATA_POOL_STATE_PUBLISH_SKIPPED_BALANCE_UNCHANGED,
+            MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        test_insert_raydium_cpmm_vault_pair(
+            &ctx,
+            pool,
+            base_vault,
+            quote_vault,
+            5_000,
+            "raydium_cpmm",
+        );
+        {
+            let mut vaults = ctx.tracked_vaults.write();
+            vaults
+                .get_mut(&base_vault)
+                .expect("base vault")
+                .last_balance
+                .store(10_000, Ordering::Relaxed);
+        }
+        ctx.refresh_tracked_membership_snapshot();
+
+        let legacy_before =
+            MARKET_DATA_POOL_STATE_PUBLISH_SKIPPED_BALANCE_UNCHANGED.load(Ordering::Relaxed);
+        let exec_hot_before = MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT.load(Ordering::Relaxed);
+        let delta = vault_tick_dropped_delta("unchanged", || {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_vault_balance_tick(
+                &worker,
+                &MdSidefxCommand::VaultBalanceTick {
+                    run_id: "test".into(),
+                    vault_pubkey: base_vault,
+                    balance: 10_000,
+                    slot: 1,
+                    grpc_recv_at: Instant::now(),
+                    update_class: SidefxUpdateClass::ExecHot,
+                },
+                &mut scratch,
+            );
+        });
+        assert_eq!(delta, 1);
+        assert_eq!(
+            MARKET_DATA_POOL_STATE_PUBLISH_SKIPPED_BALANCE_UNCHANGED.load(Ordering::Relaxed),
+            legacy_before + 1
+        );
+        assert_eq!(
+            MARKET_DATA_VAULT_TICK_APPLIED_EXEC_HOT.load(Ordering::Relaxed),
+            exec_hot_before
+        );
+    }
+
+    /// Task 1: ExecHot apply counter; JetStream inc sits after BalanceUpdated enqueue.
+    #[test]
+    #[serial_test::serial]
+    fn vault_tick_obs_exec_hot_applied() {
+        let handlers_src = include_str!("../market_data/sidefx/handlers.rs");
+        let start = handlers_src
+            .find("pub fn md_sidefx_process_vault_balance_tick")
+            .expect("vault tick handler");
+        let end = handlers_src
+            .find("pub fn md_sidefx_process_touch_bin_array_tick")
+            .expect("after vault tick handler");
+        let body = &handlers_src[start..end];
+        assert!(
+            body.contains("inc_market_data_vault_tick_jetstream_enqueued();"),
+            "vault tick must increment jetstream enqueue counter"
+        );
+        let enqueue_pos = body
+            .find("\"PoolCacheUpdate::BalanceUpdated\"")
+            .expect("BalanceUpdated enqueue");
+        let jetstream_inc_pos = body
+            .find("inc_market_data_vault_tick_jetstream_enqueued();")
+            .expect("jetstream inc");
+        assert!(
+            jetstream_inc_pos > enqueue_pos,
+            "jetstream enqueue counter must follow BalanceUpdated sidefx_host_enqueue_jetstream"
+        );
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        test_insert_raydium_cpmm_vault_pair(
+            &ctx,
+            pool,
+            base_vault,
+            quote_vault,
+            5_000,
+            "raydium_cpmm",
+        );
+        ctx.refresh_tracked_membership_snapshot();
+
+        use ironcrab::metrics::MARKET_DATA_VAULT_TICK_APPLIED_ENRICH;
+        let enrich_before = MARKET_DATA_VAULT_TICK_APPLIED_ENRICH.load(Ordering::Relaxed);
+        let delta = vault_tick_applied_delta("exec_hot", || {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_vault_balance_tick(
+                &worker,
+                &MdSidefxCommand::VaultBalanceTick {
+                    run_id: "test".into(),
+                    vault_pubkey: base_vault,
+                    balance: 10_000,
+                    slot: 42,
+                    grpc_recv_at: Instant::now(),
+                    update_class: SidefxUpdateClass::ExecHot,
+                },
+                &mut scratch,
+            );
+        });
+        assert_eq!(delta, 1);
+        assert_eq!(
+            MARKET_DATA_VAULT_TICK_APPLIED_ENRICH.load(Ordering::Relaxed),
+            enrich_before
+        );
+    }
+
+    /// Task 1: Enrich apply + enrich publish skip; no JetStream enqueue counter.
+    #[test]
+    #[serial_test::serial]
+    fn vault_tick_obs_enrich_applied_skips_jetstream() {
+        use ironcrab::metrics::{
+            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL,
+            MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        test_insert_raydium_cpmm_vault_pair(
+            &ctx,
+            pool,
+            base_vault,
+            quote_vault,
+            5_000,
+            "raydium_cpmm",
+        );
+        ctx.refresh_tracked_membership_snapshot();
+
+        let jetstream_before =
+            MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL.load(Ordering::Relaxed);
+        let enrich_skip_before =
+            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed);
+        let applied = vault_tick_applied_delta("enrich", || {
+            let mut scratch = MdSidefxBurstScratch::new();
+            md_sidefx_process_vault_balance_tick(
+                &worker,
+                &MdSidefxCommand::VaultBalanceTick {
+                    run_id: "test".into(),
+                    vault_pubkey: base_vault,
+                    balance: 10_000,
+                    slot: 42,
+                    grpc_recv_at: Instant::now(),
+                    update_class: SidefxUpdateClass::Enrich,
+                },
+                &mut scratch,
+            );
+        });
+        assert_eq!(applied, 1);
+        assert_eq!(
+            MARKET_DATA_MD_SIDEFX_ENRICH_PUBLISH_SKIPPED_TOTAL.load(Ordering::Relaxed),
+            enrich_skip_before + 1
+        );
+        assert_eq!(
+            MARKET_DATA_VAULT_TICK_JETSTREAM_ENQUEUED_TOTAL.load(Ordering::Relaxed),
+            jetstream_before
+        );
+    }
+
     #[test]
     fn phase2a_geyser_push_skipped_when_delta_empty() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
