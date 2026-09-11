@@ -577,23 +577,66 @@ fn resolve_dlmm_meta_for_pool_update(
     vault_cache: &HashMap<String, VaultBalanceCache>,
     live_pool_cache: &SharedLivePoolCache,
 ) -> (Option<i32>, Option<u16>) {
-    if let Some(existing) = vault_cache.get(pool_address) {
-        return (existing.active_id, existing.bin_step);
-    }
     let pool_pk = match Pubkey::from_str(pool_address) {
         Ok(pk) => pk,
-        Err(_) => return (None, None),
+        Err(_) => {
+            return vault_cache
+                .get(pool_address)
+                .map(|v| (v.active_id, v.bin_step))
+                .unwrap_or((None, None));
+        }
     };
-    live_pool_cache
-        .get(&pool_pk)
-        .map(|state| {
-            if let CachedPoolState::Meteora(s) = state {
-                (Some(s.active_id), Some(s.bin_step))
-            } else {
-                (None, None)
-            }
-        })
+    if let Some(state) = live_pool_cache.get(&pool_pk) {
+        if let CachedPoolState::Meteora(s) = state {
+            return (Some(s.active_id), Some(s.bin_step));
+        }
+    }
+    vault_cache
+        .get(pool_address)
+        .map(|v| (v.active_id, v.bin_step))
         .unwrap_or((None, None))
+}
+
+/// Merge JetStream `BalanceUpdated` scalars into SOL-quoted vault reserves (`0` = omit sentinel).
+fn merge_pool_cache_update_vault_reserves(
+    update: &PoolCacheUpdate,
+    existing: Option<(u64, u64)>,
+) -> (u64, u64) {
+    let Some((existing_base, existing_quote)) = existing else {
+        return sol_quoted_vault_reserves(
+            &update.base_mint,
+            &update.quote_mint,
+            update.base_reserve,
+            update.quote_reserve,
+        );
+    };
+    if update.quote_mint == NATIVE_SOL_MINT {
+        (
+            if update.base_reserve > 0 {
+                update.base_reserve
+            } else {
+                existing_base
+            },
+            if update.quote_reserve > 0 {
+                update.quote_reserve
+            } else {
+                existing_quote
+            },
+        )
+    } else {
+        (
+            if update.quote_reserve > 0 {
+                update.quote_reserve
+            } else {
+                existing_base
+            },
+            if update.base_reserve > 0 {
+                update.base_reserve
+            } else {
+                existing_quote
+            },
+        )
+    }
 }
 
 fn vault_material_unchanged(new_vault: &VaultBalanceCache, existing: &VaultBalanceCache) -> bool {
@@ -6279,16 +6322,6 @@ impl ArbContext {
         if update.base_mint != NATIVE_SOL_MINT && update.quote_mint != NATIVE_SOL_MINT {
             return false;
         }
-        if update.base_reserve == 0 && update.quote_reserve == 0 {
-            inc_arb_vault_seed_from_cache_miss_total();
-            return false;
-        }
-        let (reserve_base, reserve_quote) = sol_quoted_vault_reserves(
-            &update.base_mint,
-            &update.quote_mint,
-            update.base_reserve,
-            update.quote_reserve,
-        );
         let mints_with_pool: Vec<String> = {
             let selected = self.arb_selected_mints.read();
             let trackers = self.trackers.read();
@@ -6303,6 +6336,22 @@ impl ArbContext {
         let vault_wait = Instant::now();
         let mut cache = self.vault_balances.write();
         record_arb_writer_lock_wait(ArbWriterLockKind::VaultBalancesWrite, vault_wait.elapsed());
+        let existing_reserves = cache
+            .get(pool_address)
+            .map(|v| (v.reserve_base, v.reserve_quote));
+        let had_existing = existing_reserves.is_some();
+        let (reserve_base, reserve_quote) =
+            merge_pool_cache_update_vault_reserves(update, existing_reserves);
+        if reserve_base == 0 && reserve_quote == 0 {
+            drop(cache);
+            inc_arb_vault_seed_from_cache_miss_total();
+            return false;
+        }
+        if !had_existing && (reserve_base == 0 || reserve_quote == 0) {
+            drop(cache);
+            inc_arb_vault_seed_from_cache_miss_total();
+            return false;
+        }
         let (active_id, bin_step) = if update.dex == "meteora_dlmm" {
             resolve_dlmm_meta_for_pool_update(pool_address, &cache, &self.live_pool_cache)
         } else {
