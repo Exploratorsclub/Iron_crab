@@ -1,29 +1,14 @@
-# WSOL Manager & Account Janitor Implementation
+# WSOL Manager & Account Janitor
 
-**Status**: Phase 2.3 Complete (Swap Dust → SOL)  
-**Created**: 2026-01-20  
-**Last Updated**: 2026-01-23
+**Stand:** 2026-08-22
 
-## Motivation
-
-Professionelle Arbitrage-Bots vermeiden wrap/unwrap in der eigentlichen Arb-TX:
-- Spart ~21k+ CU pro TX (WSOL ATA + Transfer + SyncNative entfernt)
-- Weniger Instructions = schnellere Serialisierung
-- Arb-TX ist jetzt minimal: Token ATA (idempotent) + Swaps + Jito Tip
-
-## Architektur-Übersicht
+Wrap/Unwrap liegt **nicht** in der Arb-TX. `WsolManager` in der execution-engine folgt JetStream-`WalletBalanceSnapshot` (market-data Geyser → `WALLET_SNAPSHOT`). Nach erfolgreichem Wrap gilt ein Pending-Floor, bis der Snapshot nachzieht; bei Timeout **ein** RPC-Resync (Cold Path), kein 30-Sekunden-Polling als Normalbetrieb.
 
 ```
-execution-engine
-├── main_loop (Intent processing)
-├── WsolManager (tokio task) ✅ IMPLEMENTED
-│   ├── Event-driven via NATS (wallet balance updates)
-│   ├── Polling-only fallback (wenn NATS unavailable)
-│   ├── Wrap wenn WSOL < min_wsol
-│   └── Unwrap wenn WSOL > max_wsol (close ATA)
-└── AccountJanitor (tokio task) ✅ Phase 2.4 IMPLEMENTED
-    ├── Close empty ATAs (configurable interval)
-    └── Future: Merge dust, Swap dust → SOL
+market-data (Geyser)
+        │  JetStream WALLET_SNAPSHOT
+        ▼
+execution-engine WsolManager → wrap/unwrap TX (Signer)
 ```
 
 ## Komponenten
@@ -31,14 +16,14 @@ execution-engine
 ### 1. WsolManager ✅
 
 **Verantwortlichkeiten:**
-- Sicherstellen dass genug WSOL für Arbitrage bereitsteht
-- Event-driven via Geyser → market-data → NATS
-- Wrap/Unwrap Operationen (KEINE in Arb-TX)
-- Fallback: Polling alle 30s wenn NATS nicht verfügbar
+- WSOL-Puffer für Arbitrage halten
+- Event-driven: Geyser → market-data → JetStream `WALLET_SNAPSHOT`
+- Wrap/Unwrap außerhalb der Arb-TX
+- Nach Wrap: Pending-Floor bis Snapshot; Timeout → ein RPC-Resync (Cold Path)
 
 **Trigger:**
-- NATS Event: `ironcrab.v1.wallet_balance.<wallet>` (von market-data)
-- Fallback: Periodic polling (30s oder 60s interval)
+- JetStream subject `ironcrab.wallet_snapshot.{wallet}.{mint}` (`WalletBalanceSnapshot`)
+- Nicht: deprecated Core-NATS `ironcrab.v1.wallet_balance.*`
 
 **Konfiguration:**
 ```toml
@@ -105,18 +90,14 @@ close_ata_max_per_run = 20          # Max ATAs pro Run
 
 ### Phase 1: WsolManager (Priority: HIGH) ✅ COMPLETE
 
-#### 1.1 NATS Infrastructure ✅
-- [x] NATS Topic: `ironcrab.v1.wallet_balance.<wallet>` (in `src/nats/topics.rs`)
-- [x] `wallet_balance_topic()` helper function
-- [x] `WalletBalanceUpdate` struct in `src/execution/wsol_manager.rs`
+#### 1.1 Wallet snapshots ✅
+- [x] JetStream `WALLET_SNAPSHOT` / `ironcrab.wallet_snapshot.{wallet}.{mint}`
+- [x] Deprecated: Core-NATS `ironcrab.v1.wallet_balance.*` (nicht SSOT)
 
 #### 1.2 WsolManager Core ✅
-- [x] `src/execution/wsol_manager.rs` erstellen
-- [x] `WsolManagerConfig` struct (in `src/config.rs` unter `ExecutionEngineCfg`)
-- [x] `WsolManager` struct mit:
-  - [x] `new(config, treasury, rpc)` constructor
-  - [x] `run()` async main loop (NATS subscription + periodic fallback)
-  - [x] `run_polling_only()` fallback wenn NATS unavailable
+- [x] `src/execution/wsol_manager.rs`
+- [x] Config unter `[execution_engine.wsol_manager]`
+- [x] Snapshot-driven wrap/unwrap; RPC-Resync nur Cold Path nach Wrap-Timeout
   - [x] `handle_balance_update()` handler
   - [x] `execute_wrap()` - SOL → WSOL
   - [x] `execute_unwrap()` - WSOL → SOL (closes ATA)

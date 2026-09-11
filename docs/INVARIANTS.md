@@ -2,7 +2,9 @@
 
 **Zweck:** AI darf diese Regeln **niemals** verletzen. Bei Refactors/Features: Invariants prüfen.
 
-**Quellen:** TARGET_ARCHITECTURE.md, DEFINITION_OF_DONE.md, ROLE_SEPARATION.md, .cursor/rules/ironcrab-core.mdc
+**SSOT:** Der lebende Katalog inkl. eval-getesteter Regeln (I-MD-*, PumpSwap-Layout, Admission, …) steht in [Iron_crab-eval/docs/spec/INVARIANTS.md](https://github.com/Exploratorsclub/Iron_crab-eval/blob/main/docs/spec/INVARIANTS.md). Diese Datei ist die **kompakte P0-Liste** für den Hot-Path-Alltag. Bei Widerspruch gilt die Eval-Spec plus `.cursor/rules/ironcrab-core.mdc`; den Drift dann angleichen, nicht ignorieren.
+
+**Quellen:** Eval `docs/spec/` (TARGET_ARCHITECTURE, DEFINITION_OF_DONE, ROLE_SEPARATION), `.cursor/rules/ironcrab-core.mdc`
 
 ---
 
@@ -11,7 +13,7 @@
 | ID | Invariante | Verletzung = |
 |----|------------|--------------|
 | I-1 | **Single-Signer**: Nur execution-engine lädt Keys und signiert/sendet | Architekturbruch |
-| I-2 | **Intent-only**: market-data, momentum-bot, arb-strategy, control-plane sind **keyless** — erzeugen nur TradeIntent oder MarketEvents | Key-Leak-Risiko |
+| I-2 | **Intent-only**: market-data, momentum-bot, arb-strategy, position-manager, control-plane sind **keyless** — erzeugen nur TradeIntent, MarketEvents oder Positions-KV | Key-Leak-Risiko |
 | I-3 | Prozesse außer execution-engine **crashen mit exit(1)** wenn Key-Env-Vars erkannt | DoD §A |
 
 ---
@@ -46,7 +48,7 @@
 | I-13 | **Pool-Matching**: Position-Preis-Updates (Trade, PoolCacheUpdate) nur anwenden wenn source_pool == position.pool. Bei Multi-Pool-Tokens sonst falsche PnL und TAKE_PROFIT bei Verlust. | FIX-38 |
 | I-14 | **tokens_per_sol** Konvention: LOWER = token wertvoller. pnl_pct = (entry/current - 1)*100. highest_price = niedrigster tps (bester Preis für Holder). | Invertierte Exit-Signale |
 | I-15 | **Amounts explizit**: Jede Zahl hat raw vs ui und decimals. Keine impliziten Konventionen. | Falsche Slippage/Quotes |
-| I-16 | **Geyser/LivePoolCache** ist autoritativ im Hot Path. RPC/WS nur Fallback (Cold Path). | Latenz + Cache-Inkonsistenz |
+| I-16 | **Geyser MASTER in market-data + JetStream `POOL_CACHE` → SLAVE `LivePoolCache`** ist autoritativ im Hot Path. RPC/WS nur Cold Path. | Latenz + Cache-Inkonsistenz |
 
 ---
 
@@ -76,7 +78,7 @@
 |----|------------|--------------|
 | I-23 | Keine neuen ad-hoc NATS Topics. An versioned Topics halten oder klar dokumentieren. | Topic-Chaos |
 | I-24 | Topics: ironcrab.v1.market_events, ironcrab.v1.trade_intents, ironcrab.v1.execution_results, ironcrab.v1.decision_records (siehe src/nats/topics.rs). | — |
-| I-24a | **JetStream = SSOT für Bot-Zustand**: Wallet-Balances, Positionen, Pool-Cache, Config gehören in JetStream (persistent). Konsumenten bootstrappen und holen Live-Updates von dort. | Zustands-Drift |
+| I-24a | **JetStream = SSOT für Bot-Zustand**: Wallet-Balances, Positionen, Pool-Cache, Config gehören in JetStream (persistent). Konsumenten bootstrappen und holen Live-Updates von dort. **Positionen:** Bucket `POSITION_AUTHORITY` ist die Daten-SSOT; `position-manager` ist der einzige Writer. EE/Momentum nur lesen. | Zustands-Drift |
 | I-24b | **Core NATS = Market Events**: Chain-Daten (Trades, Blocks, Preise) als Echtzeit-Events. Kein Bot-Zustand über Core NATS — Datenflut zu hoch, keine Persistenz. | — |
 
 ---

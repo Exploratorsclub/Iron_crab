@@ -1,41 +1,50 @@
 # Level-5 Evaluator Workflow
 
-## Übersicht
+Stand: 2026-08-22.
 
-Der Level-5-Setup trennt Implementation (ironcrab) und Evaluation (Iron_crab-eval) in separate Repos. Die CI führt Eval-Tests als eigenen Job aus und meldet nur Pass/Fail.
+Der Level-5-Setup trennt Implementation (`Iron_crab`) und Evaluation (`Iron_crab-eval`) in separate Repos.
 
 ## Architektur
 
 | Rolle | Workspace | Sichtbarkeit |
 |-------|-----------|--------------|
-| **Implementation Agent** | nur ironcrab | Code, CI-Logs (Pass/Fail), keine Spec, keine Eval-Tests |
-| **Test Authority** | nur Iron_crab-eval | Spec, API (via ironcrab), schreibt Szenarien und Invarianten |
-| **Evaluation Runner** | CI | Führt Eval-Tests aus, gibt nur Ergebnis zurück |
+| **Implementation Agent** | nur Iron_crab | Code, CI-Logs (Pass/Fail), Kern-Regeln (`docs/INVARIANTS.md`). Keine Eval-Testdateien. Spec aus Eval-`docs/` nur wenn im Handoff referenziert. |
+| **Test Authority** | nur Iron_crab-eval | Spec, öffentliche API (via `ironcrab`), schreibt Szenarien und Invarianten. Kein `Iron_crab/src/`. |
+| **Evaluation Runner** | CI | Führt Tests aus, gibt Pass/Fail zurück. |
 
-## CI-Flow
+## Zwei Gates
 
-1. **Checkout** ironcrab
-2. **Clone** Iron_crab-eval → `ironcrab-eval/`
-3. **Build + cargo test** in `ironcrab-eval/` (Abhängigkeit: `ironcrab = { path = ".." }`)
-4. **Report** Pass/Fail
+### A) Impl-CI — Job `Eval (Level 5)`
 
-Job-Name: `Eval (Level 5)` in `.github/workflows/ci.yml`.
+In `.github/workflows/ci.yml` (Branches `architecture-rebuild`, `architecture-rebuild-next`, `main`, `release/**`):
+
+1. Checkout Iron_crab (PR-Stand)
+2. Clone Iron_crab-eval (`main`)
+3. Patch: git-Dependency `ironcrab` → Path auf den PR-Checkout
+4. `cargo test` im Eval-Repo — **volle** Invarianten-/Blackbox-Suite
+
+Das ist der kanonische Nachweis, dass Impl und Eval-Tests zur gleichen öffentlichen API passen.
+
+### B) Eval-CI — Workflow `Rust` (schlank)
+
+In Iron_crab-eval auf `main`/PRs: `fmt`, `check`, `build`, `clippy -p ironcrab-eval` **ohne** `--all-targets` und **ohne** `cargo test`.
+
+Zusätzlich: manueller Workflow **Eval invariant tests** (`workflow_dispatch`).
 
 ## Lokale Entwicklung
 
-Klonen von Iron_crab-eval als Sibling von Iron_crab:
-
 ```
 Trading_bot/
-├── Iron_crab/       # impl
-└── Iron_crab-eval/  # eval
+├── Iron_crab/       # impl, Branch architecture-rebuild (gemeinsam)
+└── Iron_crab-eval/  # eval, Branch main
 ```
 
-In Iron_crab-eval: `Cargo.toml` mit `path = "../Iron_crab"` für lokale Dev (oder `path = ".."` wenn ironcrab-eval als Unterordner von Iron_crab geklont wird, wie in CI).
+Path-Patch für lokale volle Suite: siehe [Iron_crab-eval/CONTRIBUTING.md](https://github.com/Exploratorsclub/Iron_crab-eval/blob/main/CONTRIBUTING.md). Den Patch nicht committen.
 
 ## Tests
 
-- **Blackbox**: `pump_amm_geyser_first`, `ipc_schema_serde` (LivePoolCache, Quote-Calculator, IPC-Schema Roundtrip)
-- **Invarianten**: `invariants_lock_manager`, `invariants_quote_monotonic` (LockManager, Quote-Monotonie)
+Die Suite liegt in `Iron_crab-eval/tests/` (Dutzende Invarianten- und Blackbox-Dateien, u. a. Hot-Path-RPC, LockManager, Quotes, DEX-Parser, Market-Data Admission, Arb Track-Requests). Die Dateiliste in älteren Docs mit nur vier Tests ist veraltet.
 
-Siehe auch `docs/SPEC_LOCATION.md` für den Spezifikations-Standort.
+Katalog: Iron_crab-eval `docs/spec/INVARIANTS.md` Abschnitt A.
+
+Siehe auch `docs/SPEC_LOCATION.md` und [CONTRIBUTING.md](../CONTRIBUTING.md).

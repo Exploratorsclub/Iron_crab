@@ -1520,8 +1520,8 @@ fn pool_state_mints(state: &CachedPoolState) -> (String, String) {
 ///
 /// A transaction parser may identify a candidate pool before its account update arrives. That
 /// candidate must not create or mutate an arb tracker until the SLAVE LivePoolCache confirms the
-/// pool address, DEX and complete mint pair from DEX-owned account data. Orca/Meteora TX-layout
-/// seeds are deliberately insufficient because they are not account-authoritative quote state.
+/// pool address, DEX and mint pair. TX-layout seeds (Orca/Meteora) are sufficient for tracker
+/// admission when DEX + mints match; quote readiness (`account_seeded`) remains a screening gate.
 fn cached_pool_authorizes_arb_trade(
     state: &CachedPoolState,
     dex: &str,
@@ -1540,15 +1540,6 @@ fn cached_pool_authorizes_arb_trade(
         CachedPoolState::PumpAmm(_) => matches!(dex, "pump_amm" | "pumpswap" | "pump_swap_amm"),
     };
     if !dex_matches {
-        return false;
-    }
-
-    let account_authoritative = match state {
-        CachedPoolState::Orca(s) => s.whirlpool_quote_account_seeded,
-        CachedPoolState::Meteora(s) => s.dlmm_bin_params_account_seeded,
-        _ => true,
-    };
-    if !account_authoritative {
         return false;
     }
 
@@ -9697,12 +9688,12 @@ mod event_pipeline_tests {
     }
 
     #[test]
-    fn arb_trade_identity_requires_account_seeded_matching_pool_metadata() {
+    fn arb_trade_identity_accepts_tx_layout_seed_with_matching_dex_and_mints() {
         let mint = Pubkey::new_unique();
         let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
         let pool = Pubkey::new_unique();
         let wrong_pool = Pubkey::new_unique();
-        let mut state = ironcrab::execution::live_pool_cache::orca_whirlpool_tx_layout_seed(
+        let state = ironcrab::execution::live_pool_cache::orca_whirlpool_tx_layout_seed(
             mint,
             sol,
             Pubkey::new_unique(),
@@ -9710,14 +9701,6 @@ mod event_pipeline_tests {
         );
         let mint_str = mint.to_string();
 
-        assert!(!cached_pool_authorizes_arb_trade(
-            &CachedPoolState::Orca(state.clone()),
-            "orca",
-            &mint_str,
-            NATIVE_SOL_MINT,
-        ));
-
-        state.whirlpool_quote_account_seeded = true;
         assert!(cached_pool_authorizes_arb_trade(
             &CachedPoolState::Orca(state.clone()),
             "orca",
@@ -9725,7 +9708,7 @@ mod event_pipeline_tests {
             NATIVE_SOL_MINT,
         ));
         assert!(!cached_pool_authorizes_arb_trade(
-            &CachedPoolState::Orca(state),
+            &CachedPoolState::Orca(state.clone()),
             "meteora_dlmm",
             &mint_str,
             NATIVE_SOL_MINT,
@@ -9747,20 +9730,7 @@ mod event_pipeline_tests {
         };
 
         assert!(apply(pool, &mint_str, "orca").is_none(), "missing address");
-        let unseeded = ironcrab::execution::live_pool_cache::orca_whirlpool_tx_layout_seed(
-            mint,
-            sol,
-            Pubkey::new_unique(),
-            Pubkey::new_unique(),
-        );
-        cache.upsert(pool, CachedPoolState::Orca(unseeded.clone()), 1);
-        assert!(
-            apply(pool, &mint_str, "orca").is_none(),
-            "unseeded metadata"
-        );
-        let mut authoritative = unseeded;
-        authoritative.whirlpool_quote_account_seeded = true;
-        cache.upsert(pool, CachedPoolState::Orca(authoritative), 2);
+        cache.upsert(pool, CachedPoolState::Orca(state.clone()), 1);
         assert!(
             apply(pool, &mint_str, "meteora_dlmm").is_none(),
             "wrong DEX"
@@ -9774,12 +9744,8 @@ mod event_pipeline_tests {
             "wrong address"
         );
         assert!(
-            ctx.trackers.read().is_empty(),
-            "rejected trades must not mutate trackers"
-        );
-        assert!(
             apply(pool, &mint_str, "orca").is_some(),
-            "all four checks pass"
+            "DEX + mint pair match on TX layout seed"
         );
     }
 

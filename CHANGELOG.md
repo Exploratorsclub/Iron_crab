@@ -1,8 +1,16 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+**Stand:** 2026-08-22 — Diese Datei ist **nicht** mehr die Release-Historie.
+
+- Semver-Einträge enden bei **0.4.0 (2026-01-23)**. `[Unreleased]` wird nicht gepflegt.
+- Aktuelle Änderungen: GitHub-PRs auf `architecture-rebuild` / `architecture-rebuild-next` (Impl) und `main` (Eval).
+- Betrieb und Invarianten: `CONTRIBUTING.md`, Eval `docs/spec/INVARIANTS.md`.
+
+Die Abschnitte ab 0.4.0 bleiben als historischer Snapshot.
 
 ## [Unreleased]
+
+Nicht gepflegt. Siehe Pull Requests auf GitHub.
 
 ## [0.4.0] - 2026-01-23
 ### Added

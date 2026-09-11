@@ -1,13 +1,10 @@
 # Multi-Hop Arbitrage Implementation
 
-**Status**: ❌ Not Started (Planning Only)  
-**Created**: 2025-01-21  
-**Updated**: 2025-01-23 (Review Feedback eingearbeitet)  
-**Priority**: Medium (nach WsolManager/Janitor stable)
+**Stand:** 2026-08-22 — **implementiert** (nicht mehr „Planning only“).
 
-> ⚠️ **Hinweis**: Dieses Dokument beschreibt eine **geplante** Erweiterung.  
-> Es existiert noch **kein Code** für Multi-Hop Arbitrage.  
-> Aktuell läuft nur 2-Hop Arbitrage (WSOL → Token → WSOL).
+N-Hop läuft in `arb-strategy` (`src/arbitrage/`: PoolGraph, PoolRanker, BeamCycleFinder). 2-Hop Cross-DEX bleibt der Primärpfad. Quotes aus Trade-Cache / SLAVE `LivePoolCache` (JetStream `POOL_CACHE`), kein RPC im Hot Path.
+
+Shadow-Mode und Sanity-Caps unten bleiben gültig. Der Rest dieses Files ist Design-Hintergrund; bei Konflikt gelten `ARB_QUOTE_CONTRACT.md` und I-24a.
 
 ---
 

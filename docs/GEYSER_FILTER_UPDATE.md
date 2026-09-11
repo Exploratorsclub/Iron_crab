@@ -1,87 +1,41 @@
-# Geyser Filtering: Client-Side Implementation
+# Geyser Filtering: Client-Side
 
-## Status: Implemented ✅
+**Stand:** 2026-08-22
 
-**Stand**: Januar 2026
+## Plugin-JSON (minimal)
 
-## Architektur-Entscheidung
-
-### Yellowstone gRPC Plugin Limitation
-
-Das Yellowstone gRPC Plugin unterstützt **keine server-seitigen Account Owner Filter**.
-Die `geyser-grpc-plugin-config.json` enthält daher nur minimale Konfiguration:
+Das Yellowstone-gRPC-Plugin in der Repo-Vorlage hat **keine** server-seitigen Owner-Filter. Kanonische Datei: `docs/geyser-grpc-plugin-config.json`.
 
 ```json
 {
-  "libpath": "/opt/geyser/libgeyser_grpc.so",
+  "libpath": "/usr/local/lib/solana/libyellowstone_grpc_geyser.so",
   "grpc": {
-    "address": "0.0.0.0:10000"
+    "address": "127.0.0.1:10000"
   }
 }
 ```
 
-### Konsequenz: Client-Side Filtering
+Auf dem Server: `/home/sol/geyser-config.json`, gebunden in `agave-validator` via `--geyser-plugin-config`. Port **10000**.
 
-Das Filtering nach DEX Program IDs erfolgt **client-seitig** in `market-data`:
+## Filtering in market-data
 
-**File**: `src/bin/market_data.rs`
+DEX-Program-IDs und Account-Membership steuert **market-data** (explizites Geyser-Set, Track-Requests, Wallet-/Momentum-/Arb-Pins). Konstanten in `src/bin/market_data.rs`:
 
-```rust
-// DEX Program IDs for client-side filtering
-const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
-const RAYDIUM_CPMM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
-const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
-const PUMPFUN_BONDING: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-const PUMPSWAP_AMM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
-const METEORA_DLMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
-const METEORA_CPMM: &str = "cpmmpPPPsf4FLyJpqjBnFMVAYkdNrmnHb9Wrt8KLPZC";
-```
+| DEX | Program ID |
+|-----|------------|
+| Raydium AMM V4 | `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` |
+| Raydium CPMM | `CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C` |
+| Orca Whirlpool | `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc` |
+| PumpFun | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` |
+| PumpSwap | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` |
+| Meteora DLMM | `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo` |
+| Meteora CPMM | `cpmmpPFsKiR4eeYnGSuXgkhLLgGL1j5FUZoJBJU9t9D` |
 
-## Unterstützte DEXes
+PumpFun/PumpSwap: zusätzlich TX-basierte Discovery. Neue Program-IDs: Code + Restart **market-data**, kein Validator-Restart nur für Filter.
 
-| DEX | Program ID | Pool Discovery |
-|-----|-----------|----------------|
-| Raydium AMM V4 | `675kPX9...` | Geyser Account Updates |
-| Raydium CPMM | `CPMMoo8...` | Geyser Account Updates |
-| Orca Whirlpool | `whirLbM...` | Geyser Account Updates |
-| PumpFun Bonding | `6EF8rre...` | Geyser + Trade-Based |
-| PumpSwap AMM | `pAMMBay...` | Geyser + Trade-Based |
-| Meteora DLMM | `LBUZKhR...` | Geyser Account Updates |
-| Meteora CPMM | `cpmmpPP...` | Geyser Account Updates |
-
-## Trade-Based Discovery (Fallback)
-
-Für PumpFun/PumpSwap nutzt `momentum-bot` zusätzlich **Trade-Based Discovery**:
-
-```rust
-// Falls Geyser-Event verpasst wird, kann ein Trade das Token tracken
-if is_trade_event && !token_already_tracked {
-    let dex = infer_dex_from_pool_address(pool_address);
-    initialize_token_tracker(mint, dex);
-}
-```
-
-## Deployment
-
-Kein Validator-Restart erforderlich für Filter-Änderungen, da das Filtering client-seitig erfolgt.
-
-**Neue DEXes hinzufügen**:
-1. Program ID in `market_data.rs` hinzufügen
-2. `cargo build --release --bin market-data`
-3. `./deploy_new.sh --component market-data`
-
-## Performance Consideration
-
-Client-seitiges Filtering bedeutet höhere Bandbreite vom Geyser zum Client.
-Bei hoher Last kann dies zu Backpressure führen.
-
-**Mitigations**:
-- Geyser läuft lokal auf dem gleichen Server
-- NATS JetStream für Event-Buffering
-- `market-data` filtert früh und verwirft irrelevante Events
+Caps und Full-Reconnect: `[market_data_geyser]` in der Config (`docs/CONFIG_SCHEMA.md`). Architektur: `docs/VALIDATOR_SETUP.md`.
 
 ## Referenzen
 
-- [Yellowstone gRPC Plugin](https://github.com/rpcpool/yellowstone-grpc)
-- [docs/TARGET_ARCHITECTURE.md](TARGET_ARCHITECTURE.md) - Process Boundaries
-- [src/bin/market_data.rs](../src/bin/market_data.rs) - Client-side Implementation
+- [Yellowstone gRPC](https://github.com/rpcpool/yellowstone-grpc)
+- [VALIDATOR_SETUP.md](VALIDATOR_SETUP.md)

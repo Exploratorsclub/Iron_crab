@@ -1,43 +1,49 @@
 # Level-5 Cursor Setup
 
+Zwei getrennte Fenster, damit Implementation und Test Authority sich nicht in die Quere kommen.
+
+Sibling-Layout (Ordnernamen genau so, Groß/Kleinschreibung beachten):
+
+```
+Trading_bot/
+├── Iron_crab/
+└── Iron_crab-eval/
+```
+
+Arbeits-Branches: Iron_crab → `architecture-rebuild` (gemeinsam), Iron_crab-eval → `main`. `architecture-rebuild-next` ist Maintainer-Entwicklung.
+
 ## Zwei Fenster
 
 ### Fenster 1 – Implementation (Iron_crab)
-**Ordner öffnen:** `c:\Users\Robert Onuk\Desktop\Trading_bot\Iron_crab`
 
-- Agent-Rolle: Implementation Agent
-- Sieht: Code, CI Pass/Fail
-- Sieht nicht: Spec-Details (liegen im Eval-Repo), Eval-Test-Code
+Ordner öffnen: `.../Trading_bot/Iron_crab`
 
-### Fenster 2 – Test Authority (ironcrab-eval)
-**Ordner öffnen:** `c:\Users\Robert Onuk\Desktop\Trading_bot\ironcrab-eval`
+- Rolle: Implementation Agent
+- Sieht: Code, CI Pass/Fail, `docs/INVARIANTS.md`
+- Sieht nicht: Eval-Test-Code (`Iron_crab-eval/tests/`)
 
-- Agent-Rolle: Test Authority
-- Sieht: Spec (`docs/spec/`), Tests, API via ironcrab
+### Fenster 2 – Test Authority (Iron_crab-eval)
+
+Ordner öffnen: `.../Trading_bot/Iron_crab-eval`
+
+- Rolle: Test Authority
+- Sieht: Spec (`docs/spec/`), Tests, öffentliche API via `ironcrab`
 - Aufgabe: Blackbox-Szenarien und Invarianten aus der Spec schreiben
-
-**Voraussetzung:** `Iron_crab` muss als Geschwister vorhanden sein (gleicher Parent wie Iron_crab-eval).
 
 ## Prüfen
 
 ```bash
-# Im ironcrab-eval Ordner:
-cd c:\Users\Robert Onuk\Desktop\Trading_bot\ironcrab-eval
+cd .../Trading_bot/Iron_crab-eval
 cargo test
 ```
 
-Falls `cargo test` fehlschlägt (z.B. "path ../Iron_crab not found"): Prüfen, ob beide Ordner unter `Trading_bot` stehen:
-```
-Trading_bot/
-├── Iron_crab/
-└── ironcrab-eval/
-```
+Falls der Build die crate `ironcrab` nicht findet: Sibling-Layout prüfen und Path-Patch aus [CONTRIBUTING.md](https://github.com/Exploratorsclub/Iron_crab-eval/blob/main/CONTRIBUTING.md) setzen — Patch nicht committen.
 
 ## Multi-Root Workspace (optional)
 
-Beide Repos in einem Fenster: `File → Add Folder to Workspace` → `ironcrab-eval` hinzufügen.
+Beide Repos in einem Fenster: `File → Add Folder to Workspace` → `Iron_crab-eval` hinzufügen.
 
-`.cursorignore` in Iron_crab blendet `ironcrab-eval/` und `Iron_crab-eval/` aus, falls sie als Unterordner existieren. Bei Sibling-Layout im Multi-Root sind beide Roots sichtbar – dann Fenster 1 nur mit Iron_crab öffnen, wenn der Implementation Agent keine Spec/Tests sehen soll.
+`.cursorignore` in Iron_crab blendet `ironcrab-eval/` und `Iron_crab-eval/` aus, falls sie als Unterordner existieren. Bei Sibling-Layout im Multi-Root sind beide Roots sichtbar — Fenster 1 nur mit Iron_crab öffnen, wenn der Implementation Agent keine Spec/Tests sehen soll.
 
 ---
 
@@ -48,22 +54,20 @@ Beide Repos in einem Fenster: `File → Add Folder to Workspace` → `ironcrab-e
 | Situation | Fenster | Agent |
 |-----------|---------|-------|
 | Code ändern, Bug fixen, Feature bauen | 1 (Iron_crab) | Implementation |
-| Neue Tests aus Spec, Spec pflegen | 2 (ironcrab-eval) | Test Authority |
+| Neue Tests aus Spec, Spec pflegen | 2 (Iron_crab-eval) | Test Authority |
 
 ### Tasks für den Implementation Agent
 
-Spec-Kontext explizit mitschicken, wenn relevant:
+Spec-Kontext explizit mitschicken, wenn relevant. STOP-CHECK in `AGENTS.md` zuerst.
 
 ```
-Implementiere [FEATURE]. Kontext aus Spec (ironcrab-eval/docs/spec/): [Ausschnitt einfügen oder Verweis].
-Erlaubte Dateien: [z.B. src/execution/]. Vermeide Architektur-Verstöße (INVARIANTS.md).
+Implementiere [FEATURE]. Kontext aus Spec (Iron_crab-eval/docs/spec/): [Ausschnitt].
+Erlaubte Dateien: [z.B. src/execution/]. Keine Eval-Testdateien lesen.
 ```
-
-Bei reinen Code-Fixes reicht oft: „Fix X in [Modul], siehe INVARIANTS.md“.
 
 ### Iteration
 
-1. Agent ändert Code → Push
-2. CI läuft → Eval-Tests Pass/Fail
-3. Bei Fail: Agent erneut mit Fehlermeldung (z.B. „Eval-Test Y schlägt fehl: …“)
-4. Wiederholen bis Pass
+1. Impl-Änderung → PR auf `architecture-rebuild`
+2. CI: Unit-Tests + Job **Eval (Level 5)**
+3. Bei Fail: Fix im Impl-Repo (nicht die Tests an die Impl anpassen, außer die öffentliche API hat sich bewusst geändert — dann Eval-PR auf `main`)
+4. Eval-PRs separat; schlankes Gate „Rust“, volle Suite über Impl-CI oder manuellen Workflow
