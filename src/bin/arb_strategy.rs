@@ -548,6 +548,54 @@ fn live_pool_cache_fresher_than_vault(
     new_vault.update_slot > existing.update_slot || new_vault.updated_at > existing.updated_at
 }
 
+/// C1h pin guard: SLAVE snapshot age must not exceed quote freshness window.
+fn pin_slave_snapshot_age_allowed(age_ms: u64) -> bool {
+    age_ms <= MAX_PRICE_AGE_MS
+}
+
+/// C1h pin guard: refresh only when SLAVE is fresh, event row is stale, and slot advances.
+fn pin_slave_refresh_allowed(
+    age_ms: u64,
+    cache_slot: u64,
+    existing: &VaultBalanceCache,
+    new_vault: &VaultBalanceCache,
+) -> bool {
+    if !pin_slave_snapshot_age_allowed(age_ms) {
+        return false;
+    }
+    if existing.updated_at.elapsed() <= Duration::from_millis(MAX_PRICE_AGE_MS) {
+        return false;
+    }
+    if vault_material_unchanged(new_vault, existing) {
+        return false;
+    }
+    cache_slot > existing.update_slot
+}
+
+fn resolve_dlmm_meta_for_pool_update(
+    pool_address: &str,
+    vault_cache: &HashMap<String, VaultBalanceCache>,
+    live_pool_cache: &SharedLivePoolCache,
+) -> (Option<i32>, Option<u16>) {
+    if let Some(existing) = vault_cache.get(pool_address) {
+        return (existing.active_id, existing.bin_step);
+    }
+    let pool_pk = match Pubkey::from_str(pool_address) {
+        Ok(pk) => pk,
+        Err(_) => return (None, None),
+    };
+    live_pool_cache
+        .get(&pool_pk)
+        .map(|state| {
+            if let CachedPoolState::Meteora(s) = state {
+                (Some(s.active_id), Some(s.bin_step))
+            } else {
+                (None, None)
+            }
+        })
+        .unwrap_or((None, None))
+}
+
 fn vault_material_unchanged(new_vault: &VaultBalanceCache, existing: &VaultBalanceCache) -> bool {
     state_fingerprint(&vault_cache_to_quote_input(new_vault))
         == state_fingerprint(&vault_cache_to_quote_input(existing))
@@ -581,6 +629,9 @@ fn try_seed_vault_from_live_cache(
     let Some((state, slot, age_ms)) = live_pool_cache.get_with_metadata(&pool_pk) else {
         return false;
     };
+    if pin_class == "pin" && !pin_slave_snapshot_age_allowed(age_ms) {
+        return false;
+    }
     let Some(vault) = vault_balance_from_live_cache_state(&state, slot, age_ms) else {
         return false;
     };
@@ -609,7 +660,12 @@ fn try_refresh_vault_from_live_cache(
     let Some(new_vault) = vault_balance_from_live_cache_state(&state, slot, age_ms) else {
         return false;
     };
-    if !live_pool_cache_fresher_than_vault(&new_vault, existing) {
+    let allowed = if pin_class == "pin" {
+        pin_slave_refresh_allowed(age_ms, slot, existing, &new_vault)
+    } else {
+        live_pool_cache_fresher_than_vault(&new_vault, existing)
+    };
+    if !allowed {
         return false;
     }
     record_live_cache_age_at_snapshot("refresh", age_ms, pin_class);
@@ -632,6 +688,15 @@ fn try_overwrite_stale_pinned_vault_from_live_cache(
         return false;
     };
     if existing.updated_at.elapsed().as_millis() as u64 <= state_ttl_ms {
+        return false;
+    }
+    let Ok(pool_pk) = Pubkey::from_str(pool_address) else {
+        return false;
+    };
+    let Some((_, _, age_ms)) = live_pool_cache.get_with_metadata(&pool_pk) else {
+        return false;
+    };
+    if !pin_slave_snapshot_age_allowed(age_ms) {
         return false;
     }
     if try_refresh_vault_from_live_cache(pool_address, live_pool_cache, vault_cache, pin_class) {
@@ -6199,14 +6264,32 @@ impl ArbContext {
         }
     }
 
-    /// P1: seed global `vault_balances` from SLAVE cache on JetStream PoolCacheUpdate for pinned pools.
+    /// P1: apply JetStream `PoolCacheUpdate` reserves into global `vault_balances` for pinned pools.
+    ///
+    /// Uses event slot + `Instant::now()` (same semantics as `handle_pool_state_update`), not SLAVE
+    /// `age_ms` from `get_with_metadata`.
     fn consume_vault_seed_from_pool_cache_update(&self, update: &PoolCacheUpdate) -> bool {
         if matches!(update.update_type, PoolCacheUpdateType::PoolRemoved) {
             return false;
         }
         let pool_address = update.pool_address.as_str();
-        let is_pinned = self.arb_pinned_pools.read().contains(pool_address);
-        let mints_with_pool: Vec<String> = if is_pinned {
+        if !self.arb_pinned_pools.read().contains(pool_address) {
+            return false;
+        }
+        if update.base_mint != NATIVE_SOL_MINT && update.quote_mint != NATIVE_SOL_MINT {
+            return false;
+        }
+        if update.base_reserve == 0 && update.quote_reserve == 0 {
+            inc_arb_vault_seed_from_cache_miss_total();
+            return false;
+        }
+        let (reserve_base, reserve_quote) = sol_quoted_vault_reserves(
+            &update.base_mint,
+            &update.quote_mint,
+            update.base_reserve,
+            update.quote_reserve,
+        );
+        let mints_with_pool: Vec<String> = {
             let selected = self.arb_selected_mints.read();
             let trackers = self.trackers.read();
             trackers
@@ -6216,43 +6299,49 @@ impl ArbContext {
                 })
                 .map(|(mint, _)| mint.clone())
                 .collect()
-        } else {
-            Vec::new()
         };
-        if !is_pinned {
-            return false;
-        }
-        let pin_class = "pin";
         let vault_wait = Instant::now();
-        let mut vault_cache = self.vault_balances.write();
+        let mut cache = self.vault_balances.write();
         record_arb_writer_lock_wait(ArbWriterLockKind::VaultBalancesWrite, vault_wait.elapsed());
-        let seeded = if try_refresh_vault_from_live_cache(
-            pool_address,
-            &self.live_pool_cache,
-            &mut vault_cache,
-            pin_class,
-        ) {
-            inc_arb_vault_live_snapshot_refreshed_total();
-            true
-        } else if try_seed_vault_from_live_cache(
-            pool_address,
-            &self.live_pool_cache,
-            &mut vault_cache,
-            pin_class,
-        ) {
-            inc_arb_vault_live_snapshot_seeded_total();
-            true
+        let (active_id, bin_step) = if update.dex == "meteora_dlmm" {
+            resolve_dlmm_meta_for_pool_update(pool_address, &cache, &self.live_pool_cache)
         } else {
-            false
+            (None, None)
         };
-        drop(vault_cache);
-        if seeded {
-            inc_arb_vault_seed_from_cache_ok_total();
-            self.schedule_arb_vault_rescreen_for_mints(pool_address, &mints_with_pool);
+        let dlmm_token_x_mint = if update.dex == "meteora_dlmm" {
+            resolve_dlmm_token_x_mint_for_pool_update(pool_address, &cache, &self.live_pool_cache)
         } else {
-            inc_arb_vault_seed_from_cache_miss_total();
+            cache
+                .get(pool_address)
+                .and_then(|v| v.dlmm_token_x_mint.clone())
+        };
+        let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
+        let new_vault = VaultBalanceCache {
+            reserve_base,
+            reserve_quote,
+            update_slot: update.geyser_slot,
+            active_id,
+            bin_step,
+            updated_at: Instant::now(),
+            dlmm_sol_is_x,
+            dlmm_token_x_mint,
+        };
+        if let Some(existing) = cache.get(pool_address) {
+            if vault_material_unchanged(&new_vault, existing) {
+                drop(cache);
+                return false;
+            }
+            if update.geyser_slot < existing.update_slot {
+                drop(cache);
+                return false;
+            }
         }
-        seeded
+        cache.insert(pool_address.to_string(), new_vault);
+        inc_arb_vault_balance_applied_total();
+        drop(cache);
+        inc_arb_vault_seed_from_cache_ok_total();
+        self.schedule_arb_vault_rescreen_for_mints(pool_address, &mints_with_pool);
+        true
     }
 
     /// Handle PoolStateUpdate event - cache vault balances from Geyser
@@ -13249,7 +13338,10 @@ mod two_hop_price_tests {
 
     #[test]
     fn pool_cache_update_consume_seeds_pinned_vault_and_metrics() {
-        use ironcrab::metrics::ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL;
+        use ironcrab::metrics::{
+            ARB_VAULT_BALANCE_APPLIED_TOTAL, ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL,
+            ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL,
+        };
         use std::sync::atomic::Ordering;
 
         let cache = create_shared_cache();
@@ -13275,12 +13367,30 @@ mod two_hop_price_tests {
 
         ctx.arb_pinned_pools.write().insert(pool_str.clone());
         let ok_before = ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL.load(Ordering::Relaxed);
+        let applied_before = ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed);
+        let seeded_before = ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.load(Ordering::Relaxed);
         assert!(ctx.consume_vault_seed_from_pool_cache_update(&update));
         assert_eq!(
             ARB_VAULT_SEED_FROM_CACHE_OK_TOTAL.load(Ordering::Relaxed),
             ok_before + 1
         );
-        assert!(ctx.vault_balances.read().contains_key(&pool_str));
+        assert_eq!(
+            ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed),
+            applied_before + 1,
+            "JetStream pin apply must use balance-applied counter, not snapshot seed"
+        );
+        assert_eq!(
+            ARB_VAULT_LIVE_SNAPSHOT_SEEDED_TOTAL.load(Ordering::Relaxed),
+            seeded_before,
+            "event apply must not increment C1h snapshot seed counter"
+        );
+        let vaults = ctx.vault_balances.read();
+        let vault = vaults.get(&pool_str).expect("vault row");
+        assert_eq!(vault.update_slot, 100);
+        assert!(
+            vault.updated_at.elapsed() <= Duration::from_millis(MAX_PRICE_AGE_MS),
+            "event apply must stamp updated_at from Instant::now(), not SLAVE age_ms"
+        );
     }
 
     #[test]
@@ -13337,8 +13447,108 @@ mod two_hop_price_tests {
     }
 
     #[test]
+    fn pin_event_apply_not_overwritten_by_stale_slave_snapshot() {
+        let cache = create_shared_cache();
+        let ctx = test_arb_context(cache.clone());
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+
+        let update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            2_000_000_000,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update);
+        ctx.arb_pinned_pools.write().insert(pool_str.clone());
+        assert!(ctx.consume_vault_seed_from_pool_cache_update(&update));
+
+        let vaults = ctx.vault_balances.read();
+        let event_updated_at = vaults.get(&pool_str).expect("event vault").updated_at;
+
+        let mut snapshot_vaults = ctx.vault_balances.read().clone();
+        assert!(
+            !try_refresh_vault_from_live_cache(&pool_str, &cache, &mut snapshot_vaults, "pin",),
+            "C1h refresh must not overwrite event-fresh pin row with SLAVE age_ms clock"
+        );
+        let vault = snapshot_vaults.get(&pool_str).expect("vault preserved");
+        assert_eq!(vault.update_slot, 100);
+        assert_eq!(vault.updated_at, event_updated_at);
+        assert!(
+            pin_slave_snapshot_age_allowed(400_000) == false,
+            "gt_300s SLAVE age must be rejected for pin snapshot seed"
+        );
+        assert!(
+            !pin_slave_refresh_allowed(
+                400_000,
+                100,
+                vault,
+                &VaultBalanceCache {
+                    reserve_base: 2_000_000_000_000,
+                    reserve_quote: 3_000_000_000,
+                    update_slot: 100,
+                    active_id: None,
+                    bin_step: None,
+                    updated_at: Instant::now() - Duration::from_millis(400_000),
+                    dlmm_sol_is_x: false,
+                    dlmm_token_x_mint: None,
+                },
+            ),
+            "stale SLAVE must not refresh event-fresh pin vault"
+        );
+    }
+
+    #[test]
+    fn pin_try_seed_rejects_stale_slave_age_without_key() {
+        assert!(
+            !pin_slave_snapshot_age_allowed(MAX_PRICE_AGE_MS + 1),
+            "pin seed must reject SLAVE age above MAX_PRICE_AGE_MS"
+        );
+        assert!(
+            pin_slave_snapshot_age_allowed(5_000),
+            "pin seed allows SLAVE age within MAX_PRICE_AGE_MS"
+        );
+    }
+
+    #[test]
+    fn pin_try_seed_allows_fresh_slave_within_max_price_age() {
+        let cache = create_shared_cache();
+        let pool = Pubkey::new_unique();
+        let pool_str = pool.to_string();
+        let seed_update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            Pubkey::new_unique().to_string(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            2_000_000_000,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &seed_update);
+
+        let mut vault_balances = HashMap::new();
+        assert!(
+            try_seed_vault_from_live_cache(&pool_str, &cache, &mut vault_balances, "pin"),
+            "pin cold-start seed allowed when SLAVE age is within MAX_PRICE_AGE_MS"
+        );
+        assert!(vault_balances.contains_key(&pool_str));
+    }
+
+    #[test]
     fn live_snapshot_cache_age_records_pin_label() {
         use ironcrab::metrics::{
+            ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_GT_300S,
             ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_120S,
             ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_30S,
         };
@@ -13373,9 +13583,16 @@ mod two_hop_price_tests {
         ));
         let after_30s = ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_30S.load(Ordering::Relaxed);
         let after_120s = ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_LE_120S.load(Ordering::Relaxed);
+        let gt_300s_before =
+            ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_GT_300S.load(Ordering::Relaxed);
         assert!(
             after_30s > before_30s || after_120s > before_120s,
-            "pin-labeled cache age bucket must increment for arb-pinned seed path"
+            "pin-labeled cache age bucket must increment for arb-pinned seed path within 30s"
+        );
+        assert_eq!(
+            ARB_VAULT_LIVE_SNAPSHOT_CACHE_AGE_PIN_SEED_GT_300S.load(Ordering::Relaxed),
+            gt_300s_before,
+            "fresh pin seed must not land in gt_300s bucket"
         );
     }
 
