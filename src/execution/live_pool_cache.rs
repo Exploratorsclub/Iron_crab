@@ -535,12 +535,14 @@ fn preserve_option_reserve(incoming: Option<u64>, existing: Option<u64>) -> Opti
     }
 }
 
-/// Meteora CPMM uses plain `u64`; account parse leaves `0` when reserves are not in the message.
-fn preserve_u64_reserve(incoming: u64, existing: u64) -> u64 {
-    if incoming == 0 && existing > 0 {
-        existing
-    } else {
-        incoming
+/// Meteora CPMM uses plain `u64`; account parse uses `0/0` as omit sentinel (not per-leg).
+fn merge_meteora_cpmm_account_reserves_from_prior(
+    inc: &mut MeteoraCpmmState,
+    ex: &MeteoraCpmmState,
+) {
+    if inc.reserve_0 == 0 && inc.reserve_1 == 0 {
+        inc.reserve_0 = ex.reserve_0;
+        inc.reserve_1 = ex.reserve_1;
     }
 }
 
@@ -628,10 +630,9 @@ pub fn merge_account_parse_preserves_existing(
         }
         (CachedPoolState::MeteoraCpmm(ex), CachedPoolState::MeteoraCpmm(mut inc)) => {
             // Slot 0 = cold-path RPC hydration with observed vault balances (0 is valid).
-            // Slot > 0 = Geyser account parse leaves reserves at 0 until vault ticks.
+            // Slot > 0 = Geyser account parse uses 0/0 omit sentinel until vault ticks.
             if slot > 0 {
-                inc.reserve_0 = preserve_u64_reserve(inc.reserve_0, ex.reserve_0);
-                inc.reserve_1 = preserve_u64_reserve(inc.reserve_1, ex.reserve_1);
+                merge_meteora_cpmm_account_reserves_from_prior(&mut inc, ex);
             }
             CachedPoolState::MeteoraCpmm(inc)
         }
@@ -3434,6 +3435,138 @@ mod tests {
         };
         assert_eq!(s.reserve_0, Some(1_000_000));
         assert_eq!(s.reserve_1, Some(2_000_000));
+    }
+
+    fn test_meteora_cpmm_state_with_vaults(
+        token_0_mint: Pubkey,
+        token_1_mint: Pubkey,
+        token_0_vault: Pubkey,
+        token_1_vault: Pubkey,
+        reserve_0: u64,
+        reserve_1: u64,
+    ) -> MeteoraCpmmState {
+        MeteoraCpmmState {
+            token_0_mint,
+            token_1_mint,
+            token_0_vault,
+            token_1_vault,
+            amm_config: Pubkey::new_unique(),
+            observation_key: Pubkey::new_unique(),
+            token_0_program: Pubkey::new_unique(),
+            token_1_program: Pubkey::new_unique(),
+            reserve_0,
+            reserve_1,
+            mint_0_decimals: 6,
+            mint_1_decimals: 9,
+            status: 1,
+        }
+    }
+
+    #[test]
+    fn upsert_account_parse_preserves_meteora_cpmm_reserves_on_zero_zero_sentinel() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let v0 = Pubkey::new_unique();
+        let v1 = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 1_000_000, 2_000_000,
+            )),
+            10,
+        );
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 0, 0,
+            )),
+            20,
+        );
+
+        let cached = cache.get(&pool).expect("cached");
+        let CachedPoolState::MeteoraCpmm(s) = cached else {
+            panic!("expected meteora cpmm");
+        };
+        assert_eq!(s.reserve_0, 1_000_000);
+        assert_eq!(s.reserve_1, 2_000_000);
+    }
+
+    #[test]
+    fn upsert_account_parse_meteora_cpmm_partial_observation_applies_including_zero_leg() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let v0 = Pubkey::new_unique();
+        let v1 = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 1_000_000, 2_000_000,
+            )),
+            10,
+        );
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 500_000, 0,
+            )),
+            20,
+        );
+
+        let cached = cache.get(&pool).expect("cached");
+        let CachedPoolState::MeteoraCpmm(s) = cached else {
+            panic!("expected meteora cpmm");
+        };
+        assert_eq!(s.reserve_0, 500_000);
+        assert_eq!(
+            s.reserve_1, 0,
+            "observed zero leg must not be preserved from existing"
+        );
+    }
+
+    #[test]
+    fn meteora_cpmm_vault_tick_zero_after_preserve_upsert() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let v0 = Pubkey::new_unique();
+        let v1 = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 1_000_000, 2_000_000,
+            )),
+            10,
+        );
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 0, 0,
+            )),
+            20,
+        );
+
+        cache.update_vault_balance(&v0, 0, 30);
+
+        let cached = cache.get(&pool).expect("cached");
+        let CachedPoolState::MeteoraCpmm(s) = cached else {
+            panic!("expected meteora cpmm");
+        };
+        assert_eq!(
+            s.reserve_0, 0,
+            "vault tick must apply genuine zero after preserve upsert"
+        );
+        assert_eq!(s.reserve_1, 2_000_000);
     }
 
     #[test]
