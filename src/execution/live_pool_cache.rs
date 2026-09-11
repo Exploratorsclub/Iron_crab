@@ -573,6 +573,7 @@ fn merge_raydium_amm_account_fields_from_prior(new_am: &mut RaydiumAmmState, ex:
 pub fn merge_account_parse_preserves_existing(
     existing: &CachedPoolState,
     incoming: CachedPoolState,
+    slot: u64,
 ) -> CachedPoolState {
     match (existing, incoming) {
         (CachedPoolState::PumpAmm(ex), CachedPoolState::PumpAmm(mut inc)) => {
@@ -626,8 +627,12 @@ pub fn merge_account_parse_preserves_existing(
             CachedPoolState::Meteora(inc)
         }
         (CachedPoolState::MeteoraCpmm(ex), CachedPoolState::MeteoraCpmm(mut inc)) => {
-            inc.reserve_0 = preserve_u64_reserve(inc.reserve_0, ex.reserve_0);
-            inc.reserve_1 = preserve_u64_reserve(inc.reserve_1, ex.reserve_1);
+            // Slot 0 = cold-path RPC hydration with observed vault balances (0 is valid).
+            // Slot > 0 = Geyser account parse leaves reserves at 0 until vault ticks.
+            if slot > 0 {
+                inc.reserve_0 = preserve_u64_reserve(inc.reserve_0, ex.reserve_0);
+                inc.reserve_1 = preserve_u64_reserve(inc.reserve_1, ex.reserve_1);
+            }
             CachedPoolState::MeteoraCpmm(inc)
         }
         (_, incoming) => incoming,
@@ -917,7 +922,7 @@ impl LivePoolCache {
                 if slot > 0 && slot < prev.last_seen_slot {
                     return false;
                 }
-                state = merge_account_parse_preserves_existing(&prev.state, state);
+                state = merge_account_parse_preserves_existing(&prev.state, state, slot);
                 let refresh_age = pool_state_has_reserve_basis(&state);
                 let new_fingerprint = pool_state_material_fingerprint(&state);
                 let material_changed =
