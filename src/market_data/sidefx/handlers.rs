@@ -34,7 +34,8 @@ use crate::metrics::{
     inc_market_data_open_position_pumpfun_jetstream_publish_total,
     inc_market_data_pool_state_publish_skipped_balance_unchanged_total,
     inc_market_data_tx_pin_seed_pool_accounts_write_miss_total,
-    inc_market_data_tx_pin_seed_pool_accounts_written_total,
+    inc_market_data_tx_pin_seed_pool_accounts_written_total, inc_market_data_vault_tick_applied,
+    inc_market_data_vault_tick_dropped, inc_market_data_vault_tick_jetstream_enqueued,
     record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_pool_mint_map_to_devwallet_ms, MarketDataLatencySegment,
 };
@@ -1969,9 +1970,11 @@ pub fn md_sidefx_process_vault_balance_tick(
         return;
     };
     let Some(vault_view) = host.vault_membership_view(vault_pubkey) else {
+        inc_market_data_vault_tick_dropped("membership_miss");
         return;
     };
     if vault_view.dex == "restored" {
+        inc_market_data_vault_tick_dropped("restored");
         return;
     }
     let prev_balance = vault_view
@@ -1979,6 +1982,7 @@ pub fn md_sidefx_process_vault_balance_tick(
         .swap(*balance, std::sync::atomic::Ordering::Relaxed);
     if *balance == prev_balance {
         inc_market_data_pool_state_publish_skipped_balance_unchanged_total();
+        inc_market_data_vault_tick_dropped("unchanged");
         return;
     }
     scratch.note_vault_touch(*vault_pubkey, *update_class);
@@ -2002,11 +2006,17 @@ pub fn md_sidefx_process_vault_balance_tick(
     }
 
     if final_base == 0 && final_quote == 0 {
+        inc_market_data_vault_tick_dropped("pair_zero");
         return;
     }
 
     host.live_pool_cache()
         .update_vault_balance(vault_pubkey, *balance, *slot);
+    inc_market_data_vault_tick_applied(if update_class.is_exec_hot() {
+        "exec_hot"
+    } else {
+        "enrich"
+    });
 
     let publish_jetstream = update_class.is_exec_hot();
     if publish_jetstream && host.nats_enabled() {
@@ -2114,6 +2124,7 @@ pub fn md_sidefx_process_vault_balance_tick(
             "PoolCacheUpdate::BalanceUpdated",
             false,
         );
+        inc_market_data_vault_tick_jetstream_enqueued();
         md_sidefx_inc_enrichment_publish_metrics_if_member(
             host,
             &vault_view.pool_address,
