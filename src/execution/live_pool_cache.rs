@@ -527,6 +527,119 @@ pub fn pool_state_has_reserve_basis(state: &CachedPoolState) -> bool {
     }
 }
 
+/// Preserve vault balance when account parse omits reserves (`None` = not in this message).
+fn preserve_option_reserve(incoming: Option<u64>, existing: Option<u64>) -> Option<u64> {
+    match incoming {
+        None => existing,
+        some => some,
+    }
+}
+
+/// Meteora CPMM uses plain `u64`; account parse uses `0/0` as omit sentinel (not per-leg).
+fn merge_meteora_cpmm_account_reserves_from_prior(
+    inc: &mut MeteoraCpmmState,
+    ex: &MeteoraCpmmState,
+) {
+    if inc.reserve_0 == 0 && inc.reserve_1 == 0 {
+        inc.reserve_0 = ex.reserve_0;
+        inc.reserve_1 = ex.reserve_1;
+    }
+}
+
+fn merge_raydium_amm_account_fields_from_prior(new_am: &mut RaydiumAmmState, ex: &RaydiumAmmState) {
+    new_am.coin_reserve = preserve_option_reserve(new_am.coin_reserve, ex.coin_reserve);
+    new_am.pc_reserve = preserve_option_reserve(new_am.pc_reserve, ex.pc_reserve);
+    if new_am.market_id == Pubkey::default() && ex.market_id != Pubkey::default() {
+        new_am.market_id = ex.market_id;
+    }
+    if new_am.serum_bids.is_none() {
+        new_am.serum_bids = ex.serum_bids;
+    }
+    if new_am.serum_asks.is_none() {
+        new_am.serum_asks = ex.serum_asks;
+    }
+    if new_am.serum_event_queue.is_none() {
+        new_am.serum_event_queue = ex.serum_event_queue;
+    }
+    if new_am.serum_base_vault.is_none() {
+        new_am.serum_base_vault = ex.serum_base_vault;
+    }
+    if new_am.serum_quote_vault.is_none() {
+        new_am.serum_quote_vault = ex.serum_quote_vault;
+    }
+}
+
+/// Account parse (partial) merged over an existing MASTER row: existing wins for fields the parse
+/// does not carry (TX-v14 `pool_accounts`, vault-tick reserves, etc.). Layout fields from the
+/// incoming account parse win when present (mints, vault pubkeys, Orca sqrt_price, DLMM active_id).
+pub fn merge_account_parse_preserves_existing(
+    existing: &CachedPoolState,
+    incoming: CachedPoolState,
+    slot: u64,
+) -> CachedPoolState {
+    match (existing, incoming) {
+        (CachedPoolState::PumpAmm(ex), CachedPoolState::PumpAmm(mut inc)) => {
+            inc.base_reserve = preserve_option_reserve(inc.base_reserve, ex.base_reserve);
+            inc.quote_reserve = preserve_option_reserve(inc.quote_reserve, ex.quote_reserve);
+            if inc.pool_accounts.is_empty() && !ex.pool_accounts.is_empty() {
+                inc.pool_accounts = ex.pool_accounts.clone();
+            }
+            if inc.creator.is_none() {
+                inc.creator = ex.creator;
+            }
+            CachedPoolState::PumpAmm(inc)
+        }
+        (CachedPoolState::Orca(ex), CachedPoolState::Orca(mut inc)) => {
+            inc.vault_a_balance = preserve_option_reserve(inc.vault_a_balance, ex.vault_a_balance);
+            inc.vault_b_balance = preserve_option_reserve(inc.vault_b_balance, ex.vault_b_balance);
+            if inc.token_a_program.is_none() {
+                inc.token_a_program = ex.token_a_program;
+            }
+            if inc.token_b_program.is_none() {
+                inc.token_b_program = ex.token_b_program;
+            }
+            if ex.whirlpool_quote_account_seeded {
+                inc.whirlpool_quote_account_seeded = true;
+            }
+            CachedPoolState::Orca(inc)
+        }
+        (CachedPoolState::RaydiumAmm(ex), CachedPoolState::RaydiumAmm(mut inc)) => {
+            merge_raydium_amm_account_fields_from_prior(&mut inc, ex);
+            CachedPoolState::RaydiumAmm(inc)
+        }
+        (CachedPoolState::RaydiumCpmm(ex), CachedPoolState::RaydiumCpmm(mut inc)) => {
+            inc.reserve_0 = preserve_option_reserve(inc.reserve_0, ex.reserve_0);
+            inc.reserve_1 = preserve_option_reserve(inc.reserve_1, ex.reserve_1);
+            CachedPoolState::RaydiumCpmm(inc)
+        }
+        (CachedPoolState::Meteora(ex), CachedPoolState::Meteora(mut inc)) => {
+            inc.reserve_x_balance =
+                preserve_option_reserve(inc.reserve_x_balance, ex.reserve_x_balance);
+            inc.reserve_y_balance =
+                preserve_option_reserve(inc.reserve_y_balance, ex.reserve_y_balance);
+            if inc.reserve_x == Pubkey::default() && ex.reserve_x != Pubkey::default() {
+                inc.reserve_x = ex.reserve_x;
+            }
+            if inc.reserve_y == Pubkey::default() && ex.reserve_y != Pubkey::default() {
+                inc.reserve_y = ex.reserve_y;
+            }
+            if ex.dlmm_bin_params_account_seeded {
+                inc.dlmm_bin_params_account_seeded = true;
+            }
+            CachedPoolState::Meteora(inc)
+        }
+        (CachedPoolState::MeteoraCpmm(ex), CachedPoolState::MeteoraCpmm(mut inc)) => {
+            // Slot 0 = cold-path RPC hydration with observed vault balances (0 is valid).
+            // Slot > 0 = Geyser account parse uses 0/0 omit sentinel until vault ticks.
+            if slot > 0 {
+                merge_meteora_cpmm_account_reserves_from_prior(&mut inc, ex);
+            }
+            CachedPoolState::MeteoraCpmm(inc)
+        }
+        (_, incoming) => incoming,
+    }
+}
+
 // ============================================================================
 // Cache entry with metadata
 // ============================================================================
@@ -797,8 +910,6 @@ impl LivePoolCache {
                 orca.token_b_program = self.get_mint_program(&orca.token_mint_b);
             }
         }
-        let refresh_age = pool_state_has_reserve_basis(&state);
-        let new_fingerprint = pool_state_material_fingerprint(&state);
         match self.pools.entry(pool) {
             Entry::Vacant(v) => {
                 let stored_slot = if slot == 0 { 0 } else { slot };
@@ -812,6 +923,9 @@ impl LivePoolCache {
                 if slot > 0 && slot < prev.last_seen_slot {
                     return false;
                 }
+                state = merge_account_parse_preserves_existing(&prev.state, state, slot);
+                let refresh_age = pool_state_has_reserve_basis(&state);
+                let new_fingerprint = pool_state_material_fingerprint(&state);
                 let material_changed =
                     new_fingerprint != pool_state_material_fingerprint(&prev.state);
                 let stored_slot = if slot == 0 {
@@ -3167,6 +3281,382 @@ mod tests {
     }
 
     #[test]
+    fn upsert_account_parse_preserves_pump_reserves_and_pool_accounts() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint,
+                pool_base_token_account: base_vault,
+                pool_quote_token_account: quote_vault,
+                base_reserve: Some(1_000_000),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: pool_accounts.clone(),
+                creator: Some(Pubkey::new_unique()),
+            }),
+            10,
+        );
+
+        let new_base_vault = Pubkey::new_unique();
+        let new_quote_vault = Pubkey::new_unique();
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint,
+                pool_base_token_account: new_base_vault,
+                pool_quote_token_account: new_quote_vault,
+                base_reserve: None,
+                quote_reserve: None,
+                pool_accounts: Vec::new(),
+                creator: None,
+            }),
+            20,
+        );
+
+        let cached = cache.get(&pool).expect("cached");
+        let CachedPoolState::PumpAmm(s) = cached else {
+            panic!("expected pump amm");
+        };
+        assert_eq!(s.base_reserve, Some(1_000_000));
+        assert_eq!(s.quote_reserve, Some(50_000_000_000));
+        assert_eq!(s.pool_accounts.len(), 14);
+        assert!(s.creator.is_some());
+        assert_eq!(s.pool_base_token_account, new_base_vault);
+        assert_eq!(s.pool_quote_token_account, new_quote_vault);
+    }
+
+    #[test]
+    fn upsert_account_parse_preserves_orca_vault_balances_and_sqrt_price() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: mint_a,
+                token_mint_b: mint_b,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: -100,
+                sqrt_price: 1_000_000_000,
+                liquidity: 5_000_000,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 64,
+                vault_a_balance: Some(1_000_000_000),
+                vault_b_balance: Some(2_000_000_000),
+                token_a_program: Some(Pubkey::new_unique()),
+                token_b_program: None,
+                whirlpool_quote_account_seeded: true,
+            }),
+            10,
+        );
+
+        cache.upsert(
+            pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: mint_a,
+                token_mint_b: mint_b,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: -50,
+                sqrt_price: 2_000_000_000,
+                liquidity: 6_000_000,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 64,
+                vault_a_balance: None,
+                vault_b_balance: None,
+                token_a_program: None,
+                token_b_program: None,
+                whirlpool_quote_account_seeded: true,
+            }),
+            20,
+        );
+
+        let cached = cache.get(&pool).expect("cached");
+        let CachedPoolState::Orca(s) = cached else {
+            panic!("expected orca");
+        };
+        assert_eq!(s.vault_a_balance, Some(1_000_000_000));
+        assert_eq!(s.vault_b_balance, Some(2_000_000_000));
+        assert_eq!(s.sqrt_price, 2_000_000_000);
+        assert!(s.whirlpool_quote_account_seeded);
+        assert!(s.token_a_program.is_some());
+    }
+
+    #[test]
+    fn upsert_account_parse_preserves_raydium_cpmm_reserves() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: token,
+                token_1_mint: wsol,
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: Some(1_000_000),
+                reserve_1: Some(2_000_000),
+            }),
+            10,
+        );
+
+        cache.upsert(
+            pool,
+            CachedPoolState::RaydiumCpmm(RaydiumCpmmState {
+                token_0_mint: token,
+                token_1_mint: wsol,
+                token_0_vault: Pubkey::new_unique(),
+                token_1_vault: Pubkey::new_unique(),
+                reserve_0: None,
+                reserve_1: None,
+            }),
+            20,
+        );
+
+        let cached = cache.get(&pool).expect("cached");
+        let CachedPoolState::RaydiumCpmm(s) = cached else {
+            panic!("expected raydium cpmm");
+        };
+        assert_eq!(s.reserve_0, Some(1_000_000));
+        assert_eq!(s.reserve_1, Some(2_000_000));
+    }
+
+    fn test_meteora_cpmm_state_with_vaults(
+        token_0_mint: Pubkey,
+        token_1_mint: Pubkey,
+        token_0_vault: Pubkey,
+        token_1_vault: Pubkey,
+        reserve_0: u64,
+        reserve_1: u64,
+    ) -> MeteoraCpmmState {
+        MeteoraCpmmState {
+            token_0_mint,
+            token_1_mint,
+            token_0_vault,
+            token_1_vault,
+            amm_config: Pubkey::new_unique(),
+            observation_key: Pubkey::new_unique(),
+            token_0_program: Pubkey::new_unique(),
+            token_1_program: Pubkey::new_unique(),
+            reserve_0,
+            reserve_1,
+            mint_0_decimals: 6,
+            mint_1_decimals: 9,
+            status: 1,
+        }
+    }
+
+    #[test]
+    fn upsert_account_parse_preserves_meteora_cpmm_reserves_on_zero_zero_sentinel() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let v0 = Pubkey::new_unique();
+        let v1 = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 1_000_000, 2_000_000,
+            )),
+            10,
+        );
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 0, 0,
+            )),
+            20,
+        );
+
+        let cached = cache.get(&pool).expect("cached");
+        let CachedPoolState::MeteoraCpmm(s) = cached else {
+            panic!("expected meteora cpmm");
+        };
+        assert_eq!(s.reserve_0, 1_000_000);
+        assert_eq!(s.reserve_1, 2_000_000);
+    }
+
+    #[test]
+    fn upsert_account_parse_meteora_cpmm_partial_observation_applies_including_zero_leg() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let v0 = Pubkey::new_unique();
+        let v1 = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 1_000_000, 2_000_000,
+            )),
+            10,
+        );
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 500_000, 0,
+            )),
+            20,
+        );
+
+        let cached = cache.get(&pool).expect("cached");
+        let CachedPoolState::MeteoraCpmm(s) = cached else {
+            panic!("expected meteora cpmm");
+        };
+        assert_eq!(s.reserve_0, 500_000);
+        assert_eq!(
+            s.reserve_1, 0,
+            "observed zero leg must not be preserved from existing"
+        );
+    }
+
+    #[test]
+    fn meteora_cpmm_vault_tick_zero_after_preserve_upsert() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let token = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let v0 = Pubkey::new_unique();
+        let v1 = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 1_000_000, 2_000_000,
+            )),
+            10,
+        );
+
+        cache.upsert(
+            pool,
+            CachedPoolState::MeteoraCpmm(test_meteora_cpmm_state_with_vaults(
+                token, wsol, v0, v1, 0, 0,
+            )),
+            20,
+        );
+
+        cache.update_vault_balance(&v0, 0, 30);
+
+        let cached = cache.get(&pool).expect("cached");
+        let CachedPoolState::MeteoraCpmm(s) = cached else {
+            panic!("expected meteora cpmm");
+        };
+        assert_eq!(
+            s.reserve_0, 0,
+            "vault tick must apply genuine zero after preserve upsert"
+        );
+        assert_eq!(s.reserve_1, 2_000_000);
+    }
+
+    #[test]
+    fn upsert_observed_zero_vault_balance_replaces_existing() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap(),
+                pool_base_token_account: base_vault,
+                pool_quote_token_account: quote_vault,
+                base_reserve: Some(1_000_000),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: Vec::new(),
+                creator: None,
+            }),
+            10,
+        );
+
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap(),
+                pool_base_token_account: base_vault,
+                pool_quote_token_account: quote_vault,
+                base_reserve: Some(0),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: Vec::new(),
+                creator: None,
+            }),
+            20,
+        );
+
+        let cached = cache.get(&pool).expect("cached");
+        let CachedPoolState::PumpAmm(s) = cached else {
+            panic!("expected pump amm");
+        };
+        assert_eq!(s.base_reserve, Some(0));
+    }
+
+    #[test]
+    fn upsert_preserve_only_does_not_refresh_updated_at() {
+        use std::time::Duration;
+
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let with_reserves = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(1_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: vec![Pubkey::new_unique(); 14],
+            creator: Some(Pubkey::new_unique()),
+        });
+        let partial_parse = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: None,
+            quote_reserve: None,
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+
+        cache.upsert(pool, with_reserves, 10);
+        std::thread::sleep(Duration::from_millis(40));
+        let (_, _, age_before) = cache.get_with_metadata(&pool).expect("cached");
+        cache.upsert(pool, partial_parse, 20);
+        let (_, slot_after, age_after) = cache.get_with_metadata(&pool).expect("cached");
+        assert_eq!(
+            slot_after, 10,
+            "preserve-only must not advance material slot"
+        );
+        assert!(
+            age_after >= age_before,
+            "preserve-only must not refresh updated_at"
+        );
+        assert_eq!(cache.get_last_seen_slot(&pool), Some(20));
+    }
+
+    #[test]
     fn touch_freshness_skipped_for_zero_reserve_rows() {
         use std::time::Duration;
 
@@ -3913,13 +4403,13 @@ mod tests {
         );
         assert!(cache.pump_amm_quote_ready_by_base_mint(&base_mint));
 
-        // Stale / pre-hydration: accounts present but reserves missing (quote would fail).
+        // Partial account parse omits reserves (None) — vault-tick reserves must survive upsert.
         cache.upsert(
             pool_market,
             make_pump_amm_state(base_mint, quote_mint, None, None, pool_accounts.clone()),
             101,
         );
-        assert!(!cache.pump_amm_quote_ready_by_base_mint(&base_mint));
+        assert!(cache.pump_amm_quote_ready_by_base_mint(&base_mint));
 
         // Degenerate reserves
         cache.upsert(
