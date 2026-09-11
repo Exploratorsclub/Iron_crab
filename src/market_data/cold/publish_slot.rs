@@ -43,9 +43,14 @@ pub fn observe_cold_path_rpc_context_slot_lag(rpc_context_slot: u64) {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    /// Serializes store+assert on process-global `MARKET_DATA_GEYSER_HEAD_SLOT` across parallel tests.
+    static GEYSER_HEAD_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn resolve_prefers_rpc_context_slot_when_positive() {
+        let _guard = GEYSER_HEAD_TEST_LOCK.lock().expect("geyser head test lock");
         crate::metrics::MARKET_DATA_GEYSER_HEAD_SLOT.store(436_771_131, Ordering::Relaxed);
         assert_eq!(
             resolve_cold_path_publish_slot(436_375_700),
@@ -56,6 +61,7 @@ mod tests {
 
     #[test]
     fn resolve_falls_back_to_geyser_head_when_rpc_context_zero() {
+        let _guard = GEYSER_HEAD_TEST_LOCK.lock().expect("geyser head test lock");
         let head = 99_001_234u64;
         crate::metrics::MARKET_DATA_GEYSER_HEAD_SLOT.store(head, Ordering::Relaxed);
         assert_eq!(resolve_cold_path_publish_slot(0), head);
@@ -63,6 +69,7 @@ mod tests {
 
     #[test]
     fn resolve_does_not_elevate_stale_rpc_context_to_head() {
+        let _guard = GEYSER_HEAD_TEST_LOCK.lock().expect("geyser head test lock");
         crate::metrics::MARKET_DATA_GEYSER_HEAD_SLOT.store(436_771_131, Ordering::Relaxed);
         assert_eq!(
             resolve_cold_path_publish_slot(436_771_116),
