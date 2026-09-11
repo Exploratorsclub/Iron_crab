@@ -1974,8 +1974,15 @@ pub fn md_sidefx_process_vault_balance_tick(
         return;
     };
     if vault_view.dex == "restored" {
-        inc_market_data_vault_tick_dropped("restored");
-        return;
+        let cache_has_quotable_dex = host
+            .live_pool_cache()
+            .get(&vault_view.pool_address)
+            .and_then(|state| pool_cache_balance_fields_from_state(&state))
+            .is_some();
+        if !cache_has_quotable_dex {
+            inc_market_data_vault_tick_dropped("restored");
+            return;
+        }
     }
     let prev_balance = vault_view
         .last_balance
@@ -1987,18 +1994,38 @@ pub fn md_sidefx_process_vault_balance_tick(
     }
     scratch.note_vault_touch(*vault_pubkey, *update_class);
 
-    let (mut final_base, mut final_quote) = host
-        .snapshot_vault_pair_balances(vault_pubkey, *balance)
-        .unwrap_or((*balance, 0));
+    host.live_pool_cache()
+        .update_vault_balance(vault_pubkey, *balance, *slot);
+    inc_market_data_vault_tick_applied(if update_class.is_exec_hot() {
+        "exec_hot"
+    } else {
+        "enrich"
+    });
+
+    let (mut final_base, mut final_quote) = if vault_view.dex == "restored" {
+        // Restored membership rows lack reliable base/quote orientation; MASTER cache is authoritative.
+        host.live_pool_cache()
+            .get(&vault_view.pool_address)
+            .and_then(|state| pool_cache_balance_fields_from_state(&state))
+            .map(|(_, _, cache_base, cache_quote, _)| (cache_base, cache_quote))
+            .unwrap_or((0, 0))
+    } else {
+        host.snapshot_vault_pair_balances(vault_pubkey, *balance)
+            .unwrap_or((*balance, 0))
+    };
 
     // Prefer LivePoolCache MASTER when snapshot pair is incomplete.
-    if final_base == 0 || final_quote == 0 {
+    if vault_view.dex != "restored" && (final_base == 0 || final_quote == 0) {
         if let Some(state) = host.live_pool_cache().get(&vault_view.pool_address) {
             if let Some((_, _, cache_base, cache_quote, _)) =
                 pool_cache_balance_fields_from_state(&state)
             {
                 if cache_base > 0 && cache_quote > 0 {
                     final_base = cache_base;
+                    final_quote = cache_quote;
+                } else if final_base == 0 && cache_base > 0 {
+                    final_base = cache_base;
+                } else if final_quote == 0 && cache_quote > 0 {
                     final_quote = cache_quote;
                 }
             }
@@ -2010,29 +2037,43 @@ pub fn md_sidefx_process_vault_balance_tick(
         return;
     }
 
-    host.live_pool_cache()
-        .update_vault_balance(vault_pubkey, *balance, *slot);
-    inc_market_data_vault_tick_applied(if update_class.is_exec_hot() {
-        "exec_hot"
-    } else {
-        "enrich"
-    });
+    let pair_publishable = final_base > 0 && final_quote > 0;
 
-    let publish_jetstream = update_class.is_exec_hot();
-    if publish_jetstream && host.nats_enabled() {
+    let (publish_dex, publish_base_mint, publish_quote_mint) = if vault_view.dex == "restored" {
+        host.live_pool_cache()
+            .get(&vault_view.pool_address)
+            .and_then(|state| pool_cache_balance_fields_from_state(&state))
+            .map(|(base_mint, quote_mint, _, _, dex)| (dex.to_string(), base_mint, quote_mint))
+            .unwrap_or((
+                vault_view.dex.clone(),
+                vault_view.base_mint,
+                vault_view.quote_mint,
+            ))
+    } else {
+        (
+            vault_view.dex.clone(),
+            vault_view.base_mint,
+            vault_view.quote_mint,
+        )
+    };
+
+    let publish_jetstream = host.nats_enabled()
+        && pair_publishable
+        && (update_class.is_exec_hot() || host.is_hot_pool(&vault_view.pool_address));
+    if publish_jetstream {
         let mut balance_update = PoolCacheUpdate::new_balance_updated(
             "market-data",
             host.build_version(),
             run_id,
             vault_view.pool_address.to_string(),
-            vault_view.dex.clone(),
-            vault_view.base_mint.to_string(),
-            vault_view.quote_mint.to_string(),
+            publish_dex.clone(),
+            publish_base_mint.to_string(),
+            publish_quote_mint.to_string(),
             final_base,
             final_quote,
             *slot,
         );
-        if vault_view.dex == "raydium_cpmm" {
+        if publish_dex == "raydium_cpmm" {
             if let Some(CachedPoolState::RaydiumCpmm(ref s)) =
                 host.live_pool_cache().get(&vault_view.pool_address)
             {
@@ -2048,7 +2089,7 @@ pub fn md_sidefx_process_vault_balance_tick(
                     .merge_raydium_cpmm_pool_readiness(vault_view.pool_address, readiness);
             }
         }
-        if vault_view.dex == "meteora_cpmm" {
+        if publish_dex == "meteora_cpmm" {
             if let Some(CachedPoolState::MeteoraCpmm(ref s)) =
                 host.live_pool_cache().get(&vault_view.pool_address)
             {
@@ -2068,7 +2109,7 @@ pub fn md_sidefx_process_vault_balance_tick(
                     .merge_meteora_cpmm_pool_readiness(vault_view.pool_address, readiness);
             }
         }
-        if vault_view.dex == "raydium" {
+        if publish_dex == "raydium" {
             if let Some(CachedPoolState::RaydiumAmm(ref s)) =
                 host.live_pool_cache().get(&vault_view.pool_address)
             {
@@ -2081,7 +2122,7 @@ pub fn md_sidefx_process_vault_balance_tick(
                     .merge_raydium_amm_pool_readiness(vault_view.pool_address, readiness);
             }
         }
-        if vault_view.dex == "orca" {
+        if publish_dex == "orca" {
             if let Some(CachedPoolState::Orca(ref s)) =
                 host.live_pool_cache().get(&vault_view.pool_address)
             {
@@ -2096,7 +2137,7 @@ pub fn md_sidefx_process_vault_balance_tick(
                     .merge_orca_pool_readiness(vault_view.pool_address, readiness);
             }
         }
-        if vault_view.dex == "meteora_dlmm" {
+        if publish_dex == "meteora_dlmm" {
             if let Some(CachedPoolState::Meteora(ref s)) =
                 host.live_pool_cache().get(&vault_view.pool_address)
             {
@@ -2136,7 +2177,7 @@ pub fn md_sidefx_process_vault_balance_tick(
             slot = slot,
             "MASTER CACHE: PoolCacheUpdate::BalanceUpdated enqueued for JetStream"
         );
-    } else if !update_class.is_exec_hot() {
+    } else if !update_class.is_exec_hot() && !host.is_hot_pool(&vault_view.pool_address) {
         inc_market_data_md_sidefx_enrich_publish_skipped_total();
     }
 
@@ -2149,11 +2190,11 @@ pub fn md_sidefx_process_vault_balance_tick(
         Some(*slot),
         MarketEventKind::PoolStateUpdate {
             pool_address: vault_view.pool_address.to_string(),
-            dex: vault_view.dex.clone(),
+            dex: publish_dex,
             reserve_base: final_base,
             reserve_quote: final_quote,
-            base_mint: vault_view.base_mint.to_string(),
-            quote_mint: vault_view.quote_mint.to_string(),
+            base_mint: publish_base_mint.to_string(),
+            quote_mint: publish_quote_mint.to_string(),
             update_slot: *slot,
             active_id: vault_view.active_id,
             bin_step: vault_view.bin_step,
