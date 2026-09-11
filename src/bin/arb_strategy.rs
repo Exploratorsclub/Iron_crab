@@ -13550,7 +13550,7 @@ mod two_hop_price_tests {
         assert_eq!(vault.update_slot, 100);
         assert_eq!(vault.updated_at, event_updated_at);
         assert!(
-            pin_slave_snapshot_age_allowed(400_000) == false,
+            !pin_slave_snapshot_age_allowed(400_000),
             "gt_300s SLAVE age must be rejected for pin snapshot seed"
         );
         assert!(
