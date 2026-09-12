@@ -1,10 +1,17 @@
 //! Meteora DLMM bin-walking quote algorithm for accurate price calculation
 //!
-//! Phase 2: Implements bin-based liquidity distribution traversal
-//! for precise swap simulation (replacing constant product approximation)
+//! Program-near constant-price bin walk (Meteora DLMM), not per-bin xy=k CPMM.
 
 use anyhow::{ensure, Result};
 use std::cmp::min;
+use std::collections::HashMap;
+
+const BASIS_POINT_MAX: u128 = 10_000;
+const SCALE_OFFSET: u8 = 64;
+/// `1.0` in Q64.64.
+const ONE: u128 = 1u128 << SCALE_OFFSET;
+/// Above this exponent the result overflows the Q64.64 range (Meteora on-chain bound).
+const MAX_EXPONENTIAL: u32 = 0x80000;
 
 /// Single price bin in DLMM pool
 #[derive(Debug, Clone)]
@@ -13,9 +20,9 @@ pub struct Bin {
     pub id: i32,
     /// Liquidity in token X
     pub amount_x: u64,
-    /// Liquidity in token Y  
+    /// Liquidity in token Y
     pub amount_y: u64,
-    /// Price at this bin (derived from bin_id and bin_step)
+    /// Spot price at this bin (diagnostics / price impact only — not used for fill math)
     pub price: f64,
 }
 
@@ -48,156 +55,96 @@ impl BinWalker {
             amount_y,
             price,
         });
-        // Keep bins sorted by ID
         self.bins.sort_by_key(|b| b.id);
     }
 
-    /// Convert bin ID to price
+    /// Convert bin ID to price (diagnostics only).
     /// Formula: price = (1 + bin_step/10000)^bin_id
     pub fn bin_id_to_price(&self, bin_id: i32) -> f64 {
         let step_multiplier = 1.0 + (self.bin_step as f64 / 10000.0);
         step_multiplier.powi(bin_id)
     }
 
-    /// Simulate swap X→Y (ascending price bins)
+    /// Simulate swap X→Y (`swap_for_y = true`, walk downward).
     /// Returns (amount_out, bins_crossed, effective_fee_bps)
     pub fn quote_x_to_y(&self, amount_in: u64, fee_bps: u32) -> Result<(u64, usize, u32)> {
-        ensure!(amount_in > 0, "Amount must be positive");
-
-        // Apply fee once at the beginning
-        let fee_amount = (amount_in as u128 * fee_bps as u128) / 10000;
-        let amount_in_after_fee = amount_in.saturating_sub(fee_amount as u64);
-
-        if amount_in_after_fee == 0 {
-            return Ok((0, 0, fee_bps));
-        }
-
-        let mut remaining_in = amount_in_after_fee;
-        let mut total_out = 0u64;
-        let mut bins_crossed = 0usize;
-
-        // Walk bins from active_id upwards (X→Y increases price)
-        for bin in self.bins.iter().filter(|b| b.id >= self.active_id) {
-            if remaining_in == 0 {
-                break;
-            }
-
-            // Skip empty bins
-            if bin.amount_x == 0 || bin.amount_y == 0 {
-                continue;
-            }
-
-            // Max we can consume from this bin's Y (output side)
-            let max_available_y = bin.amount_y.saturating_sub(1);
-
-            if max_available_y == 0 {
-                continue;
-            }
-
-            // Constant product: x * y = k
-            // We add X (input), so new_x = x + remaining_in
-            // Solve for amount_y we get: amount_y = y - k/(x + remaining_in)
-            let k = bin.amount_x as u128 * bin.amount_y as u128;
-            let new_x = bin.amount_x as u128 + remaining_in as u128;
-            let new_y = k / new_x;
-
-            // Amount of Y we get out
-            let amount_out_from_bin = bin.amount_y.saturating_sub(new_y as u64);
-
-            if amount_out_from_bin == 0 {
-                continue;
-            }
-
-            // Cap output to available liquidity
-            let actual_out = min(amount_out_from_bin, max_available_y);
-
-            total_out = total_out.saturating_add(actual_out);
-
-            // Calculate how much input was actually consumed
-            if actual_out < amount_out_from_bin {
-                // Partial fill - recalculate consumed input
-                let actual_new_y = bin.amount_y.saturating_sub(actual_out);
-                let actual_new_x = k / actual_new_y as u128;
-                let consumed_x = actual_new_x.saturating_sub(bin.amount_x as u128) as u64;
-                remaining_in = remaining_in.saturating_sub(consumed_x);
-            } else {
-                // Full fill - consumed all remaining_in
-                remaining_in = 0;
-            }
-
-            bins_crossed += 1;
-
-            if remaining_in == 0 {
-                break;
-            }
-        }
-
-        Ok((total_out, bins_crossed, fee_bps))
+        self.quote_exact_in(amount_in, fee_bps, true)
     }
 
-    /// Simulate swap Y→X (descending price bins)
+    /// Simulate swap Y→X (`swap_for_y = false`, walk upward).
     pub fn quote_y_to_x(&self, amount_in: u64, fee_bps: u32) -> Result<(u64, usize, u32)> {
+        self.quote_exact_in(amount_in, fee_bps, false)
+    }
+
+    fn quote_exact_in(
+        &self,
+        amount_in: u64,
+        fee_bps: u32,
+        swap_for_y: bool,
+    ) -> Result<(u64, usize, u32)> {
         ensure!(amount_in > 0, "Amount must be positive");
 
-        // Apply fee once at the beginning
-        let fee_amount = (amount_in as u128 * fee_bps as u128) / 10000;
+        let fee_amount = (amount_in as u128 * fee_bps as u128) / 10_000;
         let amount_in_after_fee = amount_in.saturating_sub(fee_amount as u64);
 
         if amount_in_after_fee == 0 {
             return Ok((0, 0, fee_bps));
         }
 
+        if self.bins.is_empty() {
+            return Ok((0, 0, fee_bps));
+        }
+
+        let min_id = self.bins.first().map(|b| b.id).unwrap_or(self.active_id);
+        let max_id = self.bins.last().map(|b| b.id).unwrap_or(self.active_id);
+        let step: i32 = if swap_for_y { -1 } else { 1 };
+
+        let bin_map: HashMap<i32, (u64, u64)> = self
+            .bins
+            .iter()
+            .map(|b| (b.id, (b.amount_x, b.amount_y)))
+            .collect();
+
         let mut remaining_in = amount_in_after_fee;
         let mut total_out = 0u64;
         let mut bins_crossed = 0usize;
+        let mut current_id = self.active_id;
 
-        // Walk bins from active_id downwards (Y→X decreases price)
-        for bin in self.bins.iter().rev().filter(|b| b.id <= self.active_id) {
-            if remaining_in == 0 {
+        while remaining_in > 0 {
+            if swap_for_y && current_id < min_id {
+                break;
+            }
+            if !swap_for_y && current_id > max_id {
                 break;
             }
 
-            if bin.amount_x == 0 || bin.amount_y == 0 {
-                continue;
+            if let Some(&(amount_x, amount_y)) = bin_map.get(&current_id) {
+                let max_out = if swap_for_y { amount_y } else { amount_x };
+                if max_out > 0 {
+                    let price = get_price_from_id(current_id, self.bin_step).ok_or_else(|| {
+                        anyhow::anyhow!("DLMM price overflow for bin {}", current_id)
+                    })?;
+
+                    let ideal_out = get_amount_out(remaining_in, price, swap_for_y)?;
+                    let actual_out = min(ideal_out, max_out);
+
+                    if actual_out > 0 {
+                        total_out = total_out.saturating_add(actual_out);
+                        let consumed_in = if actual_out == ideal_out {
+                            remaining_in
+                        } else {
+                            get_amount_in(actual_out, price, swap_for_y)?
+                        };
+                        remaining_in = remaining_in.saturating_sub(consumed_in);
+                        bins_crossed += 1;
+                    }
+                }
             }
-
-            let max_available_x = bin.amount_x.saturating_sub(1);
-
-            if max_available_x == 0 {
-                continue;
-            }
-
-            // Constant product: x * y = k
-            // We add Y (input), so new_y = y + remaining_in
-            // Amount of X we get: amount_x = x - k/(y + remaining_in)
-            let k = bin.amount_x as u128 * bin.amount_y as u128;
-            let new_y = bin.amount_y as u128 + remaining_in as u128;
-            let new_x = k / new_y;
-
-            let amount_out_from_bin = bin.amount_x.saturating_sub(new_x as u64);
-
-            if amount_out_from_bin == 0 {
-                continue;
-            }
-
-            let actual_out = min(amount_out_from_bin, max_available_x);
-
-            total_out = total_out.saturating_add(actual_out);
-
-            if actual_out < amount_out_from_bin {
-                let actual_new_x = bin.amount_x.saturating_sub(actual_out);
-                let actual_new_y = k / actual_new_x as u128;
-                let consumed_y = actual_new_y.saturating_sub(bin.amount_y as u128) as u64;
-                remaining_in = remaining_in.saturating_sub(consumed_y);
-            } else {
-                remaining_in = 0;
-            }
-
-            bins_crossed += 1;
 
             if remaining_in == 0 {
                 break;
             }
+            current_id += step;
         }
 
         Ok((total_out, bins_crossed, fee_bps))
@@ -220,6 +167,114 @@ impl BinWalker {
     }
 }
 
+/// Q64.64 bin price: `(1 + bin_step/10_000)^bin_id`.
+fn get_price_from_id(active_id: i32, bin_step: u16) -> Option<u128> {
+    let bps = (bin_step as u128).checked_shl(SCALE_OFFSET.into())? / BASIS_POINT_MAX;
+    let base = ONE.checked_add(bps)?;
+    pow(base, active_id)
+}
+
+/// `base^exp` in Q64.64 (ported from Meteora on-chain / solana-protocols).
+fn pow(base: u128, exp: i32) -> Option<u128> {
+    let mut invert = exp.is_negative();
+
+    if exp == 0 {
+        return Some(ONE);
+    }
+
+    let exp: u32 = if invert {
+        exp.unsigned_abs()
+    } else {
+        exp as u32
+    };
+
+    if exp >= MAX_EXPONENTIAL {
+        return None;
+    }
+
+    let mut squared_base = base;
+    let mut result = ONE;
+
+    if squared_base >= result {
+        squared_base = u128::MAX.checked_div(squared_base)?;
+        invert = !invert;
+    }
+
+    macro_rules! pow_step {
+        ($mask:expr) => {
+            if exp & $mask > 0 {
+                result = (result.checked_mul(squared_base)?) >> SCALE_OFFSET;
+            }
+            squared_base = (squared_base.checked_mul(squared_base)?) >> SCALE_OFFSET;
+        };
+    }
+
+    pow_step!(0x1);
+    pow_step!(0x2);
+    pow_step!(0x4);
+    pow_step!(0x8);
+    pow_step!(0x10);
+    pow_step!(0x20);
+    pow_step!(0x40);
+    pow_step!(0x80);
+    pow_step!(0x100);
+    pow_step!(0x200);
+    pow_step!(0x400);
+    pow_step!(0x800);
+    pow_step!(0x1000);
+    pow_step!(0x2000);
+    pow_step!(0x4000);
+    pow_step!(0x8000);
+    pow_step!(0x10000);
+    pow_step!(0x20000);
+    if exp & 0x40000 > 0 {
+        result = (result.checked_mul(squared_base)?) >> SCALE_OFFSET;
+    }
+
+    if result == 0 {
+        return None;
+    }
+
+    if invert {
+        result = u128::MAX.checked_div(result)?;
+    }
+
+    Some(result)
+}
+
+/// `floor(a * b / 2^64)`
+fn mul_shr(a: u128, b: u128) -> Option<u128> {
+    Some((a.checked_mul(b)?) >> SCALE_OFFSET)
+}
+
+/// `floor(a * 2^64 / b)`
+fn shl_div(a: u128, b: u128) -> Option<u128> {
+    if b == 0 {
+        return None;
+    }
+    Some(a.checked_shl(SCALE_OFFSET.into())? / b)
+}
+
+fn get_amount_out(amount_in: u64, price: u128, swap_for_y: bool) -> Result<u64> {
+    let out = if swap_for_y {
+        mul_shr(amount_in as u128, price)
+    } else {
+        shl_div(amount_in as u128, price)
+    }
+    .ok_or_else(|| anyhow::anyhow!("DLMM amount_out overflow"))?;
+    u64::try_from(out).map_err(|_| anyhow::anyhow!("DLMM amount_out exceeds u64"))
+}
+
+fn get_amount_in(amount_out: u64, price: u128, swap_for_y: bool) -> Result<u64> {
+    let inp = if swap_for_y {
+        shl_div(amount_out as u128, price)
+    } else {
+        mul_shr(amount_out as u128, price)
+    }
+    .ok_or_else(|| anyhow::anyhow!("DLMM amount_in overflow"))?;
+    u64::try_from(inp).map_err(|_| anyhow::anyhow!("DLMM amount_in exceeds u64"))
+}
+
 /// DLMM fee estimate used by arb-strategy marginal probe (matches legacy arb formula).
 pub fn dlmm_fee_bps(bin_step: u16) -> u32 {
     10 + (bin_step as u32).min(100)
@@ -240,42 +295,114 @@ pub fn walker_from_bins(active_id: i32, bin_step: u16, bins: &[(i32, u64, u64)])
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_bin_walker_x_to_y() {
-        let mut walker = BinWalker::new(0, 10); // Active bin 0, 0.1% step
-
-        // Add bins with liquidity
-        walker.add_bin(0, 1_000_000_000, 100_000_000_000); // Active: 1000 SOL, 100k USDC
-        walker.add_bin(1, 500_000_000, 50_000_000_000); // Bin +1: 500 SOL, 50k USDC
-        walker.add_bin(2, 250_000_000, 25_000_000_000); // Bin +2: 250 SOL, 25k USDC
-
-        // Swap 1 SOL (X) for USDC (Y)
-        let (amount_out, bins_crossed, _fee) = walker
-            .quote_x_to_y(1_000_000, 30) // 1 SOL, 0.3% fee
-            .expect("Quote failed");
-
-        println!("1 SOL → {} USDC", amount_out as f64 / 1_000_000.0);
-        println!("Bins crossed: {}", bins_crossed);
-
-        assert!(amount_out > 99_000_000, "Should get ~100 USDC");
-        assert_eq!(bins_crossed, 1, "Should only use active bin for small swap");
+    fn in_after_fee(amount_in: u64, fee_bps: u32) -> u64 {
+        let fee = (amount_in as u128 * fee_bps as u128) / 10_000;
+        amount_in.saturating_sub(fee as u64)
     }
 
     #[test]
-    fn test_bin_walker_y_to_x() {
+    fn test_bin_walker_x_to_y_constant_price_active_bin() {
         let mut walker = BinWalker::new(0, 10);
+        walker.add_bin(0, 1_000_000_000, 100_000_000_000);
+        walker.add_bin(1, 500_000_000, 50_000_000_000);
+        walker.add_bin(2, 250_000_000, 25_000_000_000);
 
+        let amount_in = 1_000_000u64;
+        let fee_bps = 30u32;
+        let (amount_out, bins_crossed, _) = walker.quote_x_to_y(amount_in, fee_bps).unwrap();
+
+        let price = get_price_from_id(0, 10).unwrap();
+        let expected = mul_shr(in_after_fee(amount_in, fee_bps) as u128, price).unwrap() as u64;
+
+        assert_eq!(amount_out, expected);
+        assert_eq!(bins_crossed, 1);
+    }
+
+    #[test]
+    fn test_bin_walker_y_to_x_constant_price_active_bin() {
+        let mut walker = BinWalker::new(0, 10);
         walker.add_bin(-1, 500_000_000, 50_000_000_000);
         walker.add_bin(0, 1_000_000_000, 100_000_000_000);
 
-        // Swap USDC for SOL
-        let (amount_out, bins_crossed, _fee) = walker
-            .quote_y_to_x(100_000_000, 30) // 100 USDC
-            .expect("Quote failed");
+        let amount_in = 100_000_000u64;
+        let fee_bps = 30u32;
+        let (amount_out, bins_crossed, _) = walker.quote_y_to_x(amount_in, fee_bps).unwrap();
 
-        println!("100 USDC → {} SOL", amount_out as f64 / 1_000_000_000.0);
+        let price = get_price_from_id(0, 10).unwrap();
+        let expected = shl_div(in_after_fee(amount_in, fee_bps) as u128, price).unwrap() as u64;
 
-        assert!(amount_out > 0, "Should get SOL out");
+        assert_eq!(amount_out, expected);
         assert_eq!(bins_crossed, 1);
+    }
+
+    #[test]
+    fn test_one_sided_bin_x_to_y_produces_output() {
+        let mut walker = BinWalker::new(0, 10);
+        walker.add_bin(0, 0, 100_000_000);
+
+        let (amount_out, bins_crossed, _) = walker.quote_x_to_y(1_000_000, 30).unwrap();
+        assert!(amount_out > 0, "one-sided Y liquidity must quote X→Y");
+        assert_eq!(bins_crossed, 1);
+    }
+
+    #[test]
+    fn test_small_exact_in_matches_integer_formula_not_cpmm() {
+        let active_id = 5i32;
+        let bin_step = 100u16;
+        let mut walker = BinWalker::new(active_id, bin_step);
+        walker.add_bin(active_id, 10_000_000_000, 10_000_000_000);
+
+        let amount_in = 50_000u64;
+        let fee_bps = 0u32;
+        let (amount_out, _, _) = walker.quote_x_to_y(amount_in, fee_bps).unwrap();
+
+        let price = get_price_from_id(active_id, bin_step).unwrap();
+        let expected = mul_shr(amount_in as u128, price).unwrap() as u64;
+        assert_eq!(amount_out, expected);
+        assert!(price > ONE, "non-zero active_id must have price > 1");
+
+        let cpmm_k = 10_000_000_000u128 * 10_000_000_000u128;
+        let new_x = 10_000_000_000u128 + amount_in as u128;
+        let cpmm_out = 10_000_000_000u64 - (cpmm_k / new_x) as u64;
+        assert_ne!(
+            amount_out, cpmm_out,
+            "constant-price must diverge from xy=k"
+        );
+    }
+
+    #[test]
+    fn test_walk_x_to_y_descends_to_lower_neighbor() {
+        let mut walker = BinWalker::new(0, 10);
+        walker.add_bin(0, 0, 1_000);
+        walker.add_bin(-1, 0, 1_000_000_000);
+
+        let (amount_out, bins_crossed, _) = walker.quote_x_to_y(500_000, 0).unwrap();
+        assert!(amount_out > 1_000, "should continue into bin -1");
+        assert_eq!(bins_crossed, 2);
+    }
+
+    #[test]
+    fn test_amount_in_zero_is_error() {
+        let walker = BinWalker::new(0, 10);
+        assert!(walker.quote_x_to_y(0, 30).is_err());
+        assert!(walker.quote_y_to_x(0, 30).is_err());
+    }
+
+    #[test]
+    fn test_quote_monotonicity_larger_in_not_smaller_out() {
+        let mut walker = BinWalker::new(0, 25);
+        walker.add_bin(0, 1_000_000_000, 1_000_000_000);
+        walker.add_bin(-1, 0, 1_000_000_000);
+        walker.add_bin(-2, 0, 1_000_000_000);
+
+        let (small_out, _, _) = walker.quote_x_to_y(100_000, 30).unwrap();
+        let (large_out, _, _) = walker.quote_x_to_y(500_000, 30).unwrap();
+        assert!(large_out >= small_out);
+        assert!(small_out > 0);
+    }
+
+    #[test]
+    fn get_price_from_id_zero_is_one() {
+        assert_eq!(get_price_from_id(0, 10), Some(ONE));
     }
 }
