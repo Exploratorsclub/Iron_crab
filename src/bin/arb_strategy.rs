@@ -38,7 +38,7 @@ use ironcrab::arbitrage::in_flight::{
 };
 use ironcrab::arbitrage::{
     arb_track_removal_reason, classify_cross_dex_sell_failure, dlmm_marginal_price_plausible,
-    dlmm_quote_window_fingerprint, dlmm_sol_output_from_bins, dlmm_token_output_from_bins,
+    dlmm_quote_window_bins_fingerprint, dlmm_sol_output_from_bins, dlmm_token_output_from_bins,
     freshness_age_bucket, is_arb_route_executable, is_expected_token_output_plausible,
     is_quote_fresh_with_bins, populate_arb_slave_from_live_pool_cache,
     price_based_token_output_raw, quote_exact_in, quote_exact_in_with_freshness,
@@ -6539,7 +6539,19 @@ impl ArbContext {
                 }
             }
         }
-        let old_quote_window_fp = self.dlmm_quote_window_fingerprint_for_pool(pool_address);
+        let quote_window_ctx: Option<(i32, u64)> = {
+            let vaults = self.vault_balances.read();
+            match vaults.get(pool_address).and_then(|v| v.active_id) {
+                Some(active_id) => {
+                    let bins = self.get_bin_arrays(pool_address).unwrap_or_default();
+                    Some((
+                        active_id,
+                        dlmm_quote_window_bins_fingerprint(active_id, &bins),
+                    ))
+                }
+                None => None,
+            }
+        };
         let bins_count = bins.len();
         let mut cache = self.bin_arrays.write();
         let pool_cache = cache.entry(pool_address.to_string()).or_default();
@@ -6559,8 +6571,13 @@ impl ArbContext {
         inc_arb_dlmm_bin_array_update_applied_total();
         drop(cache);
 
-        let new_quote_window_fp = self.dlmm_quote_window_fingerprint_for_pool(pool_address);
-        let quote_window_changed = old_quote_window_fp != new_quote_window_fp;
+        let quote_window_changed = match quote_window_ctx {
+            Some((active_id, old_fp)) => {
+                let bins = self.get_bin_arrays(pool_address).unwrap_or_default();
+                dlmm_quote_window_bins_fingerprint(active_id, &bins) != old_fp
+            }
+            None => false,
+        };
 
         // Bin liquidity in the DLMM quote window is a valid price signal: refresh vault material slot.
         let now = Instant::now();
@@ -6814,14 +6831,6 @@ impl ArbContext {
                 .map(|(idx, cache)| (*idx, cache.bins.clone()))
                 .collect()
         })
-    }
-
-    fn dlmm_quote_window_fingerprint_for_pool(&self, pool_address: &str) -> Option<u64> {
-        let vaults = self.vault_balances.read();
-        let vault = vaults.get(pool_address)?;
-        let vault_q = vault_cache_to_quote_input(vault);
-        let bins = self.get_bin_arrays(pool_address).unwrap_or_default();
-        Some(dlmm_quote_window_fingerprint(&vault_q, &bins))
     }
 
     /// Update price from trade event

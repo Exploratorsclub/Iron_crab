@@ -97,6 +97,14 @@ fn filter_bins_to_quote_window(active_id: i32, bin_arrays: &DlmmBinArrays) -> Dl
     windowed
 }
 
+/// Fingerprint of DLMM bins inside the quote window only (no vault fields).
+pub fn dlmm_quote_window_bins_fingerprint(active_id: i32, bin_arrays: &DlmmBinArrays) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let windowed = filter_bins_to_quote_window(active_id, bin_arrays);
+    hash_dlmm_bins_for_fingerprint(&mut hasher, &windowed);
+    hasher.finish()
+}
+
 /// Fingerprint for DLMM ExecutableMarginal freshness: vault material + quote-window bins only.
 pub fn dlmm_quote_window_fingerprint(vault: &QuoteVaultInput, bin_arrays: &DlmmBinArrays) -> u64 {
     if let Some(active_id) = vault.active_id {
