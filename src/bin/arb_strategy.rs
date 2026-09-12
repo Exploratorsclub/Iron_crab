@@ -13846,7 +13846,8 @@ mod two_hop_price_tests {
     fn orca_and_dlmm_realistic_reserves_no_spread_too_large() {
         let reserve_base = 65_000_000u64;
         let reserve_quote = 1_000_000_000u64;
-        let active_id: i32 = 0;
+        // active_id aligned to ~65 USDC/SOL at bin_step=10 (constant-price Q64.64, not reserve ratio).
+        let active_id: i32 = 2735;
         let bin_step: u16 = 10;
         let (bin_arrays, vault, token_decimals) =
             usdc_sol_dlmm_fixture(false, reserve_base, reserve_quote, active_id, bin_step);
