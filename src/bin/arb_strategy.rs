@@ -6378,7 +6378,8 @@ impl ArbContext {
                 drop(cache);
                 return false;
             }
-            if update.geyser_slot < existing.update_slot {
+            let slot_not_stale = update.geyser_slot >= existing.update_slot;
+            if !slot_not_stale {
                 drop(cache);
                 return false;
             }

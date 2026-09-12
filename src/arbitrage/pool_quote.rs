@@ -2929,7 +2929,16 @@ mod tests {
 
     #[test]
     fn dlmm_quote_window_fingerprint_ignores_far_bins() {
-        let vault = sample_vault(1_000_000_000_000, 1_000_000_000);
+        let vault = QuoteVaultInput {
+            reserve_base: 1_000_000_000_000,
+            reserve_quote: 1_000_000_000,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(0),
+            bin_step: Some(10),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: None,
+        };
         let mut near_bins: DlmmBinArrays = HashMap::new();
         near_bins.insert(
             0,
