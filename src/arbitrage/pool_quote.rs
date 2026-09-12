@@ -19,6 +19,8 @@ use solana_sdk::pubkey::Pubkey;
 pub const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 /// Small SOL probe for DLMM marginal price / screening (0.01 SOL).
 pub const DLMM_PROBE_SOL_LAMPORTS: u64 = 10_000_000;
+/// One Meteora DLMM bin-array width; quote-window fingerprint includes bins within this distance of `active_id` (A.48).
+pub const DLMM_QUOTE_WINDOW_BINS: i32 = 70;
 /// Trade-implied quote TTL (v2 default 30s).
 pub const TRADE_TTL_MS: u64 = 30_000;
 /// Vault/bin state TTL when reserve snapshot unchanged (v2 default 120s).
@@ -73,6 +75,43 @@ fn hash_dlmm_bins_for_fingerprint(hasher: &mut DefaultHasher, bins: &DlmmBinArra
                 bin.amount_y.hash(hasher);
             }
         }
+    }
+}
+
+fn filter_bins_to_quote_window(active_id: i32, bin_arrays: &DlmmBinArrays) -> DlmmBinArrays {
+    let mut windowed = HashMap::new();
+    for (array_idx, bins) in bin_arrays {
+        let filtered: Vec<BinData> = bins
+            .iter()
+            .filter(|bin| {
+                let bin_id =
+                    (*array_idx * DLMM_QUOTE_WINDOW_BINS as i64 + bin.offset as i64) as i32;
+                (bin_id - active_id).abs() <= DLMM_QUOTE_WINDOW_BINS
+            })
+            .cloned()
+            .collect();
+        if !filtered.is_empty() {
+            windowed.insert(*array_idx, filtered);
+        }
+    }
+    windowed
+}
+
+/// Fingerprint of DLMM bins inside the quote window only (no vault fields).
+pub fn dlmm_quote_window_bins_fingerprint(active_id: i32, bin_arrays: &DlmmBinArrays) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let windowed = filter_bins_to_quote_window(active_id, bin_arrays);
+    hash_dlmm_bins_for_fingerprint(&mut hasher, &windowed);
+    hasher.finish()
+}
+
+/// Fingerprint for DLMM ExecutableMarginal freshness: vault material + quote-window bins only.
+pub fn dlmm_quote_window_fingerprint(vault: &QuoteVaultInput, bin_arrays: &DlmmBinArrays) -> u64 {
+    if let Some(active_id) = vault.active_id {
+        let windowed = filter_bins_to_quote_window(active_id, bin_arrays);
+        state_fingerprint_with_bins(vault, Some(&windowed))
+    } else {
+        state_fingerprint(vault)
     }
 }
 
@@ -2894,6 +2933,43 @@ mod tests {
                 .expect("fingerprint mismatch");
         assert_eq!(diagnosis.kind, QuoteNotFreshKind::ExecutableMarginal);
         assert_eq!(diagnosis.cause, QuoteNotFreshCause::FingerprintMismatch);
+    }
+
+    #[test]
+    fn dlmm_quote_window_fingerprint_ignores_far_bins() {
+        let vault = QuoteVaultInput {
+            reserve_base: 1_000_000_000_000,
+            reserve_quote: 1_000_000_000,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(0),
+            bin_step: Some(10),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: None,
+        };
+        let mut near_bins: DlmmBinArrays = HashMap::new();
+        near_bins.insert(
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 100,
+                amount_y: 200,
+            }],
+        );
+        let mut far_bins = near_bins.clone();
+        far_bins.insert(
+            2,
+            vec![BinData {
+                offset: 0,
+                amount_x: 9_999,
+                amount_y: 8_888,
+            }],
+        );
+        assert_eq!(
+            dlmm_quote_window_fingerprint(&vault, &near_bins),
+            dlmm_quote_window_fingerprint(&vault, &far_bins),
+            "bins outside ±70 of active_id must not affect quote-window fingerprint"
+        );
     }
 
     #[test]
