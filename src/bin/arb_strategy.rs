@@ -540,9 +540,7 @@ fn live_pool_cache_fresher_than_vault(
     new_vault: &VaultBalanceCache,
     existing: &VaultBalanceCache,
 ) -> bool {
-    if state_fingerprint(&vault_cache_to_quote_input(new_vault))
-        == state_fingerprint(&vault_cache_to_quote_input(existing))
-    {
+    if vault_material_unchanged(new_vault, existing) {
         return false;
     }
     new_vault.update_slot > existing.update_slot || new_vault.updated_at > existing.updated_at
