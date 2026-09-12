@@ -247,12 +247,28 @@ fn mul_shr(a: u128, b: u128) -> Option<u128> {
     Some((a.checked_mul(b)?) >> SCALE_OFFSET)
 }
 
+/// `ceil(a * b / 2^64)`
+fn mul_shr_ceil(a: u128, b: u128) -> Option<u128> {
+    let product = a.checked_mul(b)?;
+    let mask = (1u128 << SCALE_OFFSET) - 1;
+    Some((product + mask) >> SCALE_OFFSET)
+}
+
 /// `floor(a * 2^64 / b)`
 fn shl_div(a: u128, b: u128) -> Option<u128> {
     if b == 0 {
         return None;
     }
     Some(a.checked_shl(SCALE_OFFSET.into())? / b)
+}
+
+/// `ceil(a * 2^64 / b)`
+fn shl_div_ceil(a: u128, b: u128) -> Option<u128> {
+    if b == 0 {
+        return None;
+    }
+    let numerator = a.checked_shl(SCALE_OFFSET.into())?;
+    Some(numerator.div_ceil(b))
 }
 
 fn get_amount_out(amount_in: u64, price: u128, swap_for_y: bool) -> Result<u64> {
@@ -267,9 +283,9 @@ fn get_amount_out(amount_in: u64, price: u128, swap_for_y: bool) -> Result<u64> 
 
 fn get_amount_in(amount_out: u64, price: u128, swap_for_y: bool) -> Result<u64> {
     let inp = if swap_for_y {
-        shl_div(amount_out as u128, price)
+        shl_div_ceil(amount_out as u128, price)
     } else {
-        mul_shr(amount_out as u128, price)
+        mul_shr_ceil(amount_out as u128, price)
     }
     .ok_or_else(|| anyhow::anyhow!("DLMM amount_in overflow"))?;
     u64::try_from(inp).map_err(|_| anyhow::anyhow!("DLMM amount_in exceeds u64"))
@@ -404,5 +420,45 @@ mod tests {
     #[test]
     fn get_price_from_id_zero_is_one() {
         assert_eq!(get_price_from_id(0, 10), Some(ONE));
+    }
+
+    #[test]
+    fn test_get_amount_in_ceil_when_bin_output_capped() {
+        let active_id = 7i32;
+        let bin_step = 100u16;
+        let price = get_price_from_id(active_id, bin_step).unwrap();
+        let capped_out = 1_337u64;
+
+        let floor_in = shl_div(capped_out as u128, price).unwrap();
+        let ceil_in = get_amount_in(capped_out, price, true).unwrap();
+        assert!(
+            ceil_in as u128 >= floor_in,
+            "ceil consumed input must not be below floor"
+        );
+        assert!(
+            ceil_in as u128 > floor_in,
+            "test requires price/amount where ceil > floor"
+        );
+
+        let mut walker = BinWalker::new(active_id, bin_step);
+        walker.add_bin(active_id, 10_000_000, capped_out);
+        walker.add_bin(active_id - 1, 0, 10_000_000_000);
+
+        let amount_in = 500_000u64;
+        let (total_out, bins_crossed, _) = walker.quote_x_to_y(amount_in, 0).unwrap();
+        assert_eq!(bins_crossed, 2, "active bin exhausted then neighbor");
+        assert!(total_out > capped_out);
+
+        let ideal_out_active = get_amount_out(amount_in, price, true).unwrap();
+        assert!(
+            ideal_out_active > capped_out,
+            "input must exceed active bin output cap"
+        );
+        let consumed_active = get_amount_in(capped_out, price, true).unwrap();
+        assert!(
+            consumed_active as u128 >= floor_in,
+            "partial fill must charge at least ceil(required_in)"
+        );
+        assert!(amount_in > consumed_active, "must leave input for next bin");
     }
 }
