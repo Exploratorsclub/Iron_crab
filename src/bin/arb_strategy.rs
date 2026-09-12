@@ -38,17 +38,17 @@ use ironcrab::arbitrage::in_flight::{
 };
 use ironcrab::arbitrage::{
     arb_track_removal_reason, classify_cross_dex_sell_failure, dlmm_marginal_price_plausible,
-    dlmm_sol_output_from_bins, dlmm_token_output_from_bins, freshness_age_bucket,
-    is_arb_route_executable, is_expected_token_output_plausible, is_quote_fresh_with_bins,
-    populate_arb_slave_from_live_pool_cache, price_based_token_output_raw, quote_exact_in,
-    quote_exact_in_with_freshness, quote_sell_round_trip, quotes_pairable,
-    round_trip_profit_lamports, select_arb_track_pools, select_round_trip_pools, state_fingerprint,
-    sync_arb_slave_from_pool_cache_update, MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch,
-    NoCrossDexSellDetailReason, PoolQuote, QuoteFreshnessConfig, QuoteKind, QuotePoolInput,
-    QuoteVaultInput, RoundTripInsufficient, RoundTripInsufficientSubreason, RoundTripLeg,
-    RoundTripPoolCandidate, RoundTripSelectFailure, SellQuoteNoneDetailReason,
-    TrackCandidateCounts, TrackMintInput, TrackPoolInput, TrackPoolReadiness, TrackSelectionConfig,
-    DLMM_PROBE_SOL_LAMPORTS,
+    dlmm_quote_window_bins_fingerprint, dlmm_sol_output_from_bins, dlmm_token_output_from_bins,
+    freshness_age_bucket, is_arb_route_executable, is_expected_token_output_plausible,
+    is_quote_fresh_with_bins, populate_arb_slave_from_live_pool_cache,
+    price_based_token_output_raw, quote_exact_in, quote_exact_in_with_freshness,
+    quote_sell_round_trip, quotes_pairable, round_trip_profit_lamports, select_arb_track_pools,
+    select_round_trip_pools, state_fingerprint, sync_arb_slave_from_pool_cache_update,
+    MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch, NoCrossDexSellDetailReason, PoolQuote,
+    QuoteFreshnessConfig, QuoteKind, QuotePoolInput, QuoteVaultInput, RoundTripInsufficient,
+    RoundTripInsufficientSubreason, RoundTripLeg, RoundTripPoolCandidate, RoundTripSelectFailure,
+    SellQuoteNoneDetailReason, TrackCandidateCounts, TrackMintInput, TrackPoolInput,
+    TrackPoolReadiness, TrackSelectionConfig, DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::bundle_auction::BundleAuctionParams;
@@ -540,9 +540,7 @@ fn live_pool_cache_fresher_than_vault(
     new_vault: &VaultBalanceCache,
     existing: &VaultBalanceCache,
 ) -> bool {
-    if state_fingerprint(&vault_cache_to_quote_input(new_vault))
-        == state_fingerprint(&vault_cache_to_quote_input(existing))
-    {
+    if vault_material_unchanged(new_vault, existing) {
         return false;
     }
     new_vault.update_slot > existing.update_slot || new_vault.updated_at > existing.updated_at
@@ -6373,17 +6371,16 @@ impl ArbContext {
             dlmm_sol_is_x,
             dlmm_token_x_mint,
         };
-        let should_apply = match cache.get(pool_address) {
-            None => true,
-            Some(existing) => {
-                update.geyser_slot >= existing.update_slot
-                    && (update.geyser_slot > existing.update_slot
-                        || !vault_material_unchanged(&new_vault, existing))
+        if let Some(existing) = cache.get(pool_address) {
+            if vault_material_unchanged(&new_vault, existing) {
+                drop(cache);
+                return false;
             }
-        };
-        if !should_apply {
-            drop(cache);
-            return false;
+            let slot_not_stale = update.geyser_slot >= existing.update_slot;
+            if !slot_not_stale {
+                drop(cache);
+                return false;
+            }
         }
         cache.insert(pool_address.to_string(), new_vault);
         inc_arb_vault_balance_applied_total();
@@ -6529,6 +6526,33 @@ impl ArbContext {
     ) {
         inc_arb_dlmm_bin_array_update_received_total();
         let new_fp = bin_array_material_fingerprint(&bins);
+        {
+            let cache = self.bin_arrays.read();
+            if let Some(pool_cache) = cache.get(pool_address) {
+                if let Some(existing) = pool_cache.get(&bin_array_index) {
+                    if bin_array_material_fingerprint(&existing.bins) == new_fp {
+                        return;
+                    }
+                    if update_slot < existing.update_slot {
+                        return;
+                    }
+                }
+            }
+        }
+        let quote_window_ctx: Option<(i32, u64)> = {
+            let vaults = self.vault_balances.read();
+            match vaults.get(pool_address).and_then(|v| v.active_id) {
+                Some(active_id) => {
+                    let bins = self.get_bin_arrays(pool_address).unwrap_or_default();
+                    Some((
+                        active_id,
+                        dlmm_quote_window_bins_fingerprint(active_id, &bins),
+                    ))
+                }
+                None => None,
+            }
+        };
+        let bins_count = bins.len();
         let mut cache = self.bin_arrays.write();
         let pool_cache = cache.entry(pool_address.to_string()).or_default();
         let material_changed = match pool_cache.get(&bin_array_index) {
@@ -6538,7 +6562,6 @@ impl ArbContext {
         if !material_changed {
             return;
         }
-        let bins_count = bins.len();
         if let Some(existing) = pool_cache.get(&bin_array_index) {
             if update_slot < existing.update_slot {
                 return;
@@ -6548,7 +6571,15 @@ impl ArbContext {
         inc_arb_dlmm_bin_array_update_applied_total();
         drop(cache);
 
-        // Bin liquidity updates are a valid DLMM price signal: refresh vault material slot.
+        let quote_window_changed = match quote_window_ctx {
+            Some((active_id, old_fp)) => {
+                let bins = self.get_bin_arrays(pool_address).unwrap_or_default();
+                dlmm_quote_window_bins_fingerprint(active_id, &bins) != old_fp
+            }
+            None => false,
+        };
+
+        // Bin liquidity in the DLMM quote window is a valid price signal: refresh vault material slot.
         let now = Instant::now();
         {
             let pinned = self.arb_pinned_pools.read();
@@ -6571,11 +6602,13 @@ impl ArbContext {
                 pin_class,
             ) {
                 // refreshed from live cache with material change
-            } else if let Some(v) = vault_cache.get_mut(pool_address) {
-                if update_slot >= v.update_slot {
-                    v.update_slot = update_slot;
+            } else if quote_window_changed {
+                if let Some(v) = vault_cache.get_mut(pool_address) {
+                    if update_slot >= v.update_slot {
+                        v.update_slot = update_slot;
+                    }
+                    v.updated_at = now;
                 }
-                v.updated_at = now;
             }
         }
         let read_wait = Instant::now();
@@ -13442,7 +13475,10 @@ mod two_hop_price_tests {
     }
 
     #[test]
-    fn pool_cache_update_consume_advances_slot_on_unchanged_reserves() {
+    fn pool_cache_update_consume_skips_higher_slot_on_unchanged_reserves() {
+        use ironcrab::metrics::ARB_VAULT_BALANCE_APPLIED_TOTAL;
+        use std::sync::atomic::Ordering;
+
         let cache = create_shared_cache();
         let ctx = test_arb_context(cache.clone());
         let token_mint = Pubkey::new_unique();
@@ -13474,7 +13510,80 @@ mod two_hop_price_tests {
             vault.updated_at = stale_updated_at;
         }
 
+        let applied_before = ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed);
         let slot_advance = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            reserves.0,
+            reserves.1,
+            110,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &slot_advance);
+        assert!(
+            !ctx.consume_vault_seed_from_pool_cache_update(&slot_advance),
+            "higher slot without material change must not apply (A.48 material-slot)"
+        );
+
+        let vaults = ctx.vault_balances.read();
+        let vault = vaults.get(&pool_str).expect("vault row");
+        assert_eq!(vault.update_slot, 100);
+        assert_eq!(vault.reserve_base, reserves.0);
+        assert_eq!(vault.reserve_quote, reserves.1);
+        assert_eq!(
+            vault.updated_at, stale_updated_at,
+            "unchanged material must not refresh updated_at"
+        );
+        assert_eq!(
+            ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed),
+            applied_before,
+            "unchanged material must not increment apply counter"
+        );
+    }
+
+    #[test]
+    fn pool_cache_update_consume_applies_higher_slot_on_material_change() {
+        use ironcrab::metrics::ARB_VAULT_BALANCE_APPLIED_TOTAL;
+        use std::sync::atomic::Ordering;
+
+        let cache = create_shared_cache();
+        let ctx = test_arb_context(cache.clone());
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+        let reserve_base = 1_000_000_000_000u64;
+        let reserve_quote = 2_000_000_000u64;
+
+        let initial = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            reserve_base,
+            reserve_quote,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &initial);
+        ctx.arb_pinned_pools.write().insert(pool_str.clone());
+        assert!(ctx.consume_vault_seed_from_pool_cache_update(&initial));
+
+        let stale_updated_at = Instant::now() - Duration::from_secs(60);
+        {
+            let mut vaults = ctx.vault_balances.write();
+            let vault = vaults.get_mut(&pool_str).expect("vault row");
+            vault.updated_at = stale_updated_at;
+        }
+
+        let applied_before = ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed);
+        let material_change = PoolCacheUpdate::new_balance_updated(
             TEST_COMPONENT,
             TEST_BUILD,
             TEST_RUN,
@@ -13482,28 +13591,166 @@ mod two_hop_price_tests {
             "orca".to_string(),
             mint_str,
             NATIVE_SOL_MINT.to_string(),
-            reserves.0,
-            reserves.1,
-            102,
+            reserve_base,
+            reserve_quote + 1,
+            110,
         );
-        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &slot_advance);
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &material_change);
+        assert!(ctx.consume_vault_seed_from_pool_cache_update(&material_change));
+
+        let vaults = ctx.vault_balances.read();
+        let vault = vaults.get(&pool_str).expect("vault row");
+        assert_eq!(vault.update_slot, 110);
+        assert_eq!(vault.reserve_quote, reserve_quote + 1);
         assert!(
-            ctx.consume_vault_seed_from_pool_cache_update(&slot_advance),
-            "newer slot with unchanged reserves must still apply for slot_delta alignment"
+            vault.updated_at > stale_updated_at,
+            "material change must refresh updated_at"
+        );
+        assert!(
+            ARB_VAULT_BALANCE_APPLIED_TOTAL.load(Ordering::Relaxed) > applied_before,
+            "material change must increment apply counter"
+        );
+    }
+
+    #[test]
+    fn pool_cache_update_consume_skips_older_slot_on_material_change() {
+        let cache = create_shared_cache();
+        let ctx = test_arb_context(cache.clone());
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+        let reserve_base = 1_000_000_000_000u64;
+        let reserve_quote = 2_000_000_000u64;
+
+        let initial = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str.clone(),
+            NATIVE_SOL_MINT.to_string(),
+            reserve_base,
+            reserve_quote,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &initial);
+        ctx.arb_pinned_pools.write().insert(pool_str.clone());
+        assert!(ctx.consume_vault_seed_from_pool_cache_update(&initial));
+
+        let older_material = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            mint_str,
+            NATIVE_SOL_MINT.to_string(),
+            reserve_base,
+            reserve_quote + 1,
+            90,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &older_material);
+        assert!(
+            !ctx.consume_vault_seed_from_pool_cache_update(&older_material),
+            "older slot with material change must be skipped"
         );
 
         let vaults = ctx.vault_balances.read();
         let vault = vaults.get(&pool_str).expect("vault row");
-        assert_eq!(vault.update_slot, 102);
-        assert_eq!(vault.reserve_base, reserves.0);
-        assert_eq!(vault.reserve_quote, reserves.1);
+        assert_eq!(vault.update_slot, 100);
+        assert_eq!(vault.reserve_quote, reserve_quote);
+    }
+
+    #[test]
+    fn bin_array_update_far_from_active_id_does_not_bump_vault_slot() {
+        let ctx = test_arb_context(create_shared_cache());
+        let pool_addr = "dlmmFarBinArray";
+        let active_id = 0i32;
+        let far_array_index = 2i64; // bin_ids 140..209, outside ±70 of active_id 0
+
+        ctx.vault_balances.write().insert(
+            pool_addr.to_string(),
+            VaultBalanceCache {
+                reserve_base: 1_000_000_000,
+                reserve_quote: 1_000_000_000,
+                update_slot: 50,
+                active_id: Some(active_id),
+                bin_step: Some(10),
+                updated_at: Instant::now() - Duration::from_secs(120),
+                dlmm_sol_is_x: true,
+                dlmm_token_x_mint: Some(NATIVE_SOL_MINT.to_string()),
+            },
+        );
+        ctx.handle_bin_array_update(
+            pool_addr,
+            far_array_index,
+            vec![BinData {
+                offset: 0,
+                amount_x: 9_999,
+                amount_y: 8_888,
+            }],
+            99,
+        );
+
+        let vaults = ctx.vault_balances.read();
+        let vault = vaults.get(pool_addr).expect("vault");
+        assert_eq!(
+            vault.update_slot, 50,
+            "far bin-array material change must not advance vault material slot"
+        );
+        let bins = ctx.bin_arrays.read();
         assert!(
-            vault.updated_at > stale_updated_at,
-            "slot sustain must refresh updated_at even when reserve fingerprint is unchanged"
+            bins.get(pool_addr)
+                .and_then(|p| p.get(&far_array_index))
+                .is_some(),
+            "far bin array must still be cached"
+        );
+    }
+
+    #[test]
+    fn bin_array_update_active_window_bumps_vault_slot() {
+        let ctx = test_arb_context(create_shared_cache());
+        let pool_addr = "dlmmActiveBinArray";
+        let active_id = 0i32;
+        let array_index = 0i64;
+
+        let stale_updated_at = Instant::now() - Duration::from_secs(120);
+        ctx.vault_balances.write().insert(
+            pool_addr.to_string(),
+            VaultBalanceCache {
+                reserve_base: 1_000_000_000,
+                reserve_quote: 1_000_000_000,
+                update_slot: 50,
+                active_id: Some(active_id),
+                bin_step: Some(10),
+                updated_at: stale_updated_at,
+                dlmm_sol_is_x: true,
+                dlmm_token_x_mint: Some(NATIVE_SOL_MINT.to_string()),
+            },
+        );
+
+        ctx.handle_bin_array_update(
+            pool_addr,
+            array_index,
+            vec![BinData {
+                offset: 0,
+                amount_x: 2_000_000_000,
+                amount_y: 2_000_000_000,
+            }],
+            88,
+        );
+
+        let vaults = ctx.vault_balances.read();
+        let vault = vaults.get(pool_addr).expect("vault");
+        assert_eq!(
+            vault.update_slot, 88,
+            "active quote-window bin change must advance vault material slot"
         );
         assert!(
-            vault.updated_at.elapsed() <= Duration::from_millis(MAX_PRICE_AGE_MS),
-            "sustained slot apply must stamp fresh updated_at"
+            vault.updated_at > stale_updated_at,
+            "active quote-window bin change must refresh updated_at"
         );
     }
 
