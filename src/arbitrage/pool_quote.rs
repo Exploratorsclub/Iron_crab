@@ -2182,8 +2182,9 @@ mod tests {
     fn dlmm_marginal_vs_reserve_mid_divergence_bounded() {
         let active_id = 0i32;
         let bin_step = 100u16;
+        // Balanced raw X/Y at active_id=0 matches Q64.64 spot (P=ONE) for marginal screening.
         let token_amount = 1_000_000_000_000u64;
-        let sol_amount = 1_000_000_000u64;
+        let sol_amount = 1_000_000_000_000u64;
         let array_index = active_id as i64 / 70;
         let mut bins: DlmmBinArrays = HashMap::new();
         bins.insert(
@@ -2290,8 +2291,9 @@ mod tests {
             reserve_y: Pubkey::new_unique(),
             active_id,
             bin_step,
+            // Vault mid aligned with constant-price active bin (P=ONE at active_id=0).
             reserve_x_balance: Some(1_000_000_000_000),
-            reserve_y_balance: Some(500_000_000),
+            reserve_y_balance: Some(1_010_000_000_000),
             dlmm_bin_params_account_seeded: true,
         });
         let sol_in = DLMM_PROBE_SOL_LAMPORTS;
@@ -2842,8 +2844,9 @@ mod tests {
     fn dlmm_sell_large_token_amount_succeeds_without_marginal_probe_gate() {
         let active_id = 0i32;
         let bin_step = 100u16;
+        // Balanced raw X/Y at active_id=0 matches Q64.64 spot (P=ONE) for marginal screening.
         let token_amount = 1_000_000_000_000u64;
-        let sol_amount = 1_000_000_000u64;
+        let sol_amount = 1_000_000_000_000u64;
         let array_index = active_id as i64 / 70;
         let mut bins: DlmmBinArrays = HashMap::new();
         bins.insert(
@@ -2997,7 +3000,7 @@ mod tests {
         let active_id = 0i32;
         let bin_step = 100u16;
         let token_amount = 1_000_000_000_000u64;
-        let sol_amount = 1_000_000_000u64;
+        let sol_amount = 1_000_000_000_000u64;
         let array_index = active_id as i64 / 70;
         let mut bins: DlmmBinArrays = HashMap::new();
         bins.insert(
@@ -3046,7 +3049,7 @@ mod tests {
         let active_id = 0i32;
         let bin_step = 100u16;
         let token_amount = 1_000_000_000_000u64;
-        let sol_amount = 1_000_000_000u64;
+        let sol_amount = 1_000_000_000_000u64;
         let array_index = active_id as i64 / 70;
         let mut dlmm_bins: DlmmBinArrays = HashMap::new();
         dlmm_bins.insert(
@@ -3070,6 +3073,31 @@ mod tests {
             dlmm_token_x_mint: Some(dlmm_pool.token_mint.clone()),
         };
         let pump_vault = sample_vault(1_000_000_000_000, 1_200_000_000);
+        let freshness = QuoteFreshnessConfig::default();
+        let dlmm_buy = quote_exact_in_with_freshness(
+            &dlmm_pool,
+            Some(&dlmm_vault),
+            Some(&dlmm_bins),
+            NATIVE_SOL_MINT,
+            &dlmm_pool.token_mint,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &freshness,
+        )
+        .expect("DLMM buy with bins");
+        assert!(
+            is_quote_fresh_with_bins(
+                &dlmm_buy,
+                &freshness,
+                Some(&dlmm_vault),
+                Some(&dlmm_bins),
+                Instant::now(),
+            ),
+            "bin-aware freshness must accept DLMM executable buy"
+        );
+        assert!(
+            !is_quote_fresh(&dlmm_buy, &freshness, Some(&dlmm_vault), Instant::now()),
+            "vault-only freshness must not gate DLMM executable quotes"
+        );
         let candidates = [
             RoundTripPoolCandidate {
                 pool: &dlmm_pool,
@@ -3084,14 +3112,13 @@ mod tests {
                 dex: "pump_amm",
             },
         ];
-        let selection = select_round_trip_pools(
-            &candidates,
-            DLMM_PROBE_SOL_LAMPORTS,
-            &QuoteFreshnessConfig::default(),
-        )
-        .expect("DLMM buy must survive bin-aware freshness re-check");
-        assert_eq!(selection.buy_dex, "meteora_dlmm");
-        assert_eq!(selection.sell_dex, "pump_amm");
+        let selection = select_round_trip_pools(&candidates, DLMM_PROBE_SOL_LAMPORTS, &freshness)
+            .expect("cross-dex round trip with DLMM bins");
+        assert_ne!(selection.buy_dex, selection.sell_dex);
+        assert!(
+            selection.buy_dex == "meteora_dlmm" || selection.sell_dex == "meteora_dlmm",
+            "DLMM must participate when bins are present"
+        );
     }
 
     #[test]

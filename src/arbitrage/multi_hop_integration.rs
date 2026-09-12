@@ -1407,7 +1407,7 @@ mod tests {
                 active_id,
                 bin_step,
                 reserve_x_balance: Some(1_000_000_000_000),
-                reserve_y_balance: Some(500_000_000),
+                reserve_y_balance: Some(1_010_000_000_000),
                 dlmm_bin_params_account_seeded: true,
             }),
             1,

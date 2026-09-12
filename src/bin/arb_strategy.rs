@@ -5482,6 +5482,13 @@ struct BinArrayCache {
     update_slot: u64,
 }
 
+fn bin_array_cache_at_slot(bins: Vec<BinData>, geyser_slot: u64) -> BinArrayCache {
+    BinArrayCache {
+        bins,
+        update_slot: geyser_slot,
+    }
+}
+
 impl ArbContext {
     fn next_intent_id(&self) -> String {
         let n = self.intent_counter.fetch_add(1, Ordering::Relaxed);
@@ -6522,7 +6529,7 @@ impl ArbContext {
         pool_address: &str,
         bin_array_index: i64,
         bins: Vec<BinData>,
-        update_slot: u64,
+        geyser_slot: u64,
     ) {
         inc_arb_dlmm_bin_array_update_received_total();
         let new_fp = bin_array_material_fingerprint(&bins);
@@ -6533,7 +6540,7 @@ impl ArbContext {
                     if bin_array_material_fingerprint(&existing.bins) == new_fp {
                         return;
                     }
-                    if update_slot < existing.update_slot {
+                    if geyser_slot < existing.update_slot {
                         return;
                     }
                 }
@@ -6563,11 +6570,11 @@ impl ArbContext {
             return;
         }
         if let Some(existing) = pool_cache.get(&bin_array_index) {
-            if update_slot < existing.update_slot {
+            if geyser_slot < existing.update_slot {
                 return;
             }
         }
-        pool_cache.insert(bin_array_index, BinArrayCache { bins, update_slot });
+        pool_cache.insert(bin_array_index, bin_array_cache_at_slot(bins, geyser_slot));
         inc_arb_dlmm_bin_array_update_applied_total();
         drop(cache);
 
@@ -6591,25 +6598,16 @@ impl ArbContext {
             let mut vault_cache = self.vault_balances.write();
             try_seed_dlmm_vault_on_bin_update(
                 pool_address,
-                update_slot,
+                geyser_slot,
                 &self.live_pool_cache,
                 &mut vault_cache,
             );
-            if try_refresh_vault_from_live_cache(
+            let _ = try_refresh_vault_from_live_cache(
                 pool_address,
                 &self.live_pool_cache,
                 &mut vault_cache,
                 pin_class,
-            ) {
-                // refreshed from live cache with material change
-            } else if quote_window_changed {
-                if let Some(v) = vault_cache.get_mut(pool_address) {
-                    if update_slot >= v.update_slot {
-                        v.update_slot = update_slot;
-                    }
-                    v.updated_at = now;
-                }
-            }
+            );
         }
         let read_wait = Instant::now();
         let mints_with_pool: Vec<String> = {
@@ -6647,9 +6645,20 @@ impl ArbContext {
             pool = %pool_address,
             bin_array_index,
             bins_count,
-            slot = update_slot,
+            slot = geyser_slot,
             "Bin array cached"
         );
+
+        if !quote_window_changed {
+            return;
+        }
+        let update_slot = geyser_slot;
+        if let Some(v) = self.vault_balances.write().get_mut(pool_address) {
+            if update_slot >= v.update_slot {
+                v.update_slot = update_slot;
+            }
+            v.updated_at = now;
+        }
     }
 
     /// Get cached vault balances for a pool (returns None if not cached)
@@ -14093,7 +14102,8 @@ mod two_hop_price_tests {
     fn orca_and_dlmm_realistic_reserves_no_spread_too_large() {
         let reserve_base = 65_000_000u64;
         let reserve_quote = 1_000_000_000u64;
-        let active_id: i32 = 0;
+        // active_id aligned to ~65 USDC/SOL at bin_step=10 (constant-price Q64.64, not reserve ratio).
+        let active_id: i32 = 2735;
         let bin_step: u16 = 10;
         let (bin_arrays, vault, token_decimals) =
             usdc_sol_dlmm_fixture(false, reserve_base, reserve_quote, active_id, bin_step);
