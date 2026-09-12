@@ -6602,22 +6602,12 @@ impl ArbContext {
                 &self.live_pool_cache,
                 &mut vault_cache,
             );
-            if try_refresh_vault_from_live_cache(
+            let _ = try_refresh_vault_from_live_cache(
                 pool_address,
                 &self.live_pool_cache,
                 &mut vault_cache,
                 pin_class,
-            ) {
-                // refreshed from live cache with material change
-            } else if quote_window_changed {
-                if let Some(v) = vault_cache.get_mut(pool_address) {
-                    if geyser_slot >= v.update_slot {
-                        let update_slot = geyser_slot;
-                        v.update_slot = update_slot;
-                    }
-                    v.updated_at = now;
-                }
-            }
+            );
         }
         let read_wait = Instant::now();
         let mints_with_pool: Vec<String> = {
@@ -6658,6 +6648,17 @@ impl ArbContext {
             slot = geyser_slot,
             "Bin array cached"
         );
+
+        if !quote_window_changed {
+            return;
+        }
+        let update_slot = geyser_slot;
+        if let Some(v) = self.vault_balances.write().get_mut(pool_address) {
+            if update_slot >= v.update_slot {
+                v.update_slot = update_slot;
+            }
+            v.updated_at = now;
+        }
     }
 
     /// Get cached vault balances for a pool (returns None if not cached)
