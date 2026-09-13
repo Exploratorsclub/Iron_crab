@@ -546,7 +546,19 @@ fn merge_meteora_cpmm_account_reserves_from_prior(
     }
 }
 
+fn preserve_layout_pubkey(incoming: Pubkey, existing: Pubkey) -> Pubkey {
+    if incoming == Pubkey::default() && existing != Pubkey::default() {
+        existing
+    } else {
+        incoming
+    }
+}
+
 fn merge_raydium_amm_account_fields_from_prior(new_am: &mut RaydiumAmmState, ex: &RaydiumAmmState) {
+    new_am.base_mint = preserve_layout_pubkey(new_am.base_mint, ex.base_mint);
+    new_am.quote_mint = preserve_layout_pubkey(new_am.quote_mint, ex.quote_mint);
+    new_am.coin_vault = preserve_layout_pubkey(new_am.coin_vault, ex.coin_vault);
+    new_am.pc_vault = preserve_layout_pubkey(new_am.pc_vault, ex.pc_vault);
     new_am.coin_reserve = preserve_option_reserve(new_am.coin_reserve, ex.coin_reserve);
     new_am.pc_reserve = preserve_option_reserve(new_am.pc_reserve, ex.pc_reserve);
     if new_am.market_id == Pubkey::default() && ex.market_id != Pubkey::default() {
@@ -579,6 +591,12 @@ pub fn merge_account_parse_preserves_existing(
 ) -> CachedPoolState {
     match (existing, incoming) {
         (CachedPoolState::PumpAmm(ex), CachedPoolState::PumpAmm(mut inc)) => {
+            inc.base_mint = preserve_layout_pubkey(inc.base_mint, ex.base_mint);
+            inc.quote_mint = preserve_layout_pubkey(inc.quote_mint, ex.quote_mint);
+            inc.pool_base_token_account =
+                preserve_layout_pubkey(inc.pool_base_token_account, ex.pool_base_token_account);
+            inc.pool_quote_token_account =
+                preserve_layout_pubkey(inc.pool_quote_token_account, ex.pool_quote_token_account);
             inc.base_reserve = preserve_option_reserve(inc.base_reserve, ex.base_reserve);
             inc.quote_reserve = preserve_option_reserve(inc.quote_reserve, ex.quote_reserve);
             if inc.pool_accounts.is_empty() && !ex.pool_accounts.is_empty() {
@@ -590,6 +608,10 @@ pub fn merge_account_parse_preserves_existing(
             CachedPoolState::PumpAmm(inc)
         }
         (CachedPoolState::Orca(ex), CachedPoolState::Orca(mut inc)) => {
+            inc.token_mint_a = preserve_layout_pubkey(inc.token_mint_a, ex.token_mint_a);
+            inc.token_mint_b = preserve_layout_pubkey(inc.token_mint_b, ex.token_mint_b);
+            inc.token_vault_a = preserve_layout_pubkey(inc.token_vault_a, ex.token_vault_a);
+            inc.token_vault_b = preserve_layout_pubkey(inc.token_vault_b, ex.token_vault_b);
             inc.vault_a_balance = preserve_option_reserve(inc.vault_a_balance, ex.vault_a_balance);
             inc.vault_b_balance = preserve_option_reserve(inc.vault_b_balance, ex.vault_b_balance);
             if inc.token_a_program.is_none() {
@@ -608,21 +630,23 @@ pub fn merge_account_parse_preserves_existing(
             CachedPoolState::RaydiumAmm(inc)
         }
         (CachedPoolState::RaydiumCpmm(ex), CachedPoolState::RaydiumCpmm(mut inc)) => {
+            inc.token_0_mint = preserve_layout_pubkey(inc.token_0_mint, ex.token_0_mint);
+            inc.token_1_mint = preserve_layout_pubkey(inc.token_1_mint, ex.token_1_mint);
+            inc.token_0_vault = preserve_layout_pubkey(inc.token_0_vault, ex.token_0_vault);
+            inc.token_1_vault = preserve_layout_pubkey(inc.token_1_vault, ex.token_1_vault);
             inc.reserve_0 = preserve_option_reserve(inc.reserve_0, ex.reserve_0);
             inc.reserve_1 = preserve_option_reserve(inc.reserve_1, ex.reserve_1);
             CachedPoolState::RaydiumCpmm(inc)
         }
         (CachedPoolState::Meteora(ex), CachedPoolState::Meteora(mut inc)) => {
+            inc.token_x_mint = preserve_layout_pubkey(inc.token_x_mint, ex.token_x_mint);
+            inc.token_y_mint = preserve_layout_pubkey(inc.token_y_mint, ex.token_y_mint);
+            inc.reserve_x = preserve_layout_pubkey(inc.reserve_x, ex.reserve_x);
+            inc.reserve_y = preserve_layout_pubkey(inc.reserve_y, ex.reserve_y);
             inc.reserve_x_balance =
                 preserve_option_reserve(inc.reserve_x_balance, ex.reserve_x_balance);
             inc.reserve_y_balance =
                 preserve_option_reserve(inc.reserve_y_balance, ex.reserve_y_balance);
-            if inc.reserve_x == Pubkey::default() && ex.reserve_x != Pubkey::default() {
-                inc.reserve_x = ex.reserve_x;
-            }
-            if inc.reserve_y == Pubkey::default() && ex.reserve_y != Pubkey::default() {
-                inc.reserve_y = ex.reserve_y;
-            }
             if ex.dlmm_bin_params_account_seeded {
                 inc.dlmm_bin_params_account_seeded = true;
             }
@@ -962,6 +986,18 @@ impl LivePoolCache {
         }
     }
 
+    /// Remove a pool row and drop its `vault_to_pool` mappings (unpin demote; not quote publish).
+    pub fn remove(&self, pool: &Pubkey) -> bool {
+        if let Some((_, entry)) = self.pools.remove(pool) {
+            for vault in Self::vault_pubkeys_for_pool_state(&entry.state) {
+                self.vault_to_pool.remove(&vault);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Refresh `updated_at` on an existing row with quotable reserve basis without changing slot/state.
     ///
     /// Used when a JetStream `BalanceUpdated` heartbeat arrives with a regressed slot (SLAVE ahead of
@@ -1073,6 +1109,20 @@ impl LivePoolCache {
                 }
                 entry.updated_at = Instant::now();
             }
+        }
+    }
+
+    fn vault_pubkeys_for_pool_state(state: &CachedPoolState) -> Vec<Pubkey> {
+        match state {
+            CachedPoolState::Orca(s) => vec![s.token_vault_a, s.token_vault_b],
+            CachedPoolState::RaydiumAmm(s) => vec![s.coin_vault, s.pc_vault],
+            CachedPoolState::RaydiumCpmm(s) => vec![s.token_0_vault, s.token_1_vault],
+            CachedPoolState::Meteora(s) => vec![s.reserve_x, s.reserve_y],
+            CachedPoolState::MeteoraCpmm(s) => vec![s.token_0_vault, s.token_1_vault],
+            CachedPoolState::PumpAmm(s) => {
+                vec![s.pool_base_token_account, s.pool_quote_token_account]
+            }
+            CachedPoolState::PumpFun(_) => Vec::new(),
         }
     }
 
@@ -3332,6 +3382,57 @@ mod tests {
         assert!(s.creator.is_some());
         assert_eq!(s.pool_base_token_account, new_base_vault);
         assert_eq!(s.pool_quote_token_account, new_quote_vault);
+    }
+
+    #[test]
+    fn upsert_account_parse_preserves_pump_layout_when_incoming_vault_pubkeys_default() {
+        let cache = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(crate::ipc::NATIVE_SOL_MINT).unwrap();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let pool_accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint,
+                pool_base_token_account: base_vault,
+                pool_quote_token_account: quote_vault,
+                base_reserve: Some(1_000_000),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: pool_accounts.clone(),
+                creator: Some(Pubkey::new_unique()),
+            }),
+            10,
+        );
+
+        cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint,
+                quote_mint,
+                pool_base_token_account: Pubkey::default(),
+                pool_quote_token_account: Pubkey::default(),
+                base_reserve: None,
+                quote_reserve: None,
+                pool_accounts: Vec::new(),
+                creator: None,
+            }),
+            20,
+        );
+
+        let cached = cache.get(&pool).expect("cached");
+        let CachedPoolState::PumpAmm(s) = cached else {
+            panic!("expected pump amm");
+        };
+        assert_eq!(s.pool_base_token_account, base_vault);
+        assert_eq!(s.pool_quote_token_account, quote_vault);
+        assert_eq!(s.base_reserve, Some(1_000_000));
+        assert_eq!(s.quote_reserve, Some(50_000_000_000));
+        assert_eq!(s.pool_accounts.len(), 14);
     }
 
     #[test]
