@@ -12,6 +12,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Fix**: Separates `PoolAddressBook` (TTL 120s, LRU 32k) für ungepinnte Layout-Keys; Pin promote → layout-only MASTER + Geyser-Register; Unpin demote zurück ins Buch. Hot Account-Upsert nur bei Pin; kein RPC / keine Extra-Subs.  
 **Dateien**: `src/execution/pool_address_book.rs`, `src/execution/live_pool_cache.rs`, `src/bin/market_data.rs`, `src/market_data/sidefx/handlers.rs`, `src/metrics.rs`
 
+### FIX-MD-PIN-POOL-EXPLICIT: Nach Pin Pool-Pubkey immer in Rohr B (A.52)
+**Datum**: 2026-09-14  
+**Problem**: TX-Layout-Seed schrieb Vaults in MASTER; `planned_explicit_pubkeys` enthielt den Pool-Pubkey nur für PumpFun → Whirlpool/lbPair/Raydium-AMM nie subscribed, Quotes/Bins tot trotz Pin.  
+**Fix**: Pool-Pubkey in geplanter Explicit-Gruppe für alle gepinnten DEX-States; Hot-Reserve-Satisfaction verlangt Pool-Account in Geyser-Flush solange Quote-Account unseeded; Prometheus address_book/promote/demote exportiert. Kein RPC.  
+**Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-V2-CHAIN-HEAD-PAIRING: v2 Round-Trip nur noch Chain-Head-Age, kein relatives Slot-Delta-Gate
 **Datum**: 2026-09-13  
 **Problem**: Prod Pump→Orca ~97% `slot_delta_exceeded`, `leg_slot_too_old=0` — relatives `|buy−sell|≤2` verworf formable Pairs bevor Age-vs-Head greift; Last-Trade-Slots im selben 2-Slot-Fenster sind kein realistisches Cross-DEX-Pairing.  
