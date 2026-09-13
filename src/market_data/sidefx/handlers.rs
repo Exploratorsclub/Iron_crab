@@ -1546,7 +1546,8 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
     }
 
     if let Some(mut cached_state) = parse_pool_account(owner, account_data) {
-        if !host.is_hot_pool(pool_pubkey) {
+        // Unpinned MASTER upsert only for AMM rows in the address book; PumpFun curve stays SSOT.
+        if !host.is_hot_pool(pool_pubkey) && !matches!(cached_state, CachedPoolState::PumpFun(_)) {
             return;
         }
         let prev_state = host.live_pool_cache().get(pool_pubkey);

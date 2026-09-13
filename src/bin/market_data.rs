@@ -14495,6 +14495,115 @@ mod pr_b_geyser_tracking_tests {
         data
     }
 
+    fn test_pump_amm_pool_account_data(
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        base_vault: Pubkey,
+        quote_vault: Pubkey,
+        creator: Pubkey,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; 211];
+        data[11..43].copy_from_slice(creator.as_ref());
+        data[43..75].copy_from_slice(base_mint.as_ref());
+        data[75..107].copy_from_slice(quote_mint.as_ref());
+        data[139..171].copy_from_slice(base_vault.as_ref());
+        data[171..203].copy_from_slice(quote_vault.as_ref());
+        data
+    }
+
+    #[test]
+    fn unpinned_account_decode_pumpfun_upserts_master_skips_amm_layouts() {
+        use ironcrab::market_data::sidefx::handlers::md_sidefx_process_live_pool_cache_account_update;
+        use ironcrab::market_data::sidefx::MdSidefxCommand;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let (md_state, _depth, _md_state_rx) = test_md_state_sender_no_worker();
+        let worker = test_sidefx_host(&ctx, md_state.clone(), test_noop_track_worker_sender());
+
+        let pumpfun_pool = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let pumpfun_data = test_pumpfun_bonding_curve_account_data(
+            1_073_000_000_000_000,
+            30_000_000_000,
+            500_000_000_000_000,
+            10_000_000_000,
+            creator,
+        );
+        let mut scratch = MdSidefxBurstScratch::new();
+        md_sidefx_process_live_pool_cache_account_update(
+            &worker,
+            &MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "unpinned-pf".into(),
+                pool_pubkey: pumpfun_pool,
+                owner: PUMPFUN_PROGRAM_OWNER,
+                account_data: pumpfun_data,
+                slot: 5,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::Enrich,
+            },
+            &mut scratch,
+        );
+        assert!(
+            matches!(
+                ctx.live_pool_cache.get(&pumpfun_pool),
+                Some(CachedPoolState::PumpFun(_))
+            ),
+            "unpinned PumpFun bonding curve must upsert MASTER"
+        );
+
+        let pump_amm_pool = Pubkey::new_unique();
+        let pump_amm_data = test_pump_amm_pool_account_data(
+            Pubkey::new_unique(),
+            Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        md_sidefx_process_live_pool_cache_account_update(
+            &worker,
+            &MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "unpinned-amm".into(),
+                pool_pubkey: pump_amm_pool,
+                owner: PUMPFUN_AMM_PROGRAM_OWNER,
+                account_data: pump_amm_data,
+                slot: 6,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::Enrich,
+            },
+            &mut scratch,
+        );
+        assert!(
+            ctx.live_pool_cache.get(&pump_amm_pool).is_none(),
+            "unpinned PumpAmm account decode must not upsert MASTER"
+        );
+
+        let cpmm_pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let cpmm_data =
+            test_raydium_cpmm_account_data(base, quote, Pubkey::new_unique(), Pubkey::new_unique());
+        md_sidefx_process_live_pool_cache_account_update(
+            &worker,
+            &MdSidefxCommand::LivePoolCacheAccountUpdate {
+                run_id: "unpinned-cpmm".into(),
+                pool_pubkey: cpmm_pool,
+                owner: RAYDIUM_CPMM_OWNER,
+                account_data: cpmm_data,
+                slot: 7,
+                grpc_recv_at: Instant::now(),
+                update_class: SidefxUpdateClass::Enrich,
+            },
+            &mut scratch,
+        );
+        assert!(
+            ctx.live_pool_cache.get(&cpmm_pool).is_none(),
+            "unpinned Raydium CPMM account decode must not upsert MASTER"
+        );
+    }
+
     #[test]
     fn planned_explicit_pubkeys_includes_pumpfun_bonding_curve() {
         let pool = Pubkey::new_unique();
