@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-V2-CHAIN-HEAD-PAIRING: v2 Round-Trip nur noch Chain-Head-Age, kein relatives Slot-Delta-Gate
+**Datum**: 2026-09-13  
+**Problem**: Prod Pump→Orca ~97% `slot_delta_exceeded`, `leg_slot_too_old=0` — relatives `|buy−sell|≤2` verworf formable Pairs bevor Age-vs-Head greift; Last-Trade-Slots im selben 2-Slot-Fenster sind kein realistisches Cross-DEX-Pairing.  
+**Fix**: Default `arb_max_leg_slot_delta=0` (Reject aus); einziges Pairing-Gate `chain_head_slot − leg.as_of_slot ≤ arb_max_leg_age_slots` (16); `chain_head_slot==0` fail-closed → `leg_slot_too_old`. Histogram `record_arb_quote_pair_slot_delta` bleibt Forensik.  
+**Dateien**: `src/bin/arb_strategy.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-ATA-3012: Arb ATA CreateIdempotent skip after full SELL + ATA close (Custom 3012)
 **Datum**: 2026-08-21  
 **Problem**: Cross-DEX Arb BUY sim-fail `InstructionError(2, Custom(3012))` — `token_wallet_snapshot_seen` war `true` weil `set_available_token_balance(mint, 0)` den Map-Key behielt; CreateIdempotent wurde fälschlich übersprungen.  

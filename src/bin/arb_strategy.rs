@@ -287,7 +287,7 @@ struct ArbConfig {
     arb_quote_trade_ttl_ms: u64,
     /// ExecutableMarginal state TTL for v2 freshness. Default: 120_000 ms.
     arb_quote_state_ttl_ms: u64,
-    /// Max allowed |buy.as_of_slot - sell.as_of_slot| for v2 round-trip (0 = gate off). Default: 2.
+    /// Forensics-only |buy.as_of_slot - sell.as_of_slot| threshold (0 = reject gate off). Default: 0.
     arb_max_leg_slot_delta: u64,
     /// Max allowed chain_head_slot - leg.as_of_slot for each v2 leg (0 = gate off). Default: 16.
     arb_max_leg_age_slots: u64,
@@ -314,7 +314,7 @@ impl Default for ArbConfig {
             arb_probe_follows_max_position: true,
             arb_quote_trade_ttl_ms: 30_000,
             arb_quote_state_ttl_ms: 120_000,
-            arb_max_leg_slot_delta: 2,
+            arb_max_leg_slot_delta: 0,
             arb_max_leg_age_slots: 16,
             bundle_auction: BundleAuctionParams::default(),
         };
@@ -3887,37 +3887,12 @@ impl TokenArbTracker {
         );
         let slot_delta = buy_as_of_slot.abs_diff(sell_as_of_slot);
         record_arb_quote_pair_slot_delta(buy_as_of_slot, sell_as_of_slot);
-        if config.arb_max_leg_slot_delta > 0 && slot_delta > config.arb_max_leg_slot_delta {
-            record_arb_round_trip_by_dex_pair(
-                &selection.buy_dex,
-                &selection.sell_dex,
-                "slot_delta",
-            );
-            log_v2_gate_forensics(
-                0,
-                "slot_delta",
-                &self.base_mint,
-                token_decimals,
-                probe,
-                &selection.buy_dex,
-                &selection.buy_pool_address,
-                buy_as_of_slot,
-                selection.buy_quote.amount_out,
-                &selection.sell_dex,
-                &selection.sell_pool_address,
-                sell_as_of_slot,
-                selection.sell_quote.amount_out,
-                slot_delta,
-                None,
-                None,
-            );
-            arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::SlotDeltaExceeded);
-            return None;
-        }
 
         if config.arb_max_leg_age_slots > 0 {
             let chain_slot = check_ctx.chain_head_slot;
-            if chain_slot > 0 {
+            let reject_leg_too_old = if chain_slot == 0 {
+                true
+            } else {
                 let buy_age = if buy_as_of_slot > 0 {
                     chain_slot.saturating_sub(buy_as_of_slot)
                 } else {
@@ -3928,16 +3903,16 @@ impl TokenArbTracker {
                 } else {
                     u64::MAX
                 };
-                if buy_age > config.arb_max_leg_age_slots || sell_age > config.arb_max_leg_age_slots
-                {
-                    record_arb_round_trip_by_dex_pair(
-                        &selection.buy_dex,
-                        &selection.sell_dex,
-                        "leg_too_old",
-                    );
-                    arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::LegSlotTooOld);
-                    return None;
-                }
+                buy_age > config.arb_max_leg_age_slots || sell_age > config.arb_max_leg_age_slots
+            };
+            if reject_leg_too_old {
+                record_arb_round_trip_by_dex_pair(
+                    &selection.buy_dex,
+                    &selection.sell_dex,
+                    "leg_too_old",
+                );
+                arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::LegSlotTooOld);
+                return None;
             }
         }
 
@@ -12293,6 +12268,7 @@ mod two_hop_price_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn check_arbitrage_v2_uses_round_trip_not_legacy_mids() {
         let cache = create_shared_cache();
         let token_mint = Pubkey::new_unique();
@@ -12369,7 +12345,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
-                chain_head_slot: 0,
+                chain_head_slot: 2,
             },
         );
         let opp = opp.expect("v2 round-trip should find cross-dex edge");
@@ -12380,6 +12356,7 @@ mod two_hop_price_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn check_arbitrage_v2_rejects_excessive_slot_delta() {
         let cache = create_shared_cache();
         let token_mint = Pubkey::new_unique();
@@ -12397,7 +12374,7 @@ mod two_hop_price_tests {
             NATIVE_SOL_MINT.to_string(),
             1_000_000_000_000,
             980_000_000,
-            1,
+            90,
         );
         let update_pump = PoolCacheUpdate::new_balance_updated(
             TEST_COMPONENT,
@@ -12434,6 +12411,7 @@ mod two_hop_price_tests {
         let config = with_small_v2_probe(ArbConfig {
             arb_two_hop_v2_enabled: true,
             arb_max_leg_slot_delta: 2,
+            arb_max_leg_age_slots: 16,
             min_spread_bps: 1,
             min_profit_lamports: 1,
             est_tx_cost_lamports: 1,
@@ -12443,8 +12421,27 @@ mod two_hop_price_tests {
         let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
         let spread_warn_last = RwLock::new(HashMap::new());
         let data_quality_rejects = AtomicU64::new(0);
-        let before =
-            ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED.load(Ordering::Relaxed);
+        let opp = tracker.check_arbitrage(
+            &config,
+            &known_pools,
+            &vault_balances,
+            &bin_arrays,
+            &ArbCheckContext {
+                spread_warn_last: &spread_warn_last,
+                data_quality_rejects: &data_quality_rejects,
+                forensics: None,
+                v2_forensics: None,
+                selected_mints: None,
+                pinned_pools: None,
+                chain_head_slot: 100,
+            },
+        );
+        let opp = opp.expect("large relative delta should pass pairing when legs are head-fresh");
+        assert!(opp.spread_bps > 0);
+        assert!(opp.estimated_profit_lamports > 0);
+
+        let old_before =
+            ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD.load(Ordering::Relaxed);
         let opp = tracker.check_arbitrage(
             &config,
             &known_pools,
@@ -12460,14 +12457,18 @@ mod two_hop_price_tests {
                 chain_head_slot: 0,
             },
         );
-        assert!(opp.is_none(), "slot delta 99 should exceed default gate");
         assert!(
-            ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_SLOT_DELTA_EXCEEDED.load(Ordering::Relaxed)
-                > before
+            opp.is_none(),
+            "chain head 0 must fail-closed as leg_slot_too_old"
+        );
+        assert!(
+            ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_LEG_SLOT_TOO_OLD.load(Ordering::Relaxed)
+                > old_before
         );
     }
 
     #[test]
+    #[serial_test::serial]
     fn check_arbitrage_v2_rejects_stale_leg_vs_chain_head() {
         let cache = create_shared_cache();
         let token_mint = Pubkey::new_unique();
@@ -12589,6 +12590,7 @@ mod two_hop_price_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn check_arbitrage_v2_rejects_spread_below_min_with_split_reason() {
         use ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_SPREAD_BELOW_MIN;
 
@@ -12667,7 +12669,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
-                chain_head_slot: 0,
+                chain_head_slot: 2,
             },
         );
         assert!(opp.is_none(), "equal reserves should fail spread gate");
@@ -12678,6 +12680,7 @@ mod two_hop_price_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn check_arbitrage_v2_rejects_profit_below_min_with_split_reason() {
         use ironcrab::metrics::ARB_TWO_HOP_V2_REJECTED_ROUND_TRIP_PROFIT_BELOW_MIN;
 
@@ -12756,7 +12759,7 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
-                chain_head_slot: 0,
+                chain_head_slot: 2,
             },
         );
         assert!(opp.is_none(), "tiny edge should fail profit gate");
@@ -12766,7 +12769,27 @@ mod two_hop_price_tests {
         );
     }
 
-    fn run_v2_slot_skew_screen(buy_slot: u64, sell_slot: u64) {
+    struct V2SlotSkewHistogramDelta {
+        count: u64,
+        equal: u64,
+        buy: u64,
+        sell: u64,
+        sum: u64,
+    }
+
+    fn run_v2_slot_skew_screen(buy_slot: u64, sell_slot: u64) -> V2SlotSkewHistogramDelta {
+        use ironcrab::metrics::{
+            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT, ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM,
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL, ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL,
+            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL,
+        };
+
+        let count_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT.load(Ordering::Relaxed);
+        let equal_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL.load(Ordering::Relaxed);
+        let buy_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed);
+        let sell_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.load(Ordering::Relaxed);
+        let sum_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed);
+
         let cache = create_shared_cache();
         let token_mint = Pubkey::new_unique();
         let pool_a = Pubkey::new_unique();
@@ -12829,6 +12852,7 @@ mod two_hop_price_tests {
         let bin_arrays: HashMap<String, HashMap<i64, BinArrayCache>> = HashMap::new();
         let spread_warn_last = RwLock::new(HashMap::new());
         let data_quality_rejects = AtomicU64::new(0);
+        let chain_head_slot = buy_slot.max(sell_slot);
         let _ = tracker.check_arbitrage(
             &config,
             &known_pools,
@@ -12841,64 +12865,35 @@ mod two_hop_price_tests {
                 v2_forensics: None,
                 selected_mints: None,
                 pinned_pools: None,
-                chain_head_slot: 0,
+                chain_head_slot,
             },
         );
+
+        V2SlotSkewHistogramDelta {
+            count: ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT.load(Ordering::Relaxed) - count_before,
+            equal: ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL.load(Ordering::Relaxed) - equal_before,
+            buy: ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed) - buy_before,
+            sell: ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.load(Ordering::Relaxed) - sell_before,
+            sum: ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed) - sum_before,
+        }
     }
 
     #[test]
+    #[serial_test::serial]
     fn check_arbitrage_v2_records_slot_skew_histogram_and_leg_attribution() {
-        use ironcrab::metrics::{
-            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT, ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM,
-            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL, ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL,
-            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL,
-        };
+        let delta = run_v2_slot_skew_screen(50, 50);
+        assert_eq!(delta.count, 1);
+        assert_eq!(delta.equal, 1);
+        assert_eq!(delta.sum, 0);
 
-        let count_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT.load(Ordering::Relaxed);
-        let equal_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL.load(Ordering::Relaxed);
-        let sum_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed);
-        run_v2_slot_skew_screen(50, 50);
-        assert_eq!(
-            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT.load(Ordering::Relaxed),
-            count_before + 1
-        );
-        assert_eq!(
-            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL.load(Ordering::Relaxed),
-            equal_before + 1
-        );
-        assert_eq!(
-            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed),
-            sum_before
-        );
+        let delta = run_v2_slot_skew_screen(48, 50);
+        assert_eq!(delta.buy, 1);
+        assert_eq!(delta.sum, 2);
 
-        let buy_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed);
-        let sum_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed);
-        run_v2_slot_skew_screen(48, 50);
-        assert_eq!(
-            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed),
-            buy_before + 1
-        );
-        assert_eq!(
-            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed),
-            sum_before + 2
-        );
-
-        let buy_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed);
-        let sell_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.load(Ordering::Relaxed);
-        let sum_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed);
-        run_v2_slot_skew_screen(1, 101);
-        assert_eq!(
-            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed),
-            buy_before + 1
-        );
-        assert_eq!(
-            ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.load(Ordering::Relaxed),
-            sell_before
-        );
-        assert_eq!(
-            ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed),
-            sum_before + 100
-        );
+        let delta = run_v2_slot_skew_screen(1, 101);
+        assert_eq!(delta.buy, 1);
+        assert_eq!(delta.sell, 0);
+        assert_eq!(delta.sum, 100);
     }
 
     #[test]
@@ -14686,6 +14681,7 @@ mod two_hop_price_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn check_arbitrage_v2_increments_multi_dex_screen_counter() {
         let before_multi =
             ironcrab::metrics::ARB_TWO_HOP_V2_SCREEN_MULTI_DEX_TOTAL.load(Ordering::Relaxed);
