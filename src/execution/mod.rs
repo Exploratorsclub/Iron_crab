@@ -3,6 +3,7 @@ pub mod bundle_auction;
 pub mod cache_geyser;
 pub mod error_detection;
 pub mod live_pool_cache;
+pub mod pool_address_book;
 pub mod pool_cache_sync;
 pub mod position_utils;
 pub mod quote_calculator;

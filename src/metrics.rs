@@ -331,6 +331,13 @@ static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_SKIP_UNPARSEABLE: Lazy<AtomicU64> 
     Lazy::new(|| AtomicU64::new(0));
 static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_CACHE_MISS: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_ADDRESS_BOOK: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_POOL_ADDRESS_BOOK_ENTRIES_GAUGE: AtomicU64 = AtomicU64::new(0);
+static MARKET_DATA_POOL_ADDRESS_BOOK_PROMOTE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_POOL_ADDRESS_BOOK_DEMOTE_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// Hot account-decode path vault register completeness (pin-gated, no TX upsert).
 static MARKET_DATA_ACCOUNT_PATH_HOT_VAULT_REGISTER: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -852,6 +859,7 @@ pub enum TxPoolAccountsHotApplyResult {
     SkipNotHot,
     SkipUnparseable,
     CacheMiss,
+    AddressBook,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -881,8 +889,26 @@ pub fn inc_market_data_tx_pool_accounts_hot_apply_total(result: TxPoolAccountsHo
         TxPoolAccountsHotApplyResult::CacheMiss => {
             &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_CACHE_MISS
         }
+        TxPoolAccountsHotApplyResult::AddressBook => {
+            &*MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_ADDRESS_BOOK
+        }
     };
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_pool_address_book_entries_gauge(n: usize) {
+    MARKET_DATA_POOL_ADDRESS_BOOK_ENTRIES_GAUGE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pool_address_book_promote_total() {
+    MARKET_DATA_POOL_ADDRESS_BOOK_PROMOTE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pool_address_book_demote_total() {
+    MARKET_DATA_POOL_ADDRESS_BOOK_DEMOTE_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]

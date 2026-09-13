@@ -962,6 +962,18 @@ impl LivePoolCache {
         }
     }
 
+    /// Remove a pool row and drop its `vault_to_pool` mappings (unpin demote; not quote publish).
+    pub fn remove(&self, pool: &Pubkey) -> bool {
+        if let Some((_, entry)) = self.pools.remove(pool) {
+            for vault in Self::vault_pubkeys_for_pool_state(&entry.state) {
+                self.vault_to_pool.remove(&vault);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Refresh `updated_at` on an existing row with quotable reserve basis without changing slot/state.
     ///
     /// Used when a JetStream `BalanceUpdated` heartbeat arrives with a regressed slot (SLAVE ahead of
@@ -1073,6 +1085,20 @@ impl LivePoolCache {
                 }
                 entry.updated_at = Instant::now();
             }
+        }
+    }
+
+    fn vault_pubkeys_for_pool_state(state: &CachedPoolState) -> Vec<Pubkey> {
+        match state {
+            CachedPoolState::Orca(s) => vec![s.token_vault_a, s.token_vault_b],
+            CachedPoolState::RaydiumAmm(s) => vec![s.coin_vault, s.pc_vault],
+            CachedPoolState::RaydiumCpmm(s) => vec![s.token_0_vault, s.token_1_vault],
+            CachedPoolState::Meteora(s) => vec![s.reserve_x, s.reserve_y],
+            CachedPoolState::MeteoraCpmm(s) => vec![s.token_0_vault, s.token_1_vault],
+            CachedPoolState::PumpAmm(s) => {
+                vec![s.pool_base_token_account, s.pool_quote_token_account]
+            }
+            CachedPoolState::PumpFun(_) => Vec::new(),
         }
     }
 

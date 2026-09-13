@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MD-ADDRESS-BOOK: Unpinned TX layout vs MASTER on pin (KNOWN_BUG #28)
+**Datum**: 2026-09-13  
+**Problem**: Ungepinnte TX-Layouts landeten nicht im MASTER, aber Partial-Account-Parse auf einer gemeinsamen `LivePoolCache`-Zeile konnte TX-Adressen überschreiben; Pin traf `live_pool_cache_miss`.  
+**Fix**: Separates `PoolAddressBook` (TTL 120s, LRU 32k) für ungepinnte Layout-Keys; Pin promote → layout-only MASTER + Geyser-Register; Unpin demote zurück ins Buch. Hot Account-Upsert nur bei Pin; kein RPC / keine Extra-Subs.  
+**Dateien**: `src/execution/pool_address_book.rs`, `src/execution/live_pool_cache.rs`, `src/bin/market_data.rs`, `src/market_data/sidefx/handlers.rs`, `src/metrics.rs`
+
 ### FIX-ARB-V2-CHAIN-HEAD-PAIRING: v2 Round-Trip nur noch Chain-Head-Age, kein relatives Slot-Delta-Gate
 **Datum**: 2026-09-13  
 **Problem**: Prod Pump→Orca ~97% `slot_delta_exceeded`, `leg_slot_too_old=0` — relatives `|buy−sell|≤2` verworf formable Pairs bevor Age-vs-Head greift; Last-Trade-Slots im selben 2-Slot-Fenster sind kein realistisches Cross-DEX-Pairing.  

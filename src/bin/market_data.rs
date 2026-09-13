@@ -279,6 +279,7 @@ use ironcrab::execution::live_pool_cache::{
     parse_pool_account, CachedPoolState, LivePoolCache, MeteoraCpmmState, MeteoraState,
     OrcaWhirlpoolState, PumpAmmState, PumpFunState, RaydiumAmmState, RaydiumCpmmState,
 };
+use ironcrab::execution::pool_address_book::{PoolAddressBook, PoolLayoutKeys};
 
 // P1 Crash Isolation: Systemd Watchdog support
 #[cfg(unix)]
@@ -1352,6 +1353,9 @@ struct MarketDataContext {
     /// Updated via Geyser events and propagated to execution-engine via NATS.
     live_pool_cache: Arc<LivePoolCache>,
 
+    /// Unpinned TX-derived layout keys (promoted to MASTER on pin; not Geyser subs).
+    pool_address_book: parking_lot::Mutex<PoolAddressBook>,
+
     /// Creator cache for PumpFun tokens: mint -> creator pubkey.
     /// Populated from PoolCreated events, used to enrich Trade events.
     /// This enables momentum-bot to build intents without RPC calls.
@@ -2224,7 +2228,14 @@ fn merge_tx_pool_accounts_into_existing(
     }
 }
 
-/// Teil B: hot-gated TX `pool_accounts` → LivePoolCache seed + trade-path vault register.
+fn address_book_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Teil B: TX `pool_accounts` → unpinned address book or hot MASTER fill-missing + vault register.
 fn apply_tx_pool_accounts_for_hot_pool(
     ctx: &MarketDataContext,
     pool: Pubkey,
@@ -2234,12 +2245,6 @@ fn apply_tx_pool_accounts_for_hot_pool(
     pool_accounts: &[Pubkey],
     slot: u64,
 ) {
-    if !ctx.hot_pool_registry.is_hot_pool(pool) {
-        ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(
-            ironcrab::metrics::TxPoolAccountsHotApplyResult::SkipNotHot,
-        );
-        return;
-    }
     let Some(incoming) =
         cache_state_from_tx_pool_accounts(pool, dex, base_mint, quote_mint, pool_accounts)
     else {
@@ -2248,6 +2253,18 @@ fn apply_tx_pool_accounts_for_hot_pool(
         );
         return;
     };
+    if !ctx.hot_pool_registry.is_hot_pool(pool) {
+        if let Some(keys) = PoolLayoutKeys::from_cached_layout_state(&incoming) {
+            let now = address_book_now_ms();
+            let mut book = ctx.pool_address_book.lock();
+            book.merge(pool, keys, now);
+            ironcrab::metrics::set_market_data_pool_address_book_entries_gauge(book.len());
+            ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(
+                ironcrab::metrics::TxPoolAccountsHotApplyResult::AddressBook,
+            );
+        }
+        return;
+    }
     let merged = match ctx.live_pool_cache.get(&pool) {
         Some(existing) => {
             if tx_layout_seed_preserves_account_quote(&existing, &incoming) {
@@ -3287,6 +3304,60 @@ impl MarketDataContext {
 
     fn wallet_tracks_mint_for_geyser(&self, mint: &Pubkey) -> bool {
         self.tracked_wallet_mint_decimals.read().contains_key(mint)
+    }
+
+    fn refresh_pool_address_book_gauge(&self) {
+        ironcrab::metrics::set_market_data_pool_address_book_entries_gauge(
+            self.pool_address_book.lock().len(),
+        );
+    }
+
+    /// Pin path: promote unpinned book row (+ optional TX layout) into layout-only MASTER.
+    fn promote_address_book_to_master_if_needed(
+        &self,
+        pool: Pubkey,
+        slot: u64,
+        extra_layout: Option<&CachedPoolState>,
+    ) -> bool {
+        if self.live_pool_cache.contains(&pool) {
+            return false;
+        }
+        let mut book = self.pool_address_book.lock();
+        let taken = book.take(pool);
+        let Some(keys) = (match (taken, extra_layout) {
+            (Some(k), Some(layout)) => Some(k.merge_from_cached_layout(layout)),
+            (Some(k), None) => Some(k),
+            (None, Some(layout)) => PoolLayoutKeys::from_cached_layout_state(layout),
+            (None, None) => None,
+        }) else {
+            return false;
+        };
+        if !keys.has_any_vault_pubkey() {
+            book.insert_from_demote(pool, keys, address_book_now_ms());
+            self.refresh_pool_address_book_gauge();
+            return false;
+        }
+        let state = keys.into_layout_only_cached_state();
+        self.live_pool_cache.upsert(pool, state, slot);
+        ironcrab::metrics::inc_market_data_pool_address_book_promote_total();
+        self.refresh_pool_address_book_gauge();
+        true
+    }
+
+    fn demote_master_layout_to_address_book(&self, pool: Pubkey) {
+        if self.hot_pool_registry.pool_has_any_pin(pool) {
+            return;
+        }
+        if let Some(state) = self.live_pool_cache.get(&pool) {
+            if let Some(keys) = PoolLayoutKeys::from_cached_layout_state(&state) {
+                self.pool_address_book
+                    .lock()
+                    .insert_from_demote(pool, keys, address_book_now_ms());
+                ironcrab::metrics::inc_market_data_pool_address_book_demote_total();
+            }
+        }
+        self.live_pool_cache.remove(&pool);
+        self.refresh_pool_address_book_gauge();
     }
 
     /// Single writer path for tracked wallet mint decimals + ingest PumpFun bonding snapshot.
@@ -5608,6 +5679,7 @@ impl MarketDataContext {
         let Some(pin) = self.geyser_pin_for_hot_dlmm_pool(pool) else {
             return false;
         };
+        self.promote_address_book_to_master_if_needed(pool, 0, None);
         let Some(state) = self.live_pool_cache.get(&pool) else {
             self.note_deferred_hot_pool_reserve_registration(pool, pin, "live_pool_cache_miss");
             return false;
@@ -5832,6 +5904,7 @@ impl MarketDataContext {
     /// PR-D / Phase 3: explicit vault/bin subscriptions when cache has layout.
     /// Returns whether any tracked set changed. Caller schedules debounced Geyser push.
     fn register_geyser_reserves_for_active_pool(&self, pool: Pubkey, pin: GeyserPinReason) -> bool {
+        self.promote_address_book_to_master_if_needed(pool, 0, None);
         if self.live_pool_cache.get(&pool).is_none() {
             debug!(
                 run_id = %self.run_id,
@@ -6681,6 +6754,7 @@ impl MarketDataContext {
         // Pool-level reserve pins are shared: only demote vaults/bin arrays when no `(m, pool)`
         // row remains after this unpin (PR #147 follow-up).
         if !self.hot_pool_registry.pool_has_any_pin(pool) {
+            self.demote_master_layout_to_address_book(pool);
             self.release_pool_consumer_group(admission, pool, ExplicitConsumer::MomentumPosition);
             self.release_pool_consumer_group(admission, pool, ExplicitConsumer::Momentum);
             {
@@ -6922,6 +6996,7 @@ impl MarketDataContext {
         if !self.hot_pool_registry.pool_has_arb(pool)
             && !self.hot_pool_registry.pool_has_any_pin(pool)
         {
+            self.demote_master_layout_to_address_book(pool);
             {
                 let mut vaults = self.tracked_vaults.write();
                 for v in vaults.values_mut() {
@@ -9077,6 +9152,7 @@ async fn main() -> Result<()> {
         pumpfun_wallet_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
         pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
         live_pool_cache: Arc::new(LivePoolCache::new()),
+        pool_address_book: parking_lot::Mutex::new(PoolAddressBook::new()),
         creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
         pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -13685,6 +13761,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             pumpfun_wallet_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
+            pool_address_book: parking_lot::Mutex::new(PoolAddressBook::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -13921,6 +13998,7 @@ mod wallet_tx_meta_balance_tests {
             pumpfun_wallet_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
+            pool_address_book: parking_lot::Mutex::new(PoolAddressBook::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -14818,7 +14896,10 @@ mod pr_b_geyser_tracking_tests {
         let mut scratch = MdSidefxBurstScratch::new();
         md_sidefx_process_live_pool_cache_account_update(&worker, &job, &mut scratch);
         assert_eq!(depth.load(Ordering::Relaxed), 0);
-        assert!(ctx.live_pool_cache.get(&pool).is_some());
+        assert!(
+            ctx.live_pool_cache.get(&pool).is_none(),
+            "unpinned account decode must not upsert MASTER"
+        );
 
         ctx.hot_pool_registry.pin_pool(base, pool);
         let mut scratch = MdSidefxBurstScratch::new();
@@ -15531,6 +15612,7 @@ mod pr_b_geyser_tracking_tests {
             pumpfun_wallet_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: live_pool_cache.unwrap_or_else(|| Arc::new(LivePoolCache::new())),
+            pool_address_book: parking_lot::Mutex::new(PoolAddressBook::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -15617,6 +15699,7 @@ mod pr_b_geyser_tracking_tests {
             pumpfun_wallet_bonding_curves_snapshot: ArcSwap::from_pointee(HashSet::new()),
             pool_tracked_legs: parking_lot::RwLock::new(HashMap::new()),
             live_pool_cache: Arc::new(LivePoolCache::new()),
+            pool_address_book: parking_lot::Mutex::new(PoolAddressBook::new()),
             creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_mint_map: parking_lot::RwLock::new(std::collections::HashMap::new()),
             pool_creator_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -18957,7 +19040,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn tx_pool_accounts_hot_apply_skips_non_hot_pool() {
+    fn tx_pool_accounts_hot_apply_merges_non_hot_pool_into_address_book() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
@@ -18983,6 +19066,7 @@ mod pr_b_geyser_tracking_tests {
         assert!(ctx.live_pool_cache.get(&pool).is_none());
         assert_eq!(ctx.tracked_vaults.read().len(), vaults_before);
         assert_eq!(ctx.snapshot_explicit_demand_pubkeys(), demand_before);
+        assert!(ctx.pool_address_book.lock().contains(&pool));
     }
 
     #[test]

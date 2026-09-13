@@ -117,6 +117,9 @@ fn md_sidefx_pin_seed_write_pump_layer_c(
     slot: u64,
     is_hot: bool,
 ) -> bool {
+    if !is_hot {
+        return false;
+    }
     let result = host.live_pool_cache().set_pump_amm_pool_accounts_at_slot(
         pool_address,
         pool_accounts.to_vec(),
@@ -918,17 +921,14 @@ pub fn md_sidefx_process_pump_amm_trade(host: &dyn SidefxWorkerHost, job: &MdSid
         .map(|p| p.to_string())
         .unwrap_or_default();
 
-    let is_hot = host.is_hot_pool(pool_address);
-    if is_hot {
-        host.apply_tx_pool_accounts_for_hot_pool(
-            *pool_address,
-            DexType::PumpFunAmm,
-            *base_mint_pk,
-            Pubkey::from_str(&quote_mint).unwrap_or_default(),
-            pool_accounts,
-            *slot,
-        );
-    }
+    host.apply_tx_pool_accounts_for_hot_pool(
+        *pool_address,
+        DexType::PumpFunAmm,
+        *base_mint_pk,
+        Pubkey::from_str(&quote_mint).unwrap_or_default(),
+        pool_accounts,
+        *slot,
+    );
 
     let is_first_trade = host.known_pump_amm_pools_insert(*pool_address);
 
@@ -997,7 +997,13 @@ pub fn md_sidefx_process_pump_amm_trade(host: &dyn SidefxWorkerHost, job: &MdSid
         );
     }
     if pool_accounts.len() >= 14 {
-        md_sidefx_pin_seed_write_pump_layer_c(host, pool_address, pool_accounts, *slot, is_hot);
+        md_sidefx_pin_seed_write_pump_layer_c(
+            host,
+            pool_address,
+            pool_accounts,
+            *slot,
+            host.is_hot_pool(pool_address),
+        );
         let (ext_flag, ext_third, ext_t0, ext_t1) = host
             .live_pool_cache()
             .pump_amm_sell_extended_layout(pool_address);
@@ -1226,9 +1232,25 @@ pub fn md_sidefx_process_generic_dex_first_trade(
     let is_first_trade = host.known_trade_dex_pools_insert(*pool_address);
     if !is_first_trade {
         if !host.is_hot_pool(pool_address) {
+            host.apply_tx_pool_accounts_for_hot_pool(
+                *pool_address,
+                *dex,
+                *mint,
+                *quote_mint,
+                pool_accounts,
+                *slot,
+            );
             return;
         }
         if host.hot_pool_reserve_registration_satisfied(*pool_address) {
+            host.apply_tx_pool_accounts_for_hot_pool(
+                *pool_address,
+                *dex,
+                *mint,
+                *quote_mint,
+                pool_accounts,
+                *slot,
+            );
             return;
         }
     }
@@ -1260,16 +1282,14 @@ pub fn md_sidefx_process_generic_dex_first_trade(
             }),
         );
     }
-    if host.is_hot_pool(pool_address) {
-        host.apply_tx_pool_accounts_for_hot_pool(
-            *pool_address,
-            *dex,
-            *mint,
-            *quote_mint,
-            pool_accounts,
-            *slot,
-        );
-    }
+    host.apply_tx_pool_accounts_for_hot_pool(
+        *pool_address,
+        *dex,
+        *mint,
+        *quote_mint,
+        pool_accounts,
+        *slot,
+    );
 }
 
 pub fn md_sidefx_process_bonding_curve(host: &dyn SidefxWorkerHost, job: &MdSidefxCommand) {
@@ -1526,6 +1546,9 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
     }
 
     if let Some(mut cached_state) = parse_pool_account(owner, account_data) {
+        if !host.is_hot_pool(pool_pubkey) {
+            return;
+        }
         let prev_state = host.live_pool_cache().get(pool_pubkey);
         let prev_meteora_meta = prev_state.as_ref().and_then(|s| {
             if let CachedPoolState::Meteora(m) = s {
