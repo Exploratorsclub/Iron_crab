@@ -2,7 +2,8 @@
 
 use crate::execution::live_pool_cache::CachedPoolState;
 use crate::execution::live_pool_cache::{
-    MeteoraCpmmState, MeteoraState, OrcaWhirlpoolState, RaydiumAmmState, RaydiumCpmmState,
+    LivePoolCache, MeteoraCpmmState, MeteoraState, OrcaWhirlpoolState, PumpAmmState,
+    RaydiumAmmState, RaydiumCpmmState,
 };
 use crate::ipc::{
     DexPoolReadiness, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY,
@@ -21,6 +22,31 @@ use crate::solana::dex::pumpfun_amm::{
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::str::FromStr;
+
+/// FIX-26 / FIX-33: comma-joined `pool_accounts` when MASTER has Pump layer C (never invent v14).
+pub fn merge_pump_amm_pool_accounts_for_jetstream_metadata(
+    cache: &LivePoolCache,
+    pool_pubkey: &Pubkey,
+    pump_state: &PumpAmmState,
+    meta: &mut HashMap<String, String>,
+) {
+    let effective_pool_accounts = if !pump_state.pool_accounts.is_empty() {
+        pump_state.pool_accounts.clone()
+    } else {
+        cache
+            .get_pump_amm_pool_accounts(pool_pubkey)
+            .unwrap_or_default()
+    };
+    if effective_pool_accounts.is_empty() {
+        return;
+    }
+    let joined = effective_pool_accounts
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    meta.insert("pool_accounts".to_string(), joined);
+}
 
 /// Raydium AMM v4: Serum/OpenBook static metadata for JetStream SLAVE bootstrap.
 pub fn raydium_amm_metadata_for_pool_cache_update(s: &RaydiumAmmState) -> HashMap<String, String> {
@@ -737,5 +763,84 @@ mod tests {
             meta.get("serum_quote_vault").map(String::as_str),
             Some(quote_vault.to_string().as_str())
         );
+    }
+
+    #[test]
+    fn pump_amm_balance_updated_metadata_from_master_v14_applies_to_empty_slave() {
+        use crate::execution::live_pool_cache::{LivePoolCache, PumpAmmState};
+        use crate::execution::pool_cache_sync::apply_pool_cache_update;
+        use crate::ipc::PoolCacheUpdate;
+
+        let master = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let mut pool_accounts = vec![
+            pool,
+            Pubkey::new_unique(),
+            base_mint,
+            quote_mint,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        pool_accounts.extend((0..8).map(|_| Pubkey::new_unique()));
+        let pump_state = PumpAmmState {
+            base_mint,
+            quote_mint,
+            pool_base_token_account: pool_accounts[4],
+            pool_quote_token_account: pool_accounts[5],
+            base_reserve: Some(100),
+            quote_reserve: Some(200),
+            pool_accounts: pool_accounts.clone(),
+            creator: None,
+        };
+        master.upsert(pool, CachedPoolState::PumpAmm(pump_state.clone()), 1);
+
+        let mut meta = HashMap::new();
+        merge_pump_amm_pool_accounts_for_jetstream_metadata(&master, &pool, &pump_state, &mut meta);
+        assert!(meta.get("pool_accounts").is_some());
+
+        let mut update = PoolCacheUpdate::new_balance_updated(
+            "test",
+            "0.1.0",
+            "run",
+            pool.to_string(),
+            "pump_amm".to_string(),
+            base_mint.to_string(),
+            quote_mint.to_string(),
+            100,
+            200,
+            2,
+        );
+        update.metadata = Some(meta);
+
+        let slave = LivePoolCache::new();
+        assert!(apply_pool_cache_update(&slave, &update));
+        let CachedPoolState::PumpAmm(s) = slave.get(&pool).expect("slave row") else {
+            panic!("expected PumpAmm");
+        };
+        assert_eq!(s.pool_accounts.len(), 14);
+        assert_eq!(s.pool_accounts[0], pool);
+    }
+
+    #[test]
+    fn pump_amm_balance_updated_metadata_skips_invented_v14_when_master_empty() {
+        use crate::execution::live_pool_cache::{LivePoolCache, PumpAmmState};
+
+        let master = LivePoolCache::new();
+        let pool = Pubkey::new_unique();
+        let pump_state = PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            base_reserve: Some(1),
+            quote_reserve: Some(2),
+            pool_accounts: vec![],
+            creator: None,
+        };
+        let mut meta = HashMap::new();
+        merge_pump_amm_pool_accounts_for_jetstream_metadata(&master, &pool, &pump_state, &mut meta);
+        assert!(!meta.contains_key("pool_accounts"));
     }
 }

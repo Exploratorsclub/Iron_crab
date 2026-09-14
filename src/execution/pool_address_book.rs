@@ -120,9 +120,7 @@ impl PoolAddressBook {
             })
             .collect();
         // Drop incomplete book rows before Pump v14 pin-payload; then oldest LRU.
-        by_evict_priority.sort_by(|a, b| {
-            a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1))
-        });
+        by_evict_priority.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
         for (pool, _, _) in by_evict_priority.into_iter().take(to_remove) {
             self.entries.remove(&pool);
         }
