@@ -2152,6 +2152,26 @@ fn tx_layout_seed_preserves_account_quote(
     }
 }
 
+fn cached_pool_layout_variants_match(
+    existing: &CachedPoolState,
+    incoming: &CachedPoolState,
+) -> bool {
+    matches!(
+        (existing, incoming),
+        (CachedPoolState::PumpAmm(_), CachedPoolState::PumpAmm(_))
+            | (CachedPoolState::Orca(_), CachedPoolState::Orca(_))
+            | (
+                CachedPoolState::RaydiumCpmm(_),
+                CachedPoolState::RaydiumCpmm(_)
+            )
+            | (CachedPoolState::Meteora(_), CachedPoolState::Meteora(_))
+            | (
+                CachedPoolState::RaydiumAmm(_),
+                CachedPoolState::RaydiumAmm(_)
+            )
+    )
+}
+
 fn merge_tx_pool_accounts_into_existing(
     existing: &CachedPoolState,
     incoming: &CachedPoolState,
@@ -3327,29 +3347,43 @@ impl MarketDataContext {
         slot: u64,
         extra_layout: Option<&CachedPoolState>,
     ) -> bool {
-        if self.live_pool_cache.contains(&pool) {
-            return false;
-        }
-        let mut book = self.pool_address_book.lock();
-        let taken = book.take(pool);
-        let Some(keys) = (match (taken, extra_layout) {
-            (Some(k), Some(layout)) => Some(k.merge_from_cached_layout(layout)),
-            (Some(k), None) => Some(k),
-            (None, Some(layout)) => PoolLayoutKeys::from_cached_layout_state(layout),
-            (None, None) => None,
-        }) else {
-            return false;
+        let (upsert_state, book_len) = {
+            let mut book = self.pool_address_book.lock();
+            let taken = book.take(pool);
+            let Some(keys) = (match (taken, extra_layout) {
+                (Some(k), Some(layout)) => Some(k.merge_from_cached_layout(layout)),
+                (Some(k), None) => Some(k),
+                (None, Some(layout)) => PoolLayoutKeys::from_cached_layout_state(layout),
+                (None, None) => None,
+            }) else {
+                return false;
+            };
+            let upsert_state = if let Some(existing) = self.live_pool_cache.get(&pool) {
+                let incoming = keys.into_layout_only_cached_state();
+                if !cached_pool_layout_variants_match(&existing, &incoming) {
+                    if let Some(restore) = PoolLayoutKeys::from_cached_layout_state(&incoming) {
+                        book.insert_from_demote(pool, restore, address_book_now_ms());
+                    }
+                    None
+                } else {
+                    Some(merge_tx_pool_accounts_into_existing(&existing, &incoming))
+                }
+            } else if !keys.has_any_vault_pubkey() {
+                book.insert_from_demote(pool, keys, address_book_now_ms());
+                None
+            } else {
+                Some(keys.into_layout_only_cached_state())
+            };
+            (upsert_state, book.len())
         };
-        if !keys.has_any_vault_pubkey() {
-            book.insert_from_demote(pool, keys, address_book_now_ms());
-            self.refresh_pool_address_book_gauge();
-            return false;
+        ironcrab::metrics::set_market_data_pool_address_book_entries_gauge(book_len);
+        if let Some(state) = upsert_state {
+            self.live_pool_cache.upsert(pool, state, slot);
+            ironcrab::metrics::inc_market_data_pool_address_book_promote_total();
+            true
+        } else {
+            false
         }
-        let state = keys.into_layout_only_cached_state();
-        self.live_pool_cache.upsert(pool, state, slot);
-        ironcrab::metrics::inc_market_data_pool_address_book_promote_total();
-        self.refresh_pool_address_book_gauge();
-        true
     }
 
     fn demote_master_layout_to_address_book(&self, pool: Pubkey) {
@@ -6255,10 +6289,13 @@ impl MarketDataContext {
                         "live_pool_cache_miss",
                     );
                 }
-                if self.try_admit_hot_pool_account_bootstrap(admission, pool, consumer) {
-                    batch_dirty = true;
+                let _ = self.promote_address_book_to_master_if_needed(pool, 0, None);
+                if self.live_pool_cache.get(&pool).is_none() {
+                    if self.try_admit_hot_pool_account_bootstrap(admission, pool, consumer) {
+                        batch_dirty = true;
+                    }
+                    continue;
                 }
-                continue;
             }
             let _ = self.try_touch_live_pool_reserve_basis_for_hot_pool(pool);
             if !self.try_admit_pool_consumer_group(admission, pool, consumer) {
@@ -6664,6 +6701,7 @@ impl MarketDataContext {
                     GeyserPinReason::MomentumActive,
                     "admit_suppress",
                 );
+                let _ = self.promote_address_book_to_master_if_needed(pool_pk, 0, None);
                 if self.live_pool_cache.get(&pool_pk).is_none()
                     && self.try_admit_hot_pool_account_bootstrap(
                         admission,
@@ -6680,6 +6718,7 @@ impl MarketDataContext {
                 );
                 continue;
             }
+            let _ = self.promote_address_book_to_master_if_needed(pool_pk, 0, None);
             if self.try_admit_pool_consumer_group(admission, pool_pk, momentum_consumer) {
                 if superseded_present {
                     self.release_pool_consumer_group(admission, pool_pk, superseded_consumer);
@@ -6938,6 +6977,7 @@ impl MarketDataContext {
                     "admit_suppress",
                 );
                 self.log_arb_pin_deferred_throttled(pool_pk, "admit_suppress");
+                let _ = self.promote_address_book_to_master_if_needed(pool_pk, 0, None);
                 if self.live_pool_cache.get(&pool_pk).is_none()
                     && self.try_admit_hot_pool_account_bootstrap(
                         admission,
@@ -6955,6 +6995,7 @@ impl MarketDataContext {
                 let _ = &a.reason;
                 continue;
             }
+            let _ = self.promote_address_book_to_master_if_needed(pool_pk, 0, None);
             if self.try_admit_pool_consumer_group(admission, pool_pk, ExplicitConsumer::Arb) {
                 inc_market_data_arb_admission_admitted_total();
                 let registered = self.register_geyser_reserves_for_arb_active_pool(pool_pk);
@@ -24449,6 +24490,281 @@ mod pr_b_geyser_tracking_tests {
                 > admitted_before
         );
         assert!(ctx.pool_has_explicit_arb_admission(pool));
+    }
+
+    #[test]
+    fn apply_arb_active_entries_promotes_address_book_before_admit() {
+        use ironcrab::nats::{
+            ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRequestsUpdate,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        ctx.pool_address_book.lock().merge(
+            pool,
+            PoolLayoutKeys::PumpAmm {
+                base_mint: base,
+                quote_mint: quote,
+                pool_base_token_account: base_vault,
+                pool_quote_token_account: quote_vault,
+                pool_accounts: vec![],
+            },
+            address_book_now_ms(),
+        );
+
+        let mut admission = test_admission_for(&ctx);
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::MultiDex,
+                    readiness: ArbTrackReadiness::QuoteReady,
+                }],
+                removed: vec![],
+                reconcile: false,
+            },
+        );
+
+        assert!(!ctx.pool_address_book.lock().contains(&pool));
+        let state = ctx
+            .live_pool_cache
+            .get(&pool)
+            .expect("MASTER seeded from address book before admit");
+        let CachedPoolState::PumpAmm(ref s) = state else {
+            panic!("expected PumpAmm MASTER row");
+        };
+        assert_eq!(s.pool_base_token_account, base_vault);
+        assert_eq!(s.pool_quote_token_account, quote_vault);
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        assert!(pubkeys.contains(&pool));
+        assert!(pubkeys.contains(&base_vault));
+        assert!(pubkeys.contains(&quote_vault));
+    }
+
+    #[test]
+    fn apply_arb_active_entries_repin_after_demote_promotes_from_address_book() {
+        use ironcrab::execution::live_pool_cache::PumpAmmState;
+        use ironcrab::nats::{
+            ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRemovedEntry,
+            ArbTrackRemovedReason, ArbTrackRequestsUpdate,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: base,
+                quote_mint: quote,
+                pool_base_token_account: base_vault,
+                pool_quote_token_account: quote_vault,
+                base_reserve: Some(1_000),
+                quote_reserve: Some(2_000),
+                pool_accounts: vec![],
+                creator: None,
+            }),
+            1,
+        );
+
+        let mut admission = test_admission_for(&ctx);
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::MultiDex,
+                    readiness: ArbTrackReadiness::QuoteReady,
+                }],
+                removed: vec![],
+                reconcile: false,
+            },
+        );
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 1,
+                ts_unix_ms: 2,
+                active: vec![],
+                removed: vec![ArbTrackRemovedEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackRemovedReason::Cooldown,
+                }],
+                reconcile: false,
+            },
+        );
+        assert!(ctx.pool_address_book.lock().contains(&pool));
+        assert!(ctx.live_pool_cache.get(&pool).is_none());
+
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 1,
+                ts_unix_ms: 3,
+                active: vec![ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::MultiDex,
+                    readiness: ArbTrackReadiness::QuoteReady,
+                }],
+                removed: vec![],
+                reconcile: false,
+            },
+        );
+        let state = ctx
+            .live_pool_cache
+            .get(&pool)
+            .expect("re-pin promotes book");
+        let CachedPoolState::PumpAmm(s) = state else {
+            panic!("expected PumpAmm");
+        };
+        assert_eq!(s.pool_base_token_account, base_vault);
+        assert!(!ctx.pool_address_book.lock().contains(&pool));
+    }
+
+    #[test]
+    fn retry_deferred_promotes_address_book_before_bootstrap() {
+        use ironcrab::nats::{
+            ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRequestsUpdate,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+
+        let mut admission = test_admission_for(&ctx);
+        ctx.apply_arb_track_requests_update(
+            &mut admission,
+            &ArbTrackRequestsUpdate {
+                version: 1,
+                ts_unix_ms: 1,
+                active: vec![ArbTrackActiveEntry {
+                    pool: pool.to_string(),
+                    reason: ArbTrackActiveReason::MultiDex,
+                    readiness: ArbTrackReadiness::QuoteReady,
+                }],
+                removed: vec![],
+                reconcile: false,
+            },
+        );
+        assert!(ctx.live_pool_cache.get(&pool).is_none());
+        assert!(ctx
+            .deferred_hot_pool_reserve_pins
+            .read()
+            .contains_key(&pool));
+
+        ctx.pool_address_book.lock().merge(
+            pool,
+            PoolLayoutKeys::PumpAmm {
+                base_mint: base,
+                quote_mint: quote,
+                pool_base_token_account: base_vault,
+                pool_quote_token_account: quote_vault,
+                pool_accounts: vec![],
+            },
+            address_book_now_ms(),
+        );
+
+        assert!(ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission));
+        let state = ctx.live_pool_cache.get(&pool).expect("retry promotes book");
+        let CachedPoolState::PumpAmm(s) = state else {
+            panic!("expected PumpAmm");
+        };
+        assert_eq!(s.pool_base_token_account, base_vault);
+    }
+
+    #[test]
+    fn promote_address_book_fill_missing_preserves_account_reserves() {
+        use ironcrab::execution::live_pool_cache::PumpAmmState;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: base,
+                quote_mint: quote,
+                pool_base_token_account: Pubkey::default(),
+                pool_quote_token_account: Pubkey::default(),
+                base_reserve: Some(42),
+                quote_reserve: Some(84),
+                pool_accounts: vec![],
+                creator: None,
+            }),
+            1,
+        );
+        ctx.pool_address_book.lock().merge(
+            pool,
+            PoolLayoutKeys::PumpAmm {
+                base_mint: base,
+                quote_mint: quote,
+                pool_base_token_account: base_vault,
+                pool_quote_token_account: quote_vault,
+                pool_accounts: vec![],
+            },
+            address_book_now_ms(),
+        );
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        assert!(ctx.promote_address_book_to_master_if_needed(pool, 0, None));
+        let state = ctx.live_pool_cache.get(&pool).expect("MASTER");
+        let CachedPoolState::PumpAmm(s) = state else {
+            panic!("expected PumpAmm");
+        };
+        assert_eq!(s.pool_base_token_account, base_vault);
+        assert_eq!(s.pool_quote_token_account, quote_vault);
+        assert_eq!(s.base_reserve, Some(42));
+        assert_eq!(s.quote_reserve, Some(84));
+    }
+
+    #[test]
+    fn apply_arb_active_entries_pin_path_has_no_get_account() {
+        let src = include_str!("market_data.rs");
+        let start = src
+            .find("fn apply_arb_active_entries(")
+            .expect("apply_arb_active_entries");
+        let end = src[start..]
+            .find("\n    fn arb_pool_leg_mint_still_required")
+            .expect("next fn")
+            + start;
+        let body = &src[start..end];
+        assert!(
+            !body.contains("get_account"),
+            "apply_arb_active_entries must not call RPC get_account"
+        );
     }
 
     /// Fill-wake: deferred retry counter increments when cache fill hits deferred pool.

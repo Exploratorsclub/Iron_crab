@@ -18,6 +18,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Fix**: Pool-Pubkey in geplanter Explicit-Gruppe für alle gepinnten DEX-States; Hot-Reserve-Satisfaction verlangt Pool-Account in Geyser-Flush solange Quote-Account unseeded; Prometheus address_book/promote/demote exportiert. Kein RPC.  
 **Dateien**: `src/bin/market_data.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
 
+### FIX-MD-PROMOTE-BEFORE-ADMIT: Adressbuch → MASTER vor Pin-Admit (A.52)
+**Datum**: 2026-09-14  
+**Problem**: `promote_address_book_to_master_if_needed` no-op bei vorhandener MASTER-Zeile (`contains` early-return); Pin/Retry riefen `try_admit` vor Promote → `planned_pool_consumer_group_pubkeys` leer, `promote=0`, ~1.5M deferred `live_pool_cache_miss`.  
+**Fix**: Promote mit Fill-Missing in bestehende MASTER-Zeile; Pin (Arb/Momentum) und deferred Retry: Promote vor Admit/Bootstrap; Buch-Take vor Merge. Kein RPC.  
+**Dateien**: `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-V2-CHAIN-HEAD-PAIRING: v2 Round-Trip nur noch Chain-Head-Age, kein relatives Slot-Delta-Gate
 **Datum**: 2026-09-13  
 **Problem**: Prod Pump→Orca ~97% `slot_delta_exceeded`, `leg_slot_too_old=0` — relatives `|buy−sell|≤2` verworf formable Pairs bevor Age-vs-Head greift; Last-Trade-Slots im selben 2-Slot-Fenster sind kein realistisches Cross-DEX-Pairing.  
