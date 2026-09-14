@@ -9474,6 +9474,40 @@ fn pr167_skip_exit_reason(
     }
 }
 
+const PR167_DEFAULT_LOCAL_VALIDATOR_RPC: &str = "http://127.0.0.1:8899";
+
+/// PR167: only loopback hosts — never `SOLANA_RPC_URL` / public reference RPC.
+fn local_validator_rpc_url_is_loopback(url: &str) -> bool {
+    let url = url.trim();
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let host = rest.split('/').next().unwrap_or(rest);
+    let host = match host.rsplit_once('@') {
+        Some((_, after)) => after,
+        None => host,
+    };
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1")
+}
+
+fn pr167_resolve_local_validator_health_rpc_url(candidate: Option<&str>) -> String {
+    match candidate {
+        Some(url) if local_validator_rpc_url_is_loopback(url) => url.to_string(),
+        Some(_) | None => PR167_DEFAULT_LOCAL_VALIDATOR_RPC.to_string(),
+    }
+}
+
+fn pr167_local_validator_health_rpc_url_from_env() -> String {
+    for key in ["VALIDATOR_LAG_LOCAL_RPC", "PR167_LOCAL_VALIDATOR_RPC_URL"] {
+        if let Ok(v) = std::env::var(key) {
+            return pr167_resolve_local_validator_health_rpc_url(Some(&v));
+        }
+    }
+    pr167_resolve_local_validator_health_rpc_url(None)
+}
+
 fn probe_local_validator_get_health(rpc_url: &str) -> LocalValidatorHealth {
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(1))
@@ -9525,8 +9559,7 @@ fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
         inc_market_data_pr167_skip_exit_total, MARKET_DATA_INGEST_PROGRESS_TICK,
     };
 
-    let rpc_url =
-        std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
+    let rpc_url = pr167_local_validator_health_rpc_url_from_env();
 
     std::thread::Builder::new()
         .name("md-ingest-liveness".into())
@@ -20125,6 +20158,27 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(
             pr167_skip_exit_reason(LocalValidatorHealth::Ok, false, false),
             None
+        );
+    }
+
+    #[test]
+    fn pr167_non_loopback_rpc_url_not_used_for_health_probe() {
+        assert!(!local_validator_rpc_url_is_loopback(
+            "https://api.mainnet-beta.solana.com"
+        ));
+        assert_eq!(
+            pr167_resolve_local_validator_health_rpc_url(Some(
+                "https://api.mainnet-beta.solana.com"
+            )),
+            PR167_DEFAULT_LOCAL_VALIDATOR_RPC
+        );
+        assert_eq!(
+            pr167_resolve_local_validator_health_rpc_url(Some("http://127.0.0.1:8899")),
+            "http://127.0.0.1:8899"
+        );
+        assert_eq!(
+            pr167_resolve_local_validator_health_rpc_url(Some("http://localhost:8899")),
+            "http://localhost:8899"
         );
     }
 
