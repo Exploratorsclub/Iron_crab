@@ -1,5 +1,6 @@
 # Security audit config - see docs/KNOWN_BUG_PATTERNS.md
 # Transitive deps from Solana/SPL/async-nats; cannot be replaced without upgrading entire Solana stack.
+# RUSTSEC-2026-0285: patched via `rustls` >=0.23.45 in Cargo.lock (not listed in ignore).
 
 [advisories]
 # bincode unmaintained (Solana/spl-token-2022), rustls-pemfile (async-nats)
