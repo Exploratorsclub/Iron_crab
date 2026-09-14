@@ -798,7 +798,7 @@ mod tests {
 
         let mut meta = HashMap::new();
         merge_pump_amm_pool_accounts_for_jetstream_metadata(&master, &pool, &pump_state, &mut meta);
-        assert!(meta.get("pool_accounts").is_some());
+        assert!(meta.contains_key("pool_accounts"));
 
         let mut update = PoolCacheUpdate::new_balance_updated(
             "test",
