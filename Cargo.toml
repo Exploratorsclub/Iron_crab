@@ -42,7 +42,7 @@ base64 = "0.21"
 bs58 = "0.5"
 flate2 = "1"
 csv = "1"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
 bincode = "1.3"
 
 

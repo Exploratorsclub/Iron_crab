@@ -9415,10 +9415,151 @@ fn market_data_ingest_liveness_in_startup_grace_live(process_started: Instant) -
     market_data_ingest_liveness_in_startup_grace(process_started, snapshot_pubkey_count, barrier)
 }
 
+/// Local validator `getHealth` result for PR167 exit guard (cold path OS thread only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalValidatorHealth {
+    Ok,
+    NotOk,
+    Unknown,
+}
+
+/// PR167: after recovery wait, decide whether to `exit(1)` or keep market-data alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pr167GlobalIngestRecoveryAction {
+    SkipExitKeepAlive,
+    ExitForSystemd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pr167SkipExitReason {
+    ValidatorUnhealthy,
+    HealthUnknown,
+    SessionAlive,
+}
+
+fn pr167_global_ingest_recovery_after_wait(
+    validator_health: LocalValidatorHealth,
+    tx_session_connected: bool,
+    account_session_connected: bool,
+) -> Pr167GlobalIngestRecoveryAction {
+    match validator_health {
+        LocalValidatorHealth::Unknown => Pr167GlobalIngestRecoveryAction::SkipExitKeepAlive,
+        LocalValidatorHealth::NotOk => Pr167GlobalIngestRecoveryAction::SkipExitKeepAlive,
+        LocalValidatorHealth::Ok => {
+            if tx_session_connected || account_session_connected {
+                Pr167GlobalIngestRecoveryAction::SkipExitKeepAlive
+            } else {
+                Pr167GlobalIngestRecoveryAction::ExitForSystemd
+            }
+        }
+    }
+}
+
+fn pr167_skip_exit_reason(
+    validator_health: LocalValidatorHealth,
+    tx_session_connected: bool,
+    account_session_connected: bool,
+) -> Option<Pr167SkipExitReason> {
+    match pr167_global_ingest_recovery_after_wait(
+        validator_health,
+        tx_session_connected,
+        account_session_connected,
+    ) {
+        Pr167GlobalIngestRecoveryAction::ExitForSystemd => None,
+        Pr167GlobalIngestRecoveryAction::SkipExitKeepAlive => match validator_health {
+            LocalValidatorHealth::Unknown => Some(Pr167SkipExitReason::HealthUnknown),
+            LocalValidatorHealth::NotOk => Some(Pr167SkipExitReason::ValidatorUnhealthy),
+            LocalValidatorHealth::Ok => Some(Pr167SkipExitReason::SessionAlive),
+        },
+    }
+}
+
+const PR167_DEFAULT_LOCAL_VALIDATOR_RPC: &str = "http://127.0.0.1:8899";
+
+/// PR167: only loopback hosts — never `SOLANA_RPC_URL` / public reference RPC.
+fn local_validator_rpc_url_is_loopback(url: &str) -> bool {
+    let url = url.trim();
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let host = rest.split('/').next().unwrap_or(rest);
+    let host = match host.rsplit_once('@') {
+        Some((_, after)) => after,
+        None => host,
+    };
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1")
+}
+
+fn pr167_resolve_local_validator_health_rpc_url(candidate: Option<&str>) -> String {
+    match candidate {
+        Some(url) if local_validator_rpc_url_is_loopback(url) => url.to_string(),
+        Some(_) | None => PR167_DEFAULT_LOCAL_VALIDATOR_RPC.to_string(),
+    }
+}
+
+fn pr167_local_validator_health_rpc_url_from_env() -> String {
+    for key in ["VALIDATOR_LAG_LOCAL_RPC", "PR167_LOCAL_VALIDATOR_RPC_URL"] {
+        if let Ok(v) = std::env::var(key) {
+            return pr167_resolve_local_validator_health_rpc_url(Some(&v));
+        }
+    }
+    pr167_resolve_local_validator_health_rpc_url(None)
+}
+
+fn probe_local_validator_get_health(rpc_url: &str) -> LocalValidatorHealth {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return LocalValidatorHealth::Unknown,
+    };
+    let response = client
+        .post(rpc_url)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"getHealth"}"#)
+        .send();
+    match response {
+        Err(_) => LocalValidatorHealth::Unknown,
+        Ok(resp) => match resp.json::<serde_json::Value>() {
+            Err(_) => LocalValidatorHealth::Unknown,
+            Ok(body) => {
+                if body.get("error").is_some() {
+                    LocalValidatorHealth::NotOk
+                } else if body.get("result") == Some(&serde_json::Value::String("ok".into())) {
+                    LocalValidatorHealth::Ok
+                } else {
+                    LocalValidatorHealth::NotOk
+                }
+            }
+        },
+    }
+}
+
+fn cached_local_validator_health(
+    rpc_url: &str,
+    cache: &mut (Instant, LocalValidatorHealth),
+) -> LocalValidatorHealth {
+    const CACHE_TTL: Duration = Duration::from_secs(10);
+    if cache.0.elapsed() < CACHE_TTL {
+        return cache.1;
+    }
+    let health = probe_local_validator_get_health(rpc_url);
+    *cache = (Instant::now(), health);
+    health
+}
+
 /// PR167: detect global ingest stall (TX + account + head slot all frozen).
 /// PR233: OS thread — survives Tokio runtime freeze (same pattern as md-watchdog).
 fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
-    use ironcrab::metrics::MARKET_DATA_INGEST_PROGRESS_TICK;
+    use ironcrab::metrics::{
+        geyser_metrics_account_session_connected, geyser_metrics_tx_session_connected,
+        inc_market_data_pr167_skip_exit_total, MARKET_DATA_INGEST_PROGRESS_TICK,
+    };
+
+    let rpc_url = pr167_local_validator_health_rpc_url_from_env();
 
     std::thread::Builder::new()
         .name("md-ingest-liveness".into())
@@ -9426,6 +9567,7 @@ fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
             const CHECK_INTERVAL: Duration = Duration::from_secs(10);
             const STALL_WINDOW: Duration = Duration::from_secs(50);
             const RECOVERY_WAIT: Duration = Duration::from_secs(60);
+            let mut health_cache = (Instant::now() - Duration::from_secs(60), LocalValidatorHealth::Unknown);
             let mut last_tx = market_data_tx_handler_processed_value();
             let mut last_account = geyser_account_listener_account_updates_value();
             let mut last_head = market_data_geyser_head_slot_value();
@@ -9483,13 +9625,56 @@ fn spawn_market_data_global_ingest_liveness_task(process_started: Instant) {
                             stalled_since = None;
                         } else if recovery_requested_at.is_some_and(|t| t.elapsed() >= RECOVERY_WAIT)
                         {
-                            error!(
-                                stall_secs = RECOVERY_WAIT.as_secs(),
-                                "PR167: global ingest still stalled after reconnect — exiting for systemd restart"
-                            );
-                            #[cfg(unix)]
-                            MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
-                            std::process::exit(1);
+                            let validator_health =
+                                cached_local_validator_health(&rpc_url, &mut health_cache);
+                            let tx_session_connected = geyser_metrics_tx_session_connected();
+                            let account_session_connected =
+                                geyser_metrics_account_session_connected();
+                            match pr167_global_ingest_recovery_after_wait(
+                                validator_health,
+                                tx_session_connected,
+                                account_session_connected,
+                            ) {
+                                Pr167GlobalIngestRecoveryAction::ExitForSystemd => {
+                                    error!(
+                                        stall_secs = RECOVERY_WAIT.as_secs(),
+                                        validator_health = ?validator_health,
+                                        tx_session_connected,
+                                        account_session_connected,
+                                        "PR167: global ingest still stalled after reconnect — exiting for systemd restart"
+                                    );
+                                    #[cfg(unix)]
+                                    MD_SYSTEMD_WATCHDOG_NOTIFY.store(false, Ordering::Relaxed);
+                                    std::process::exit(1);
+                                }
+                                Pr167GlobalIngestRecoveryAction::SkipExitKeepAlive => {
+                                    let reason = pr167_skip_exit_reason(
+                                        validator_health,
+                                        tx_session_connected,
+                                        account_session_connected,
+                                    )
+                                    .expect("skip-exit branch must have reason");
+                                    let metric_reason = match reason {
+                                        Pr167SkipExitReason::ValidatorUnhealthy => {
+                                            "validator_unhealthy"
+                                        }
+                                        Pr167SkipExitReason::HealthUnknown => "health_unknown",
+                                        Pr167SkipExitReason::SessionAlive => "session_alive",
+                                    };
+                                    inc_market_data_pr167_skip_exit_total(metric_reason);
+                                    warn!(
+                                        stall_secs = RECOVERY_WAIT.as_secs(),
+                                        skip_reason = metric_reason,
+                                        validator_health = ?validator_health,
+                                        tx_session_connected,
+                                        account_session_connected,
+                                        "PR167: global ingest still stalled after reconnect — keeping process alive (re-requesting Geyser reconnect)"
+                                    );
+                                    market_data_request_tx_session_reconnect();
+                                    market_data_request_account_session_reconnect();
+                                    recovery_requested_at = Some(Instant::now());
+                                }
+                            }
                         }
                     }
                 } else {
@@ -19922,6 +20107,79 @@ mod pr_b_geyser_tracking_tests {
         assert!(!market_data_global_ingest_stalled(5, 5, 10, 11, 100, 100));
         assert!(!market_data_global_ingest_stalled(5, 6, 10, 10, 100, 100));
         assert!(!market_data_global_ingest_stalled(5, 5, 10, 10, 100, 101));
+    }
+
+    #[test]
+    fn pr167_skip_exit_when_validator_unhealthy() {
+        assert_eq!(
+            pr167_global_ingest_recovery_after_wait(LocalValidatorHealth::NotOk, false, false,),
+            Pr167GlobalIngestRecoveryAction::SkipExitKeepAlive
+        );
+        assert_eq!(
+            pr167_skip_exit_reason(LocalValidatorHealth::NotOk, false, false),
+            Some(Pr167SkipExitReason::ValidatorUnhealthy)
+        );
+    }
+
+    #[test]
+    fn pr167_skip_exit_when_health_unknown() {
+        assert_eq!(
+            pr167_global_ingest_recovery_after_wait(LocalValidatorHealth::Unknown, false, false,),
+            Pr167GlobalIngestRecoveryAction::SkipExitKeepAlive
+        );
+        assert_eq!(
+            pr167_skip_exit_reason(LocalValidatorHealth::Unknown, false, false),
+            Some(Pr167SkipExitReason::HealthUnknown)
+        );
+    }
+
+    #[test]
+    fn pr167_skip_exit_when_account_session_connected() {
+        assert_eq!(
+            pr167_global_ingest_recovery_after_wait(LocalValidatorHealth::Ok, false, true),
+            Pr167GlobalIngestRecoveryAction::SkipExitKeepAlive
+        );
+        assert_eq!(
+            pr167_skip_exit_reason(LocalValidatorHealth::Ok, false, true),
+            Some(Pr167SkipExitReason::SessionAlive)
+        );
+        assert_eq!(
+            pr167_global_ingest_recovery_after_wait(LocalValidatorHealth::Ok, true, false),
+            Pr167GlobalIngestRecoveryAction::SkipExitKeepAlive
+        );
+    }
+
+    #[test]
+    fn pr167_exit_only_when_healthy_and_both_sessions_down() {
+        assert_eq!(
+            pr167_global_ingest_recovery_after_wait(LocalValidatorHealth::Ok, false, false),
+            Pr167GlobalIngestRecoveryAction::ExitForSystemd
+        );
+        assert_eq!(
+            pr167_skip_exit_reason(LocalValidatorHealth::Ok, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn pr167_non_loopback_rpc_url_not_used_for_health_probe() {
+        assert!(!local_validator_rpc_url_is_loopback(
+            "https://api.mainnet-beta.solana.com"
+        ));
+        assert_eq!(
+            pr167_resolve_local_validator_health_rpc_url(Some(
+                "https://api.mainnet-beta.solana.com"
+            )),
+            PR167_DEFAULT_LOCAL_VALIDATOR_RPC
+        );
+        assert_eq!(
+            pr167_resolve_local_validator_health_rpc_url(Some("http://127.0.0.1:8899")),
+            "http://127.0.0.1:8899"
+        );
+        assert_eq!(
+            pr167_resolve_local_validator_health_rpc_url(Some("http://localhost:8899")),
+            "http://localhost:8899"
+        );
     }
 
     #[test]

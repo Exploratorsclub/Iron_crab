@@ -1478,6 +1478,38 @@ pub fn geyser_metrics_inc_tx_listener_transactions_total() {
 }
 
 #[inline]
+pub fn geyser_tx_listener_transactions_total_value() -> u64 {
+    GEYSER_TX_LISTENER_TRANSACTIONS_TOTAL.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn geyser_metrics_tx_session_connected() -> bool {
+    GEYSER_TX_SESSION_CONNECTED.load(Ordering::Relaxed) == 1
+}
+
+#[inline]
+pub fn geyser_metrics_account_session_connected() -> bool {
+    GEYSER_ACCOUNT_SESSION_CONNECTED.load(Ordering::Relaxed) == 1
+}
+
+/// Increment `market_data_pr167_skip_exit_total{reason=...}`.
+#[inline]
+pub fn inc_market_data_pr167_skip_exit_total(reason: &str) {
+    let counter = match reason {
+        "validator_unhealthy" => &*MARKET_DATA_PR167_SKIP_EXIT_VALIDATOR_UNHEALTHY,
+        "health_unknown" => &*MARKET_DATA_PR167_SKIP_EXIT_HEALTH_UNKNOWN,
+        "session_alive" => &*MARKET_DATA_PR167_SKIP_EXIT_SESSION_ALIVE,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_listener_handler_stale_no_reconnect_total() {
+    MARKET_DATA_TX_LISTENER_HANDLER_STALE_NO_RECONNECT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
 pub fn geyser_metrics_inc_tx_listener_payload_broadcast_total() {
     GEYSER_TX_LISTENER_PAYLOAD_BROADCAST_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
@@ -1506,6 +1538,19 @@ static MARKET_DATA_ACCOUNT_SESSION_RECONNECT_REQUESTED: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 
 /// PR167: all three ingest progress signals flat (TX handler, account listener, head slot).
+/// PR167 recovery: skipped `exit(1)` while validator unhealthy (`getHealth` not ok).
+pub static MARKET_DATA_PR167_SKIP_EXIT_VALIDATOR_UNHEALTHY: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR167 recovery: skipped `exit(1)` because local `getHealth` probe failed (timeout/transport/parse).
+pub static MARKET_DATA_PR167_SKIP_EXIT_HEALTH_UNKNOWN: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// PR167 recovery: skipped `exit(1)` because at least one Geyser session still connected.
+pub static MARKET_DATA_PR167_SKIP_EXIT_SESSION_ALIVE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// TX Geyser liveness: handler flat while listener+head advance — no session reconnect (PR167-B).
+pub static MARKET_DATA_TX_LISTENER_HANDLER_STALE_NO_RECONNECT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+
 pub static MARKET_DATA_GLOBAL_INGEST_STALLS_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 pub static MARKET_DATA_GLOBAL_INGEST_LAST_PROGRESS_UNIX_MS: Lazy<AtomicU64> =
@@ -9186,6 +9231,31 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_global_ingest_stalls_total",
         MARKET_DATA_GLOBAL_INGEST_STALLS_TOTAL.load(Ordering::Relaxed)
+    );
+    out.push_str("market_data_pr167_skip_exit_total{reason=\"validator_unhealthy\"} ");
+    out.push_str(
+        &MARKET_DATA_PR167_SKIP_EXIT_VALIDATOR_UNHEALTHY
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_pr167_skip_exit_total{reason=\"health_unknown\"} ");
+    out.push_str(
+        &MARKET_DATA_PR167_SKIP_EXIT_HEALTH_UNKNOWN
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("market_data_pr167_skip_exit_total{reason=\"session_alive\"} ");
+    out.push_str(
+        &MARKET_DATA_PR167_SKIP_EXIT_SESSION_ALIVE
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "market_data_tx_listener_handler_stale_no_reconnect_total",
+        MARKET_DATA_TX_LISTENER_HANDLER_STALE_NO_RECONNECT_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_global_ingest_last_progress_unix_ms",

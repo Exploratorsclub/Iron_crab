@@ -50,6 +50,8 @@ use crate::metrics::{
     geyser_metrics_inc_tx_listener_payload_broadcast_total,
     geyser_metrics_inc_tx_listener_transactions_total,
     geyser_metrics_set_account_session_connected, geyser_metrics_set_tx_session_connected,
+    geyser_tx_listener_transactions_total_value,
+    inc_market_data_tx_listener_handler_stale_no_reconnect_total,
     market_data_geyser_head_slot_value, market_data_take_account_session_reconnect_request,
     market_data_take_tx_session_reconnect_request, market_data_tx_handler_processed_value,
     GeyserReconnectReason,
@@ -295,6 +297,40 @@ pub struct GeyserAccountListener {
     account_tx: broadcast::Sender<GeyserAccountUpdate>,
 }
 
+/// PR167-B: 60s TX liveness tick decision (unit-testable; no gRPC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxLivenessTickAction {
+    FirstWindowBaseline,
+    Continue,
+    ReconnectStaleStream,
+    WarnHandlerStuckNoReconnect,
+}
+
+pub(crate) fn tx_liveness_tick_action(
+    listener_tx_now: u64,
+    listener_tx_at_last_tick: u64,
+    tx_handler_total: u64,
+    last_liveness_tx_handler_total: u64,
+    head: u64,
+    last_liveness_head_slot: u64,
+    first_liveness_window: bool,
+) -> TxLivenessTickAction {
+    if first_liveness_window {
+        return TxLivenessTickAction::FirstWindowBaseline;
+    }
+    if head <= last_liveness_head_slot {
+        return TxLivenessTickAction::Continue;
+    }
+    let listener_flat = listener_tx_now == listener_tx_at_last_tick;
+    if listener_flat {
+        return TxLivenessTickAction::ReconnectStaleStream;
+    }
+    if tx_handler_total == last_liveness_tx_handler_total {
+        return TxLivenessTickAction::WarnHandlerStuckNoReconnect;
+    }
+    TxLivenessTickAction::Continue
+}
+
 impl GeyserTxListener {
     pub fn new(
         endpoint: String,
@@ -369,10 +405,6 @@ impl GeyserTxListener {
             std::time::Instant::now() - std::time::Duration::from_secs(10);
         let mut last_log = std::time::Instant::now();
         let mut transaction_count: u64 = 0;
-        let mut seen_tx_since_connect = false;
-        let mut last_liveness_tx_handler_total: u64 = 0;
-        let mut last_liveness_head_slot: u64 = 0;
-        let mut first_liveness_window = true;
 
         'outer: loop {
             let mut client = loop {
@@ -422,6 +454,12 @@ impl GeyserTxListener {
                     "geyser_tx_listener: subscribed (TX sacred — no further subscribe updates)"
                 );
 
+                let mut last_liveness_tx_handler_total: u64 = 0;
+                let mut last_liveness_head_slot: u64 = 0;
+                let mut last_liveness_listener_tx_total: u64 =
+                    geyser_tx_listener_transactions_total_value();
+                let mut first_liveness_window = true;
+
                 let mut got_payload_since_subscribe = false;
                 let mut liveness = tokio::time::interval(Duration::from_secs(60));
                 liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -447,27 +485,51 @@ impl GeyserTxListener {
                             }
                             let head = market_data_geyser_head_slot_value();
                             let tx_handler_total = market_data_tx_handler_processed_value();
-                            if first_liveness_window {
-                                last_liveness_head_slot = head;
-                                last_liveness_tx_handler_total = tx_handler_total;
-                                first_liveness_window = false;
-                                continue;
+                            let listener_tx_total = geyser_tx_listener_transactions_total_value();
+                            match tx_liveness_tick_action(
+                                listener_tx_total,
+                                last_liveness_listener_tx_total,
+                                tx_handler_total,
+                                last_liveness_tx_handler_total,
+                                head,
+                                last_liveness_head_slot,
+                                first_liveness_window,
+                            ) {
+                                TxLivenessTickAction::FirstWindowBaseline => {
+                                    last_liveness_head_slot = head;
+                                    last_liveness_tx_handler_total = tx_handler_total;
+                                    last_liveness_listener_tx_total = listener_tx_total;
+                                    first_liveness_window = false;
+                                }
+                                TxLivenessTickAction::Continue => {
+                                    last_liveness_head_slot = head;
+                                    last_liveness_tx_handler_total = tx_handler_total;
+                                    last_liveness_listener_tx_total = listener_tx_total;
+                                }
+                                TxLivenessTickAction::ReconnectStaleStream => {
+                                    warn!(
+                                        listener_tx_total,
+                                        head_slot = head,
+                                        prev_head_slot = last_liveness_head_slot,
+                                        "geyser_tx_listener: TX stream wedged (listener flat, head advanced) — forcing reconnect"
+                                    );
+                                    geyser_metrics_inc_tx_listener_liveness_reconnect_total();
+                                    break 'read SessionExit::TxLivenessStale;
+                                }
+                                TxLivenessTickAction::WarnHandlerStuckNoReconnect => {
+                                    warn!(
+                                        tx_handler_total,
+                                        listener_tx_total,
+                                        head_slot = head,
+                                        prev_head_slot = last_liveness_head_slot,
+                                        "geyser_tx_listener: TX handler stale while listener+head advance — not reconnecting session"
+                                    );
+                                    inc_market_data_tx_listener_handler_stale_no_reconnect_total();
+                                    last_liveness_head_slot = head;
+                                    last_liveness_tx_handler_total = tx_handler_total;
+                                    last_liveness_listener_tx_total = listener_tx_total;
+                                }
                             }
-                            if seen_tx_since_connect
-                                && tx_handler_total == last_liveness_tx_handler_total
-                                && head > last_liveness_head_slot
-                            {
-                                warn!(
-                                    tx_handler_total,
-                                    head_slot = head,
-                                    prev_head_slot = last_liveness_head_slot,
-                                    "geyser_tx_listener: TX handler stale while chain advanced — forcing reconnect"
-                                );
-                                geyser_metrics_inc_tx_listener_liveness_reconnect_total();
-                                break 'read SessionExit::TxLivenessStale;
-                            }
-                            last_liveness_head_slot = head;
-                            last_liveness_tx_handler_total = tx_handler_total;
                         }
                         maybe_message = stream.next() => {
                             match maybe_message {
@@ -500,7 +562,6 @@ impl GeyserTxListener {
                                                 geyser_metrics_inc_tx_listener_transactions_total();
                                                 transaction_count = transaction_count.saturating_add(1);
                                                 if let Some(tx) = tx_update.transaction {
-                                                    seen_tx_since_connect = true;
                                                     let signature = if !tx.signature.is_empty() {
                                                         bs58::encode(&tx.signature).into_string()
                                                     } else {
@@ -1289,8 +1350,8 @@ impl GeyserAccountListener {
 mod geyser_resilience_tests {
     use super::{
         build_account_subscribe_request, build_tx_subscribe_request, geyser_reconnect_sleep_ms,
-        GeyserAccountListener, SubscriptionSinkPushOutcome, SUBSCRIBE_SINK_MIN_INTERVAL,
-        SUBSCRIBE_SINK_SEND_TIMEOUT,
+        tx_liveness_tick_action, GeyserAccountListener, SubscriptionSinkPushOutcome,
+        TxLivenessTickAction, SUBSCRIBE_SINK_MIN_INTERVAL, SUBSCRIBE_SINK_SEND_TIMEOUT,
     };
     use futures::SinkExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1453,5 +1514,33 @@ mod geyser_resilience_tests {
         assert!(f.cuckoo_accounts_filter.is_some());
         assert!(f.account.is_empty());
         assert!(f.owner.is_empty());
+    }
+
+    #[test]
+    fn tx_liveness_reconnect_when_listener_flat_and_head_advances() {
+        assert_eq!(
+            tx_liveness_tick_action(100, 100, 50, 50, 200, 199, false),
+            TxLivenessTickAction::ReconnectStaleStream
+        );
+    }
+
+    #[test]
+    fn tx_liveness_no_reconnect_when_listener_runs_handler_stuck() {
+        assert_eq!(
+            tx_liveness_tick_action(101, 100, 50, 50, 200, 199, false),
+            TxLivenessTickAction::WarnHandlerStuckNoReconnect
+        );
+    }
+
+    #[test]
+    fn tx_liveness_resets_first_window_on_new_session() {
+        assert_eq!(
+            tx_liveness_tick_action(100, 100, 50, 40, 200, 199, true),
+            TxLivenessTickAction::FirstWindowBaseline
+        );
+        assert_eq!(
+            tx_liveness_tick_action(100, 100, 50, 50, 200, 199, true),
+            TxLivenessTickAction::FirstWindowBaseline
+        );
     }
 }
