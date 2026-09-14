@@ -100,8 +100,9 @@ impl PoolAddressBook {
     pub fn evict_stale(&mut self, now_ms: u64) -> usize {
         let ttl = self.ttl_ms;
         let before = self.entries.len();
-        self.entries
-            .retain(|_, e| now_ms.saturating_sub(e.last_seen_ms) <= ttl);
+        self.entries.retain(|pool, e| {
+            pump_amm_v14_pin_payload(pool, &e.keys) || now_ms.saturating_sub(e.last_seen_ms) <= ttl
+        });
         before - self.entries.len()
     }
 
@@ -109,14 +110,20 @@ impl PoolAddressBook {
         if self.entries.len() <= self.cap {
             return 0;
         }
-        let mut by_lru: Vec<(Pubkey, u64)> = self
+        let to_remove = self.entries.len() - self.cap;
+        let mut by_evict_priority: Vec<(Pubkey, u64, bool)> = self
             .entries
             .iter()
-            .map(|(p, e)| (*p, e.lru_stamp))
+            .map(|(p, e)| {
+                let v14 = pump_amm_v14_pin_payload(p, &e.keys);
+                (*p, e.lru_stamp, v14)
+            })
             .collect();
-        by_lru.sort_by_key(|(_, stamp)| *stamp);
-        let to_remove = self.entries.len() - self.cap;
-        for (pool, _) in by_lru.into_iter().take(to_remove) {
+        // Drop incomplete book rows before Pump v14 pin-payload; then oldest LRU.
+        by_evict_priority.sort_by(|a, b| {
+            a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1))
+        });
+        for (pool, _, _) in by_evict_priority.into_iter().take(to_remove) {
             self.entries.remove(&pool);
         }
         to_remove
@@ -157,6 +164,16 @@ impl PoolAddressBook {
 
 fn non_default(pk: Pubkey) -> Option<Pubkey> {
     (pk != Pubkey::default()).then_some(pk)
+}
+
+/// Pump AMM layer C (v14 instruction accounts) ready for pin promotion — not subject to book TTL.
+fn pump_amm_v14_pin_payload(pool: &Pubkey, keys: &PoolLayoutKeys) -> bool {
+    match keys {
+        PoolLayoutKeys::PumpAmm { pool_accounts, .. } => {
+            pool_accounts.len() >= 14 && pool_accounts.first() == Some(pool)
+        }
+        _ => false,
+    }
 }
 
 fn merge_layout_keys(existing: &PoolLayoutKeys, incoming: &PoolLayoutKeys) -> PoolLayoutKeys {
@@ -628,5 +645,69 @@ mod tests {
         assert!(!book.contains(&p0));
         assert!(book.contains(&p1));
         assert!(book.contains(&p2));
+    }
+
+    fn test_pump_v14_keys(pool: Pubkey) -> PoolLayoutKeys {
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let mut pool_accounts = vec![
+            pool,
+            Pubkey::new_unique(),
+            base,
+            quote,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        pool_accounts.extend((0..8).map(|_| Pubkey::new_unique()));
+        PoolLayoutKeys::PumpAmm {
+            base_mint: base,
+            quote_mint: quote,
+            pool_base_token_account: pool_accounts[4],
+            pool_quote_token_account: pool_accounts[5],
+            pool_accounts,
+        }
+    }
+
+    #[test]
+    fn ttl_evict_retains_pump_v14_pin_payload() {
+        let mut book = PoolAddressBook::with_ttl_and_cap(DEFAULT_TTL_MS, 10);
+        let pool = Pubkey::new_unique();
+        book.merge(pool, test_pump_v14_keys(pool), 0);
+        assert_eq!(book.evict_stale(DEFAULT_TTL_MS + 1), 0);
+        assert!(book.contains(&pool));
+    }
+
+    #[test]
+    fn cap_evict_prefers_incomplete_over_pump_v14() {
+        let mut book = PoolAddressBook::with_ttl_and_cap(1_000_000, 2);
+        let pump_pool = Pubkey::new_unique();
+        let orca_pool = Pubkey::new_unique();
+        book.merge(pump_pool, test_pump_v14_keys(pump_pool), 1);
+        let partial = Pubkey::new_unique();
+        book.merge(
+            partial,
+            PoolLayoutKeys::PumpAmm {
+                base_mint: Pubkey::new_unique(),
+                quote_mint: Pubkey::new_unique(),
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                pool_accounts: vec![],
+            },
+            2,
+        );
+        book.merge(
+            orca_pool,
+            PoolLayoutKeys::Orca {
+                token_mint_a: Pubkey::new_unique(),
+                token_mint_b: Pubkey::new_unique(),
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+            },
+            3,
+        );
+        assert_eq!(book.len(), 2);
+        assert!(book.contains(&pump_pool));
+        assert!(book.contains(&orca_pool));
+        assert!(!book.contains(&partial));
     }
 }

@@ -24751,6 +24751,55 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
+    fn promote_address_book_pump_v14_survives_book_ttl() {
+        use ironcrab::execution::pool_address_book::DEFAULT_TTL_MS;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let accounts = test_pump_amm_v14_pool_accounts(pool, base, quote);
+
+        let t0 = 1_000u64;
+        ctx.pool_address_book.lock().merge(
+            pool,
+            PoolLayoutKeys::PumpAmm {
+                base_mint: base,
+                quote_mint: quote,
+                pool_base_token_account: accounts[4],
+                pool_quote_token_account: accounts[5],
+                pool_accounts: accounts.clone(),
+            },
+            t0,
+        );
+
+        let stale_ms = t0 + DEFAULT_TTL_MS + 1;
+        assert_eq!(ctx.pool_address_book.lock().evict_stale(stale_ms), 0);
+        assert!(
+            ctx.pool_address_book.lock().contains(&pool),
+            "complete Pump v14 book row must survive DEFAULT_TTL_MS"
+        );
+
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        assert!(ctx.promote_address_book_to_master_if_needed(pool, 0, None));
+        let state = ctx
+            .live_pool_cache
+            .get(&pool)
+            .expect("MASTER after promote");
+        let CachedPoolState::PumpAmm(s) = state else {
+            panic!("expected PumpAmm");
+        };
+        assert_eq!(s.pool_accounts.len(), 14);
+        assert_eq!(s.pool_accounts[0], pool);
+        assert!(s.base_reserve.is_none());
+        assert!(s.quote_reserve.is_none());
+    }
+
+    #[test]
     fn apply_arb_active_entries_pin_path_has_no_get_account() {
         let src = include_str!("market_data.rs");
         let start = src

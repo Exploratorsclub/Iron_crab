@@ -277,7 +277,25 @@ fn md_sidefx_build_balance_updated_from_cache(
             host.live_pool_cache()
                 .merge_pumpfun_bonding_readiness(*pool_pubkey, DexPoolReadiness::Partial);
         }
-        CachedPoolState::PumpAmm(_) => {}
+        CachedPoolState::PumpAmm(s) => {
+            // FIX-26 / I-MD-4: JetStream last message must carry layout C when MASTER has it.
+            let effective_pool_accounts = if !s.pool_accounts.is_empty() {
+                s.pool_accounts.clone()
+            } else {
+                host.live_pool_cache()
+                    .get_pump_amm_pool_accounts(pool_pubkey)
+                    .unwrap_or_default()
+            };
+            if !effective_pool_accounts.is_empty() {
+                let mut meta = std::collections::HashMap::new();
+                let accounts_str: Vec<String> = effective_pool_accounts
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
+                meta.insert("pool_accounts".to_string(), accounts_str.join(","));
+                balance_update.metadata = Some(meta);
+            }
+        }
     }
     record_arb_quality_master_update(host, &balance_update);
     Some(balance_update)
