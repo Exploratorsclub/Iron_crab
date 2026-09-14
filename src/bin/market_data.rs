@@ -2417,8 +2417,16 @@ fn planned_explicit_pubkeys_for_pool_from_cache(
             }
         }
     }
-    if let CachedPoolState::PumpFun(_) = state {
-        set.insert(pool);
+    match state {
+        CachedPoolState::Orca(_)
+        | CachedPoolState::RaydiumAmm(_)
+        | CachedPoolState::RaydiumCpmm(_)
+        | CachedPoolState::Meteora(_)
+        | CachedPoolState::MeteoraCpmm(_)
+        | CachedPoolState::PumpAmm(_)
+        | CachedPoolState::PumpFun(_) => {
+            set.insert(pool);
+        }
     }
     if let Some((a, b)) = pool_mints_for_geyser_explicit_tracking(state) {
         set.insert(a);
@@ -4509,25 +4517,38 @@ impl MarketDataContext {
         out
     }
 
-    /// PumpFun bonding curve must be in the last Geyser explicit flush **or** admitted pending flush.
+    /// Pool account (bonding curve / whirlpool / lbPair / Raydium AMM) must be in the last Geyser
+    /// explicit flush **or** admitted pending flush while layout-only MASTER rows still need decode.
     fn pool_pumpfun_bonding_curve_registration_satisfied(
         &self,
         pool: Pubkey,
         state: &CachedPoolState,
         admission: Option<&FixedCapAdmission>,
     ) -> bool {
-        match state {
-            CachedPoolState::PumpFun(_) => {
-                if !self.hot_pool_registry.is_hot_pool(pool) {
-                    return true;
-                }
-                if self.last_synced_explicit_pubkeys.read().contains(&pool) {
-                    return true;
-                }
-                admission.is_some_and(|a| a.snapshot_pubkeys().contains(&pool))
-            }
-            _ => true,
+        if !self.hot_pool_registry.is_hot_pool(pool) {
+            return true;
         }
+        let needs_pool_account_explicit = match state {
+            CachedPoolState::PumpFun(_) => true,
+            CachedPoolState::Orca(s) => !s.whirlpool_quote_account_seeded,
+            CachedPoolState::Meteora(s) => {
+                self.config.read().enable_meteora_dlmm && !s.dlmm_bin_params_account_seeded
+            }
+            CachedPoolState::RaydiumAmm(s) => {
+                s.coin_vault == Pubkey::default()
+                    || s.pc_vault == Pubkey::default()
+                    || s.coin_reserve.is_none()
+                    || s.pc_reserve.is_none()
+            }
+            _ => false,
+        };
+        if !needs_pool_account_explicit {
+            return true;
+        }
+        if self.last_synced_explicit_pubkeys.read().contains(&pool) {
+            return true;
+        }
+        admission.is_some_and(|a| a.snapshot_pubkeys().contains(&pool))
     }
 
     /// DLMM bin-array PDAs must be in the last Geyser explicit flush **or** admitted pending flush.
@@ -14626,6 +14647,73 @@ mod pr_b_geyser_tracking_tests {
             "bonding curve (pool pubkey) must be in planned explicit set"
         );
         assert!(pubkeys.contains(&mint));
+    }
+
+    #[test]
+    fn planned_explicit_pubkeys_includes_pool_for_orca_layout_seed() {
+        let pool = Pubkey::new_unique();
+        let state = CachedPoolState::Orca(
+            ironcrab::execution::live_pool_cache::orca_whirlpool_tx_layout_seed(
+                Pubkey::new_unique(),
+                Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+            ),
+        );
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        assert!(
+            pubkeys.contains(&pool),
+            "orca layout-seed row must plan pool pubkey for Geyser explicit"
+        );
+    }
+
+    #[test]
+    fn planned_explicit_pubkeys_includes_pool_for_dlmm_unseeded_bins() {
+        let pool = Pubkey::new_unique();
+        let state = CachedPoolState::Meteora(ironcrab::execution::live_pool_cache::MeteoraState {
+            token_x_mint: Pubkey::new_unique(),
+            token_y_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            reserve_x: Pubkey::new_unique(),
+            reserve_y: Pubkey::new_unique(),
+            active_id: 0,
+            bin_step: 10,
+            reserve_x_balance: None,
+            reserve_y_balance: None,
+            dlmm_bin_params_account_seeded: false,
+        });
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        assert!(
+            pubkeys.contains(&pool),
+            "DLMM with unseeded lbPair must still plan pool pubkey"
+        );
+        let bin_pdas = planned_meteora_dlmm_bin_pubkeys_for_cache(pool, &state);
+        assert!(bin_pdas.is_empty());
+    }
+
+    #[test]
+    fn planned_explicit_pubkeys_includes_pool_for_raydium_amm() {
+        let pool = Pubkey::new_unique();
+        let state = CachedPoolState::RaydiumAmm(RaydiumAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            coin_vault: Pubkey::new_unique(),
+            pc_vault: Pubkey::new_unique(),
+            base_decimals: 9,
+            quote_decimals: 9,
+            coin_reserve: None,
+            pc_reserve: None,
+            market_id: Pubkey::default(),
+            serum_bids: None,
+            serum_asks: None,
+            serum_event_queue: None,
+            serum_base_vault: None,
+            serum_quote_vault: None,
+        });
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        assert!(
+            pubkeys.contains(&pool),
+            "Raydium AMM MASTER row must plan pool pubkey for account decode"
+        );
     }
 
     #[test]

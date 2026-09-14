@@ -9775,6 +9775,25 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    out.push_str("market_data_tx_pool_accounts_hot_apply_total{result=\"address_book\"} ");
+    out.push_str(
+        &MARKET_DATA_TX_POOL_ACCOUNTS_HOT_APPLY_ADDRESS_BOOK
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
+    line!(
+        "market_data_pool_address_book_promote_total",
+        MARKET_DATA_POOL_ADDRESS_BOOK_PROMOTE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pool_address_book_demote_total",
+        MARKET_DATA_POOL_ADDRESS_BOOK_DEMOTE_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pool_address_book_entries",
+        MARKET_DATA_POOL_ADDRESS_BOOK_ENTRIES_GAUGE.load(Ordering::Relaxed)
+    );
     out.push_str("market_data_tx_layout_seed_preserve_quote_total ");
     out.push_str(
         &MARKET_DATA_TX_LAYOUT_SEED_PRESERVE_QUOTE
