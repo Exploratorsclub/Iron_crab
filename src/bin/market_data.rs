@@ -4600,6 +4600,11 @@ impl MarketDataContext {
         }
         let bin_pdas = planned_meteora_dlmm_bin_pubkeys_for_cache(pool, state);
         if bin_pdas.is_empty() {
+            if let CachedPoolState::Meteora(s) = state {
+                if self.config.read().enable_meteora_dlmm && !s.dlmm_bin_params_account_seeded {
+                    return false;
+                }
+            }
             return true;
         }
         let synced = self.last_synced_explicit_pubkeys.read();
@@ -5439,14 +5444,39 @@ impl MarketDataContext {
         }
     }
 
+    /// PDAs that must not be evicted from the DLMM bin Geyser stash (hot pool bin window + tracked).
+    fn dlmm_bin_stash_protected_pubkeys(&self) -> std::collections::HashSet<Pubkey> {
+        use std::collections::HashSet;
+        let mut protected = HashSet::new();
+        for pool in self.hot_pool_registry.snapshot_hot_pool_pubkeys() {
+            if let Some(state) = self.live_pool_cache.get(&pool) {
+                for pda in planned_meteora_dlmm_bin_pubkeys_for_cache(pool, &state) {
+                    protected.insert(pda);
+                }
+            }
+        }
+        for (pda, info) in self.tracked_bin_arrays.read().iter() {
+            if self.hot_pool_registry.is_hot_pool(info.pool_address) {
+                protected.insert(*pda);
+            }
+        }
+        protected
+    }
+
     /// C1e: stash bin-array Geyser payload dropped before membership registration (METEORA owner stream).
     fn maybe_stash_dlmm_bin_array_before_early_drop(&self, update: &GeyserAccountUpdate) {
         if !ironcrab::market_data::ingest::geyser_update_looks_like_meteora_bin_array(update) {
             return;
         }
+        let protected = self.dlmm_bin_stash_protected_pubkeys();
         let mut stash = self.dlmm_bin_geyser_stash.write();
         while stash.len() >= DLMM_BIN_GEYSER_STASH_MAX {
-            if let Some(key) = stash.keys().next().copied() {
+            let victim = stash
+                .keys()
+                .find(|pk| !protected.contains(pk))
+                .copied()
+                .or_else(|| stash.keys().next().copied());
+            if let Some(key) = victim {
                 stash.remove(&key);
             } else {
                 break;
@@ -6009,6 +6039,9 @@ impl MarketDataContext {
         let CachedPoolState::Meteora(s) = cached_state else {
             return true;
         };
+        if !s.dlmm_bin_params_account_seeded {
+            return false;
+        }
         let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
         let bins = self.tracked_bin_arrays.read();
         for offset in -3i64..=3i64 {
@@ -6451,6 +6484,9 @@ impl MarketDataContext {
         let CachedPoolState::Meteora(s) = &state else {
             return false;
         };
+        if !s.dlmm_bin_params_account_seeded {
+            return false;
+        }
         let prev = self.dlmm_registered_active_id.read().get(&pool).copied();
         let bins_untracked = !self.pool_geyser_bins_fully_tracked_for_cache(pool, &state);
         if prev == Some(new_active_id) && !bins_untracked {
@@ -19692,6 +19728,89 @@ mod pr_b_geyser_tracking_tests {
         let vs = ctx.tracked_vaults.read();
         assert!(vs.contains_key(&coin_vault));
         assert!(vs.contains_key(&pc_vault));
+    }
+
+    #[test]
+    fn account_path_hot_pool_register_skips_non_hot_pool() {
+        use ironcrab::market_data::sidefx::SidefxWorkerHost;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = Arc::new(minimal_market_data_context_for_pr_d_tests(jsonl));
+        let (md_state, _, _) = test_md_state_sender_no_worker();
+        let host = test_sidefx_host(&ctx, md_state, test_noop_track_worker_sender());
+
+        let pool = Pubkey::new_unique();
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let coin_vault = Pubkey::new_unique();
+        let pc_vault = Pubkey::new_unique();
+
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::RaydiumAmm(RaydiumAmmState {
+                base_mint: base,
+                quote_mint: quote,
+                coin_vault,
+                pc_vault,
+                base_decimals: 9,
+                quote_decimals: 9,
+                coin_reserve: Some(1),
+                pc_reserve: Some(2),
+                market_id: Pubkey::new_unique(),
+                serum_bids: None,
+                serum_asks: None,
+                serum_event_queue: None,
+                serum_base_vault: None,
+                serum_quote_vault: None,
+            }),
+            1,
+        );
+
+        host.register_geyser_reserves_after_hot_pool_cache_fill(pool);
+
+        let vs = ctx.tracked_vaults.read();
+        assert!(
+            !vs.contains_key(&coin_vault) && !vs.contains_key(&pc_vault),
+            "non-hot pool must not register vaults on account-path fill hook"
+        );
+    }
+
+    #[test]
+    fn dlmm_hot_pin_bins_geyser_registration_unseeded_not_satisfied() {
+        use ironcrab::execution::live_pool_cache::MeteoraState;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let state = CachedPoolState::Meteora(MeteoraState {
+            token_x_mint: Pubkey::new_unique(),
+            token_y_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            reserve_x: Pubkey::new_unique(),
+            reserve_y: Pubkey::new_unique(),
+            active_id: 100,
+            bin_step: 10,
+            reserve_x_balance: Some(1),
+            reserve_y_balance: Some(2),
+            dlmm_bin_params_account_seeded: false,
+        });
+        ctx.live_pool_cache.upsert(pool, state.clone(), 1);
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.note_explicit_arb_pool_admitted(pool);
+        ctx.last_synced_explicit_pubkeys.write().insert(pool);
+
+        assert!(
+            !ctx.pool_meteora_dlmm_bins_geyser_registration_satisfied(pool, &state, None),
+            "empty planned bin list must not vacuously satisfy when lbPair params are unseeded"
+        );
+        assert!(
+            !ctx.hot_pool_reserve_registration_satisfied(pool),
+            "hot DLMM pin must stay unsatisfied until account-seeded bin window is explicit"
+        );
     }
 
     #[test]

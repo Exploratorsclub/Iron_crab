@@ -6372,6 +6372,34 @@ impl ArbContext {
         true
     }
 
+    /// Seed screening `vault_balances` from SLAVE when a pool enters the arb pin set (closes JetStream-before-pin race).
+    fn seed_vault_balances_for_newly_pinned_pools(
+        &self,
+        old_pools: &HashSet<String>,
+        new_pools: &HashSet<String>,
+    ) {
+        let vault_wait = Instant::now();
+        let mut vault_cache = self.vault_balances.write();
+        record_arb_writer_lock_wait(ArbWriterLockKind::VaultBalancesWrite, vault_wait.elapsed());
+        for pool_key in new_pools.iter().filter(|p| !old_pools.contains(*p)) {
+            if try_refresh_vault_from_live_cache(
+                pool_key,
+                &self.live_pool_cache,
+                &mut vault_cache,
+                "pin",
+            ) {
+                inc_arb_vault_live_snapshot_refreshed_total();
+            } else if try_seed_vault_from_live_cache(
+                pool_key,
+                &self.live_pool_cache,
+                &mut vault_cache,
+                "pin",
+            ) {
+                inc_arb_vault_live_snapshot_seeded_total();
+            }
+        }
+    }
+
     /// Handle PoolStateUpdate event - cache vault balances from Geyser
     /// This eliminates RPC calls to fetch vault balances during quoting.
     #[allow(clippy::too_many_arguments)]
@@ -7940,6 +7968,8 @@ impl ArbContext {
         if old_pools != new_pools {
             let mut pinned = self.arb_pinned_pools.write();
             *pinned = new_pools.clone();
+            drop(pinned);
+            self.seed_vault_balances_for_newly_pinned_pools(&old_pools, &new_pools);
         }
 
         {
@@ -13880,6 +13910,38 @@ mod two_hop_price_tests {
         assert!(
             pin_slave_snapshot_age_allowed(5_000),
             "pin seed allows SLAVE age within MAX_PRICE_AGE_MS"
+        );
+    }
+
+    #[test]
+    fn arb_pin_set_change_seeds_vault_from_slave_after_jetstream_race() {
+        let cache = create_shared_cache();
+        let pool = Pubkey::new_unique();
+        let pool_str = pool.to_string();
+        let seed_update = PoolCacheUpdate::new_balance_updated(
+            TEST_COMPONENT,
+            TEST_BUILD,
+            TEST_RUN,
+            pool_str.clone(),
+            "orca".to_string(),
+            Pubkey::new_unique().to_string(),
+            NATIVE_SOL_MINT.to_string(),
+            1_000_000_000_000,
+            2_000_000_000,
+            100,
+        );
+        ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &seed_update);
+
+        let ctx = test_arb_context(cache);
+        assert!(!ctx.vault_balances.read().contains_key(&pool_str));
+
+        let old_pools = HashSet::new();
+        let new_pools = HashSet::from([pool_str.clone()]);
+        ctx.seed_vault_balances_for_newly_pinned_pools(&old_pools, &new_pools);
+
+        assert!(
+            ctx.vault_balances.read().contains_key(&pool_str),
+            "new arb pin must seed screening vault_balances from SLAVE when JetStream filled cache first"
         );
     }
 

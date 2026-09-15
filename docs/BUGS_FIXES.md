@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MD-ARB-COVERAGE-AFTER-PIN: Vault/bin Geyser registration + arb vault_balances nach Pin
+**Datum**: 2026-09-15  
+**Problem**: Hot DLMM `pool_meteora_dlmm_bins_geyser_registration_satisfied` war bei leerer Bin-PDA-Liste (lbPair unseeded) vakuum `true`; Bin-Stash evictierte FIFO inkl. später registrierter Hot-Fenster; Arb `vault_balances` blieb leer wenn JetStream SLAVE vor `arb_pinned_pools` füllte (`consume_vault_seed` pin-gated).  
+**Fix**: Unseeded hot Meteora → Bin-Explicit-Satisfaction `false` + `pool_geyser_bins_fully_tracked` `false`; DLMM-Bin-Refresh nur nach `dlmm_bin_params_account_seeded`; Stash-Evict überspringt Hot-geplante/tracked Bin-PDAs; Track-Selection seedet `vault_balances` aus SLAVE für neu gepinnte Pools. Account-Pfad `register_geyser_reserves_after_hot_pool_cache_fill` (TX-Parität) unverändert. Kein RPC, kein Owner-Filter-Change.  
+**Dateien**: `src/bin/market_data.rs`, `src/bin/arb_strategy.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-PUMP-V14-BOOK-JETSTREAM: Pump AMM layer C through pin + JetStream (KNOWN_BUG #28, #33)
 **Datum**: 2026-09-15  
 **Problem**: Ungepinnte Pump-v14-`pool_accounts` im Adressbuch starben nach `DEFAULT_TTL_MS` vor Arb-Pin; Promote ohne C; Cache-Pfad `BalanceUpdated` publizierte ohne `metadata.pool_accounts` → JetStream-Bootstrap ohne Layout-C trotz MASTER.  
