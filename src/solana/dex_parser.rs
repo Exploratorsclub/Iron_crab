@@ -2395,7 +2395,7 @@ mod tests {
 
         let mut orca_ix_data = ORCA_SWAP.to_vec();
         orca_ix_data.extend_from_slice(&[0u8; 34]);
-        let orca_ix_accounts = vec![token_program, Pubkey::new_unique(), orca_pool, trader];
+        let orca_ix_accounts = [token_program, Pubkey::new_unique(), orca_pool, trader];
 
         let spl_token = token_program;
         let system = Pubkey::from_str("11111111111111111111111111111111").unwrap();
