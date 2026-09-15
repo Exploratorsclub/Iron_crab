@@ -347,6 +347,9 @@ static MARKET_DATA_ACCOUNT_PATH_HOT_VAULT_REGISTER_INCOMPLETE: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
 /// TX layout-only hot-apply preserved existing account quote fields (merge skip-overwrite).
 static MARKET_DATA_TX_LAYOUT_SEED_PRESERVE_QUOTE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PUMP_AMM_CPI_HARVESTED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+static MARKET_DATA_TX_PUMP_AMM_CPI_HARVEST_WINNER_OTHER_DEX: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// TX pin-seed Schicht C writes to LivePoolCache (`dex=pump_amm|orca|meteora_dlmm|...`).
 static MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_PUMP_AMM: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -823,6 +826,16 @@ pub fn inc_market_data_trade_path_vault_register_total(pin: TradePathVaultRegist
 #[inline]
 pub fn inc_market_data_tx_layout_seed_preserve_quote_total() {
     MARKET_DATA_TX_LAYOUT_SEED_PRESERVE_QUOTE.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_pump_amm_cpi_harvested_total() {
+    MARKET_DATA_TX_PUMP_AMM_CPI_HARVESTED.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_tx_pump_amm_cpi_harvest_winner_other_dex_total() {
+    MARKET_DATA_TX_PUMP_AMM_CPI_HARVEST_WINNER_OTHER_DEX.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Increment `market_data_tx_pin_seed_pool_accounts_written_total{dex}`.
@@ -9871,6 +9884,14 @@ async fn metrics_response() -> Response<Body> {
             .to_string(),
     );
     out.push('\n');
+    line!(
+        "market_data_tx_pump_amm_cpi_harvested_total",
+        MARKET_DATA_TX_PUMP_AMM_CPI_HARVESTED.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tx_pump_amm_cpi_harvest_winner_other_dex_total",
+        MARKET_DATA_TX_PUMP_AMM_CPI_HARVEST_WINNER_OTHER_DEX.load(Ordering::Relaxed)
+    );
     out.push_str("market_data_tx_pin_seed_pool_accounts_written_total{dex=\"pump_amm\"} ");
     out.push_str(
         &MARKET_DATA_TX_PIN_SEED_POOL_ACCOUNTS_WRITTEN_PUMP_AMM

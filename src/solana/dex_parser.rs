@@ -220,6 +220,15 @@ pub fn parse_transaction_update(update: &GeyserTransactionUpdate) -> Option<Pars
     parse_transaction_update_with_pool_lookup(update, None)
 }
 
+/// Primary DEX event plus optional Pump AMM CPI harvests for MD sidefx (verified v14 only).
+#[derive(Debug, Clone, Default)]
+pub struct ParsedDexTxOutcome {
+    pub primary: Option<ParsedDexEvent>,
+    /// Pump AMM trades with verified v14 `pool_accounts` observed in the same TX (incl. CPI),
+    /// for `md_sidefx_process_pump_amm_trade` when `primary` is another DEX.
+    pub pump_amm_sidefx: Vec<ParsedDexEvent>,
+}
+
 /// Parse a transaction update into a DEX event (pool creation, swap) with optional pool lookup.
 /// The pool lookup is used to resolve Orca pool mints deterministically.
 ///
@@ -229,17 +238,124 @@ pub fn parse_transaction_update_with_pool_lookup(
     update: &GeyserTransactionUpdate,
     pool_lookup: PoolLookupFn<'_>,
 ) -> Option<ParsedDexEvent> {
-    // 1. Try top-level instruction first
-    if let Some(event) = try_parse_top_level(update, pool_lookup) {
-        return Some(event);
+    parse_transaction_update_with_pool_lookup_outcome(update, pool_lookup).primary
+}
+
+/// Like [`parse_transaction_update_with_pool_lookup`], but also returns Pump AMM CPI harvests.
+pub fn parse_transaction_update_with_pool_lookup_outcome(
+    update: &GeyserTransactionUpdate,
+    pool_lookup: PoolLookupFn<'_>,
+) -> ParsedDexTxOutcome {
+    let primary = try_parse_top_level(update, pool_lookup).or_else(|| {
+        if !update.inner_instructions.is_empty() {
+            try_parse_inner_instructions(update, pool_lookup)
+        } else {
+            None
+        }
+    });
+
+    let pump_amm_sidefx = if update.inner_instructions.is_empty() {
+        Vec::new()
+    } else {
+        let harvest = collect_pump_amm_harvests_from_inner_instructions(update, pool_lookup);
+        filter_pump_amm_harvest_against_primary(harvest, primary.as_ref())
+    };
+
+    ParsedDexTxOutcome {
+        primary,
+        pump_amm_sidefx,
+    }
+}
+
+fn pump_amm_trade_verified_v14(event: &ParsedDexEvent) -> bool {
+    match event {
+        ParsedDexEvent::Trade {
+            dex: DexType::PumpFunAmm,
+            pool_address,
+            pool_accounts: Some(accounts),
+            ..
+        } => accounts.len() >= 14 && accounts.first() == Some(pool_address),
+        _ => false,
+    }
+}
+
+fn filter_pump_amm_harvest_against_primary(
+    harvest: Vec<ParsedDexEvent>,
+    primary: Option<&ParsedDexEvent>,
+) -> Vec<ParsedDexEvent> {
+    let primary_pump_pool = primary.and_then(|p| match p {
+        ParsedDexEvent::Trade {
+            dex: DexType::PumpFunAmm,
+            pool_address,
+            ..
+        } => Some(*pool_address),
+        _ => None,
+    });
+    harvest
+        .into_iter()
+        .filter(|event| match event {
+            ParsedDexEvent::Trade { pool_address, .. } => primary_pump_pool != Some(*pool_address),
+            _ => false,
+        })
+        .collect()
+}
+
+/// Scan all inner instructions for verified Pump AMM v14 trades (multi-DEX CPI harvest).
+fn collect_pump_amm_harvests_from_inner_instructions(
+    update: &GeyserTransactionUpdate,
+    pool_lookup: PoolLookupFn<'_>,
+) -> Vec<ParsedDexEvent> {
+    let _ = pool_lookup;
+    let Some(pumpfun_amm) = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).ok() else {
+        return Vec::new();
+    };
+    let mut seen_pools = std::collections::HashSet::new();
+    let mut harvest = Vec::new();
+
+    for inner in &update.inner_instructions {
+        if inner.data.len() < 8 {
+            continue;
+        }
+        let Some(program_id) = update
+            .account_keys
+            .get(inner.program_id_index as usize)
+            .copied()
+        else {
+            continue;
+        };
+        if program_id != pumpfun_amm {
+            continue;
+        }
+
+        let instruction_accounts: Vec<Pubkey> = inner
+            .accounts
+            .iter()
+            .filter_map(|idx| update.account_keys.get(*idx as usize).copied())
+            .collect();
+
+        let synth = GeyserTransactionUpdate {
+            instruction_accounts,
+            instruction_data: inner.data.clone(),
+            inner_instructions: vec![],
+            ..update.clone()
+        };
+
+        let Some(event) = parse_pumpfun_amm_transaction(&synth) else {
+            continue;
+        };
+        if !pump_amm_trade_verified_v14(&event) {
+            continue;
+        }
+        let pool = match &event {
+            ParsedDexEvent::Trade { pool_address, .. } => *pool_address,
+            _ => continue,
+        };
+        if seen_pools.insert(pool) {
+            harvest.push(event);
+        }
     }
 
-    // 2. Fallback: inner instructions (CPI from aggregators like Jupiter)
-    if !update.inner_instructions.is_empty() {
-        return try_parse_inner_instructions(update, pool_lookup);
-    }
-
-    None
+    harvest
 }
 
 /// Parse top-level instruction only (original logic).
@@ -2260,6 +2376,144 @@ mod tests {
                 dex: DexType::OrcaWhirlpool,
                 ..
             }) if pool_address == pool
+        ));
+    }
+
+    #[test]
+    fn orca_inner_winner_still_harvests_pump_amm_v14_from_same_tx() {
+        use crate::solana::geyser_listener::InnerInstruction;
+
+        let orca = Pubkey::from_str(ORCA_WHIRLPOOL).unwrap();
+        let pumpfun_amm = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).unwrap();
+        let orca_pool = Pubkey::new_unique();
+        let pump_pool = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let token_program =
+            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let trader = Pubkey::new_unique();
+        let jupiter = Pubkey::new_unique();
+
+        let mut orca_ix_data = ORCA_SWAP.to_vec();
+        orca_ix_data.extend_from_slice(&[0u8; 34]);
+        let orca_ix_accounts = vec![token_program, Pubkey::new_unique(), orca_pool, trader];
+
+        let spl_token = token_program;
+        let system = Pubkey::from_str("11111111111111111111111111111111").unwrap();
+        let ata_program = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap();
+        let fee_config = Pubkey::from_str("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx").unwrap();
+        let fee_program = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").unwrap();
+        let quote_mint = *SOL_MINT_PUBKEY;
+        let buy_accounts = vec![
+            pump_pool,
+            trader,
+            Pubkey::new_unique(),
+            token_mint,
+            quote_mint,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            spl_token,
+            spl_token,
+            system,
+            ata_program,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            fee_config,
+            fee_program,
+            pumpfun_amm,
+        ];
+        assert_eq!(buy_accounts.len(), 23);
+        let buy_disc = anchor_disc("buy_exact_quote_in");
+        let mut buy_data = buy_disc.to_vec();
+        buy_data.extend_from_slice(&1_000_000u64.to_le_bytes());
+        buy_data.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut account_keys = vec![trader, jupiter, orca, pumpfun_amm];
+        account_keys.extend(orca_ix_accounts.iter().copied());
+        for pk in buy_accounts.iter().skip(1) {
+            if !account_keys.contains(pk) {
+                account_keys.push(*pk);
+            }
+        }
+        if !account_keys.contains(&pump_pool) {
+            account_keys.push(pump_pool);
+        }
+
+        let orca_prog_idx = account_keys.iter().position(|k| *k == orca).unwrap() as u8;
+        let pump_prog_idx = account_keys.iter().position(|k| *k == pumpfun_amm).unwrap() as u8;
+        let orca_inner_accounts: Vec<u8> = orca_ix_accounts
+            .iter()
+            .map(|pk| account_keys.iter().position(|k| k == pk).unwrap() as u8)
+            .collect();
+        let pump_inner_accounts: Vec<u8> = buy_accounts
+            .iter()
+            .map(|pk| account_keys.iter().position(|k| k == pk).unwrap() as u8)
+            .collect();
+
+        let update = GeyserTransactionUpdate {
+            signature: "orca-then-pump-cpi".to_string(),
+            slot: 99,
+            account_keys,
+            instruction_accounts: vec![trader],
+            instruction_data: vec![0u8; 8],
+            inner_instructions: vec![
+                InnerInstruction {
+                    program_id_index: orca_prog_idx,
+                    accounts: orca_inner_accounts,
+                    data: orca_ix_data,
+                },
+                InnerInstruction {
+                    program_id_index: pump_prog_idx,
+                    accounts: pump_inner_accounts,
+                    data: buy_data,
+                },
+            ],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![],
+            post_balances: vec![],
+            fee_lamports: 0,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+
+        let lookup = |candidate: &Pubkey| {
+            (*candidate == orca_pool).then_some(OrcaPoolInfo {
+                token_mint_a: quote_mint,
+                token_mint_b: token_mint,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: Some(0),
+                tick_spacing: Some(64),
+                token_a_program: Some(token_program),
+                token_b_program: Some(token_program),
+            })
+        };
+
+        let outcome = parse_transaction_update_with_pool_lookup_outcome(&update, Some(&lookup));
+        assert!(matches!(
+            outcome.primary,
+            Some(ParsedDexEvent::Trade {
+                pool_address,
+                dex: DexType::OrcaWhirlpool,
+                ..
+            }) if pool_address == orca_pool
+        ));
+        assert_eq!(outcome.pump_amm_sidefx.len(), 1);
+        assert!(matches!(
+            &outcome.pump_amm_sidefx[0],
+            ParsedDexEvent::Trade {
+                pool_address,
+                dex: DexType::PumpFunAmm,
+                pool_accounts: Some(accts),
+                ..
+            } if *pool_address == pump_pool && accts.len() >= 14 && accts[0] == pump_pool
         ));
     }
 
