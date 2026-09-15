@@ -22,7 +22,7 @@ use crate::metrics::{
 };
 use crate::nats::TOPIC_PRIORITY_FEE_SAMPLES;
 use crate::solana::dex_parser::{
-    parse_transaction_update_with_pool_lookup, DexType, ParsedDexEvent,
+    parse_transaction_update_with_pool_lookup_outcome, DexType, ParsedDexEvent,
 };
 use crate::solana::geyser_listener::GeyserTransactionUpdate;
 use solana_sdk::pubkey::Pubkey;
@@ -30,6 +30,58 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, info};
+
+fn enqueue_pump_amm_trade_sidefx_from_trade<H: TxIngestHost>(
+    md_tx_sidefx: &MdTxSidefxSenders,
+    run_id: &str,
+    trade: &ParsedDexEvent,
+    slot: u64,
+    tx_geyser_recv_at: Instant,
+    host: &H,
+) {
+    if let ParsedDexEvent::Trade {
+        pool_address,
+        mint: base_mint_pk,
+        dex: DexType::PumpFunAmm,
+        is_buy,
+        pool_accounts: Some(pool_accounts),
+        pump_amm_sell_requires_cashback_remaining,
+        pump_amm_sell_cashback_third_meta,
+        pump_amm_sell_extended_tail_0,
+        pump_amm_sell_extended_tail_1,
+        pump_amm_sell_extended_fee_tail_0,
+        pump_amm_sell_extended_fee_tail_1,
+        pump_amm_sell_requires_fee_tail,
+        pump_amm_sell_requires_pre_fee_metas,
+        pump_amm_sell_pre_fee_meta_1,
+        ..
+    } = trade
+    {
+        md_tx_sidefx_route_enqueue(
+            md_tx_sidefx,
+            MdSidefxCommand::PumpAmmTradeWithAccounts {
+                run_id: run_id.to_string(),
+                pool_address: *pool_address,
+                base_mint_pk: *base_mint_pk,
+                slot,
+                is_buy: *is_buy,
+                pool_accounts: pool_accounts.clone(),
+                pump_amm_sell_requires_cashback_remaining:
+                    *pump_amm_sell_requires_cashback_remaining,
+                pump_amm_sell_cashback_third_meta: *pump_amm_sell_cashback_third_meta,
+                pump_amm_sell_extended_tail_0: *pump_amm_sell_extended_tail_0,
+                pump_amm_sell_extended_tail_1: *pump_amm_sell_extended_tail_1,
+                pump_amm_sell_extended_fee_tail_0: *pump_amm_sell_extended_fee_tail_0,
+                pump_amm_sell_extended_fee_tail_1: *pump_amm_sell_extended_fee_tail_1,
+                pump_amm_sell_requires_fee_tail: *pump_amm_sell_requires_fee_tail,
+                pump_amm_sell_requires_pre_fee_metas: *pump_amm_sell_requires_pre_fee_metas,
+                pump_amm_sell_pre_fee_meta_1: *pump_amm_sell_pre_fee_meta_1,
+                tx_geyser_recv_at,
+            },
+            host.ingest_is_hot_pool(pool_address),
+        );
+    }
+}
 
 /// Geyser transaction ingest (dedizierte Task-Fairness, siehe MARKET-DATA-TX-INGEST-FAIRNESS).
 /// STOP-CHECK: keine neuen RPC-Calls; gleiche Logik wie zuvor im `select!`-Arm.
@@ -106,7 +158,10 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
     }
 
     let pool_lookup = |pool: &Pubkey| host.tx_orca_pool_lookup(pool);
-    let parsed_event = parse_transaction_update_with_pool_lookup(&tx_update, Some(&pool_lookup));
+    let parse_outcome =
+        parse_transaction_update_with_pool_lookup_outcome(&tx_update, Some(&pool_lookup));
+    let parsed_event = parse_outcome.primary;
+    let pump_amm_cpi_harvest = parse_outcome.pump_amm_sidefx;
 
     if let Some(parsed) = parsed_event.as_ref() {
         match parsed {
@@ -227,47 +282,38 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
         );
     }
 
-    if let Some(ParsedDexEvent::Trade {
-        pool_address,
-        mint: base_mint_pk,
-        dex: DexType::PumpFunAmm,
-        is_buy,
-        pool_accounts: Some(pool_accounts),
-        pump_amm_sell_requires_cashback_remaining,
-        pump_amm_sell_cashback_third_meta,
-        pump_amm_sell_extended_tail_0,
-        pump_amm_sell_extended_tail_1,
-        pump_amm_sell_extended_fee_tail_0,
-        pump_amm_sell_extended_fee_tail_1,
-        pump_amm_sell_requires_fee_tail,
-        pump_amm_sell_requires_pre_fee_metas,
-        pump_amm_sell_pre_fee_meta_1,
-        ..
-    }) = parsed_event.as_ref()
-    {
-        md_tx_sidefx_route_enqueue(
+    if let Some(trade) = parsed_event.as_ref() {
+        enqueue_pump_amm_trade_sidefx_from_trade(
             md_tx_sidefx,
-            MdSidefxCommand::PumpAmmTradeWithAccounts {
-                run_id: run_id.to_string(),
-                pool_address: *pool_address,
-                base_mint_pk: *base_mint_pk,
-                slot: tx_update.slot,
-                is_buy: *is_buy,
-                pool_accounts: pool_accounts.clone(),
-                pump_amm_sell_requires_cashback_remaining:
-                    *pump_amm_sell_requires_cashback_remaining,
-                pump_amm_sell_cashback_third_meta: *pump_amm_sell_cashback_third_meta,
-                pump_amm_sell_extended_tail_0: *pump_amm_sell_extended_tail_0,
-                pump_amm_sell_extended_tail_1: *pump_amm_sell_extended_tail_1,
-                pump_amm_sell_extended_fee_tail_0: *pump_amm_sell_extended_fee_tail_0,
-                pump_amm_sell_extended_fee_tail_1: *pump_amm_sell_extended_fee_tail_1,
-                pump_amm_sell_requires_fee_tail: *pump_amm_sell_requires_fee_tail,
-                pump_amm_sell_requires_pre_fee_metas: *pump_amm_sell_requires_pre_fee_metas,
-                pump_amm_sell_pre_fee_meta_1: *pump_amm_sell_pre_fee_meta_1,
-                tx_geyser_recv_at,
-            },
-            host.ingest_is_hot_pool(pool_address),
+            run_id,
+            trade,
+            tx_update.slot,
+            tx_geyser_recv_at,
+            host,
         );
+    }
+
+    for harvested in &pump_amm_cpi_harvest {
+        enqueue_pump_amm_trade_sidefx_from_trade(
+            md_tx_sidefx,
+            run_id,
+            harvested,
+            tx_update.slot,
+            tx_geyser_recv_at,
+            host,
+        );
+        crate::metrics::inc_market_data_tx_pump_amm_cpi_harvested_total();
+    }
+    if !pump_amm_cpi_harvest.is_empty()
+        && !matches!(
+            parsed_event.as_ref(),
+            Some(ParsedDexEvent::Trade {
+                dex: DexType::PumpFunAmm,
+                ..
+            })
+        )
+    {
+        crate::metrics::inc_market_data_tx_pump_amm_cpi_harvest_winner_other_dex_total();
     }
 
     if let Some(ParsedDexEvent::Trade {

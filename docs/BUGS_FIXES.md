@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MD-PUMP-V14-CPI-HARVEST-ARB-PIN-SEED: Pump v14 aus Multi-DEX-CPI + DexPoolAccounts bei Arb-Pin
+**Datum**: 2026-09-15  
+**Problem**: Orca→Pump-Arb hatte Quotes/Vaults, aber `create_arb_intent` ohne verifiziertes C: `try_parse_inner_instructions` lieferte nur ein `ParsedDexEvent` (Orca gewann, Pump-Fallback verworfen). Arb-Pin seedete `vault_balances` aus SLAVE (#447), nicht DexPoolAccounts.  
+**Fix**: Vollständiger Inner-Scan für verifizierte Pump-v14-Trades → gleicher MD-Sidefx wie Pump-Winner; Trade-Event bleibt Orca/anderer DEX. Bei Pin-Set-Wachstum `seed_dex_pool_accounts_for_newly_pinned_pools` aus SLAVE (14er-Gate unverändert). Kein RPC, kein Gate-Relax.  
+**Dateien**: `src/solana/dex_parser.rs`, `src/market_data/ingest/tx_handler.rs`, `src/bin/arb_strategy.rs`, `src/metrics.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-ARB-COVERAGE-AFTER-PIN: Vault/bin Geyser registration + arb vault_balances nach Pin
 **Datum**: 2026-09-15  
 **Problem**: Hot DLMM `pool_meteora_dlmm_bins_geyser_registration_satisfied` war bei leerer Bin-PDA-Liste (lbPair unseeded) vakuum `true`; Bin-Stash evictierte FIFO inkl. später registrierter Hot-Fenster; Arb `vault_balances` blieb leer wenn JetStream SLAVE vor `arb_pinned_pools` füllte (`consume_vault_seed` pin-gated).  

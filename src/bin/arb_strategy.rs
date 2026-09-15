@@ -6372,6 +6372,35 @@ impl ArbContext {
         true
     }
 
+    /// Seed DexPoolAccounts from SLAVE when a pool enters the arb pin set (parity with vault pin-seed #447).
+    fn seed_dex_pool_accounts_for_newly_pinned_pools(
+        &self,
+        old_pools: &HashSet<String>,
+        new_pools: &HashSet<String>,
+    ) {
+        for pool_key in new_pools.iter().filter(|p| !old_pools.contains(*p)) {
+            let Ok(pool_pk) = Pubkey::from_str(pool_key) else {
+                continue;
+            };
+            let Some((state, _, _)) = self.live_pool_cache.get_with_metadata(&pool_pk) else {
+                continue;
+            };
+            let Some(accounts) = dex_pool_accounts_from_cached_state(&pool_pk, &state) else {
+                continue;
+            };
+            let Some((base_mint, quote_mint)) = pool_pair_mints_from_cached_state(&state) else {
+                continue;
+            };
+            self.store_dex_pool_accounts(
+                pool_key,
+                &base_mint,
+                &quote_mint,
+                accounts,
+                Some(ArbPoolAccountsBackfillSource::LiveCache),
+            );
+        }
+    }
+
     /// Seed screening `vault_balances` from SLAVE when a pool enters the arb pin set (closes JetStream-before-pin race).
     fn seed_vault_balances_for_newly_pinned_pools(
         &self,
@@ -7970,6 +7999,7 @@ impl ArbContext {
             *pinned = new_pools.clone();
             drop(pinned);
             self.seed_vault_balances_for_newly_pinned_pools(&old_pools, &new_pools);
+            self.seed_dex_pool_accounts_for_newly_pinned_pools(&old_pools, &new_pools);
         }
 
         {
@@ -8217,8 +8247,11 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     if opp.buy_dex == "pump_amm"
         && !pump_amm_pool_accounts_valid_for_swap(&opp.buy_pool, &buy_accts)
     {
-        debug!(
+        warn!(
             buy_pool = %opp.buy_pool,
+            buy_dex = %opp.buy_dex,
+            sell_pool = %opp.sell_pool,
+            sell_dex = %opp.sell_dex,
             mint = %opp.base_mint,
             buy_accounts_len = buy_accts.len(),
             "Rejecting arb: buy pool has incomplete PumpSwap DexPoolAccounts (need 14 + accounts[0]==pool)"
@@ -8229,8 +8262,11 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     if opp.sell_dex == "pump_amm"
         && !pump_amm_pool_accounts_valid_for_swap(&opp.sell_pool, &sell_accts)
     {
-        debug!(
+        warn!(
+            buy_pool = %opp.buy_pool,
+            buy_dex = %opp.buy_dex,
             sell_pool = %opp.sell_pool,
+            sell_dex = %opp.sell_dex,
             mint = %opp.base_mint,
             sell_accounts_len = sell_accts.len(),
             "Rejecting arb: sell pool has incomplete PumpSwap DexPoolAccounts (need 14 + accounts[0]==pool)"
