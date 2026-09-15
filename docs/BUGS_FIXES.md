@@ -6,6 +6,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MD-PUMP-V14-BOOK-JETSTREAM: Pump AMM layer C through pin + JetStream (KNOWN_BUG #28, #33)
+**Datum**: 2026-09-15  
+**Problem**: Ungepinnte Pump-v14-`pool_accounts` im Adressbuch starben nach `DEFAULT_TTL_MS` vor Arb-Pin; Promote ohne C; Cache-Pfad `BalanceUpdated` publizierte ohne `metadata.pool_accounts` → JetStream-Bootstrap ohne Layout-C trotz MASTER.  
+**Fix**: Vollständige Pump-v14-Buchzeilen TTL-exempt und bei Over-Cap nachrangig; Promote-Test >120s; gemeinsamer Helper `merge_pump_amm_pool_accounts_for_jetstream_metadata` in Cache-`BalanceUpdated` und `md_sidefx_process_vault_balance_tick` (FIX-33 Last-Message-Wipe). Kein RPC, kein TTL-Zahlen-Bump.  
+**Dateien**: `src/execution/pool_address_book.rs`, `src/market_data/sidefx/{handlers,pool_publish}.rs`, `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-ADDRESS-BOOK: Unpinned TX layout vs MASTER on pin (KNOWN_BUG #28)
 **Datum**: 2026-09-13  
 **Problem**: Ungepinnte TX-Layouts landeten nicht im MASTER, aber Partial-Account-Parse auf einer gemeinsamen `LivePoolCache`-Zeile konnte TX-Adressen überschreiben; Pin traf `live_pool_cache_miss`.  

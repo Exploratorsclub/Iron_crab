@@ -3,12 +3,12 @@
 use super::host::{MarketEventCorePublishTrace, SidefxWorkerHost};
 use super::pool_publish::{
     cache_balance_fields_unchanged, cached_pool_has_fresh_reserve_basis,
-    merge_raydium_amm_serum_fields_from_prior, meteora_cpmm_onchain_mints_for_pool_cache_update,
-    meteora_cpmm_vaults_for_pool_cache_update, meteora_dlmm_metadata_for_pool_cache_update,
-    orca_metadata_for_pool_cache_update, pool_cache_balance_fields_from_state,
-    pool_cache_state_layout_significant_change, pump_amm_sell_layout_publish_state,
-    raydium_amm_metadata_for_pool_cache_update, raydium_cpmm_readiness_for_pool_cache_update,
-    raydium_cpmm_vaults_for_pool_cache_update,
+    merge_pump_amm_pool_accounts_for_jetstream_metadata, merge_raydium_amm_serum_fields_from_prior,
+    meteora_cpmm_onchain_mints_for_pool_cache_update, meteora_cpmm_vaults_for_pool_cache_update,
+    meteora_dlmm_metadata_for_pool_cache_update, orca_metadata_for_pool_cache_update,
+    pool_cache_balance_fields_from_state, pool_cache_state_layout_significant_change,
+    pump_amm_sell_layout_publish_state, raydium_amm_metadata_for_pool_cache_update,
+    raydium_cpmm_readiness_for_pool_cache_update, raydium_cpmm_vaults_for_pool_cache_update,
 };
 use super::worker::{DlmmPoolStateSignal, MdSidefxBurstScratch, MdSidefxCommand};
 use crate::arb_quality::{
@@ -277,7 +277,18 @@ fn md_sidefx_build_balance_updated_from_cache(
             host.live_pool_cache()
                 .merge_pumpfun_bonding_readiness(*pool_pubkey, DexPoolReadiness::Partial);
         }
-        CachedPoolState::PumpAmm(_) => {}
+        CachedPoolState::PumpAmm(s) => {
+            let mut meta = balance_update.metadata.take().unwrap_or_default();
+            merge_pump_amm_pool_accounts_for_jetstream_metadata(
+                host.live_pool_cache(),
+                pool_pubkey,
+                s,
+                &mut meta,
+            );
+            if !meta.is_empty() {
+                balance_update.metadata = Some(meta);
+            }
+        }
     }
     record_arb_quality_master_update(host, &balance_update);
     Some(balance_update)
@@ -1840,21 +1851,12 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                     if let Some(creator) = s.creator {
                         meta.insert("creator".to_string(), creator.to_string());
                     }
-                    // FIX-26: pool_accounts from Geyser parse, or fallback to MASTER cache
-                    let effective_pool_accounts = if !s.pool_accounts.is_empty() {
-                        s.pool_accounts.clone()
-                    } else {
-                        host.live_pool_cache()
-                            .get_pump_amm_pool_accounts(pool_pubkey)
-                            .unwrap_or_default()
-                    };
-                    if !effective_pool_accounts.is_empty() {
-                        let accounts_str: Vec<String> = effective_pool_accounts
-                            .iter()
-                            .map(|p| p.to_string())
-                            .collect();
-                        meta.insert("pool_accounts".to_string(), accounts_str.join(","));
-                    }
+                    merge_pump_amm_pool_accounts_for_jetstream_metadata(
+                        host.live_pool_cache(),
+                        pool_pubkey,
+                        s,
+                        &mut meta,
+                    );
                     let (ext_flag, ext_third, ext_t0, ext_t1) = host
                         .live_pool_cache()
                         .pump_amm_sell_extended_layout(pool_pubkey);
@@ -2178,6 +2180,22 @@ pub fn md_sidefx_process_vault_balance_tick(
                 balance_update.set_dex_readiness_in_metadata(readiness);
                 host.live_pool_cache()
                     .merge_meteora_dlmm_pool_readiness(vault_view.pool_address, readiness);
+            }
+        }
+        if publish_dex == "pump_amm" {
+            if let Some(CachedPoolState::PumpAmm(ref s)) =
+                host.live_pool_cache().get(&vault_view.pool_address)
+            {
+                let mut meta = balance_update.metadata.take().unwrap_or_default();
+                merge_pump_amm_pool_accounts_for_jetstream_metadata(
+                    host.live_pool_cache(),
+                    &vault_view.pool_address,
+                    s,
+                    &mut meta,
+                );
+                if !meta.is_empty() {
+                    balance_update.metadata = Some(meta);
+                }
             }
         }
         record_arb_quality_master_update(host, &balance_update);
