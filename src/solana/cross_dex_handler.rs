@@ -2821,11 +2821,9 @@ mod tests {
             plan.buy_instructions.len() >= 2,
             "orca route must include CreateIdempotent even when skip option is true"
         );
-        let ata_prog =
-            Pubkey::new_from_array(spl_associated_token_account::id().to_bytes());
+        let ata_prog = Pubkey::new_from_array(spl_associated_token_account::id().to_bytes());
         assert_eq!(
-            plan.buy_instructions[0].program_id,
-            ata_prog,
+            plan.buy_instructions[0].program_id, ata_prog,
             "first buy ix must be ATA CreateIdempotent"
         );
         let buy_ix = plan
