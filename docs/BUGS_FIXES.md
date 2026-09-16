@@ -54,6 +54,12 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Fix**: Separates `token_wallet_ata_present`-Set; `token_wallet_snapshot_seen` nur bei Balance > 0 oder explizitem Geyser-Snapshot-Mark. Full-Close ruft `clear_token_wallet_presence` statt `set(..., 0)`. Geyser/Bootstrap/Liquidation nutzen `apply_wallet_token_snapshot`. **Invarianten**: I-7 kein RPC; I-9 Sim-Gate unverändert.  
 **Dateien**: `src/storage/locks.rs`, `src/bin/execution_engine.rs`, `src/solana/cross_dex_handler.rs`, `docs/BUGS_FIXES.md`
 
+### FIX-ARB-ORCA-ATA-3012: Orca-Arb never skip ATA create; Token-2022 PDA from pool cache
+**Datum**: 2026-09-16  
+**Problem**: Prod Orca→Pump Arb (`arb-66df19d7`): Sim `Custom(3012)` on `token_owner_account_b` while `arb_bundle_ata_create_skipped_total{known_ata}=1`. Whirlpool needs user ATAs A+B; `known_ata` skip + wrong Token-Program default on Create vs swap.  
+**Fix**: `cross_dex_route_includes_orca` forces CreateIdempotent (idempotent no-op if ATA exists). ATA create uses `orca_token_program_for_mint_from_cache` from Orca leg pool (`token_a_program` / `token_b_program`) before generic `get_token_program_for_mint_cached`. Meteora→Pump `known_ata` skip unchanged. **Invarianten**: I-7 kein RPC; I-9 unverändert.  
+**Dateien**: `src/solana/cross_dex_handler.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-I-MD-5-6: TX Tracker explicit subs removed; snapshot excludes Tracker (I-MD-5 / I-MD-6)
 **Datum**: 2026-08-19  
 **Problem** (Prod): ~99k `geyser_subscription_accounts`, ~97% unpinned Tracker-Mints aus TX-Ingest + I-MD-6 Snapshot-Restore — nicht aus Arb/Momentum-Pins. Scope H drosselte nur Amplifikation; TX-Pfad und blind Tracker-restore blieben spec-widrig.  

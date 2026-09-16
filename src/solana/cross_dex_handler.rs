@@ -134,6 +134,35 @@ fn get_token_program_for_mint_cached(
     spl_token::id()
 }
 
+/// Token program for `mint` on an Orca whirlpool from LivePoolCache (no RPC).
+fn orca_token_program_for_mint_from_cache(
+    cache: Option<&LivePoolCache>,
+    orca_pool: &str,
+    mint: &Pubkey,
+) -> Option<spl_token::solana_program::pubkey::Pubkey> {
+    let pool_pk = Pubkey::from_str(orca_pool).ok()?;
+    let cache = cache?;
+    let state = cache.get(&pool_pk)?;
+    let CachedPoolState::Orca(orca) = state else {
+        return None;
+    };
+    let to_prog =
+        |p: Pubkey| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes());
+    let default_spl = spl_token::id();
+    if orca.token_mint_a == *mint {
+        return Some(orca.token_a_program.map(to_prog).unwrap_or(default_spl));
+    }
+    if orca.token_mint_b == *mint {
+        return Some(orca.token_b_program.map(to_prog).unwrap_or(default_spl));
+    }
+    None
+}
+
+/// Orca whirlpool swaps always reference user token ATAs A and B; never omit CreateIdempotent.
+fn cross_dex_route_includes_orca(buy_dex: &str, sell_dex: &str) -> bool {
+    buy_dex == "orca" || sell_dex == "orca"
+}
+
 /// Result of Cross-DEX arbitrage validation
 ///
 /// NOTE: buy_quote/sell_quote are constructed from Intent metadata,
@@ -1460,19 +1489,35 @@ impl CrossDexHandler {
         let token_mint_pk = Pubkey::from_str(token_mint)
             .map_err(|_| anyhow!("Invalid token mint: {}", token_mint))?;
 
-        let token_program = get_token_program_for_mint_cached(
+        let orca_pool_for_mint_program = if buy_dex == "orca" {
+            buy_pool.as_str()
+        } else if sell_dex == "orca" {
+            sell_pool.as_str()
+        } else {
+            ""
+        };
+        let token_program = orca_token_program_for_mint_from_cache(
             self.pool_cache.as_deref(),
+            orca_pool_for_mint_program,
             &token_mint_pk,
-            Some(&buy_dex),
-            intent.resources.token_program.as_deref(),
-        );
+        )
+        .unwrap_or_else(|| {
+            get_token_program_for_mint_cached(
+                self.pool_cache.as_deref(),
+                &token_mint_pk,
+                Some(&buy_dex),
+                intent.resources.token_program.as_deref(),
+            )
+        });
         let token_program_sdk = Pubkey::new_from_array(token_program.to_bytes());
 
         // ====================================================================
         // Create Token ATA (idempotent) - only when wallet ATA is not yet known
         // ====================================================================
+        let skip_token_ata_create =
+            options.skip_token_ata_create && !cross_dex_route_includes_orca(&buy_dex, &sell_dex);
         let mut ata_creation_instructions = Vec::new();
-        if options.skip_token_ata_create {
+        if skip_token_ata_create {
             debug!(
                 token_mint = %token_mint,
                 "Skipping token ATA CreateIdempotent (wallet snapshot proves ATA exists)"
@@ -2772,15 +2817,127 @@ mod tests {
 
         assert_eq!(plan.buy_dex, "orca");
         assert_eq!(plan.sell_dex, "meteora_dlmm");
+        assert!(
+            plan.buy_instructions.len() >= 2,
+            "orca route must include CreateIdempotent even when skip option is true"
+        );
+        let ata_prog = Pubkey::new_from_array(spl_associated_token_account::id().to_bytes());
+        assert_eq!(
+            plan.buy_instructions[0].program_id, ata_prog,
+            "first buy ix must be ATA CreateIdempotent"
+        );
         let buy_ix = plan
             .buy_instructions
-            .first()
+            .iter()
+            .find(|ix| ix.program_id.to_string() == ORCA_WHIRLPOOL_PROGRAM)
             .expect("orca buy swap ix present");
-        assert_eq!(buy_ix.program_id.to_string(), ORCA_WHIRLPOOL_PROGRAM);
         assert!(
             buy_ix.accounts.iter().any(|a| a.pubkey == buy_pool),
             "orca swap ix must reference buy whirlpool from cache injection"
         );
+    }
+
+    #[tokio::test]
+    async fn cross_dex_orca_token2022_quote_mint_create_pda_matches_swap_owner_b() {
+        let wallet = Keypair::new();
+        let token_mint = Pubkey::new_unique();
+        let buy_pool = Pubkey::new_unique();
+        let sell_pool = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let token_2022 = Pubkey::from_str(TOKEN_2022_PROGRAM_ID).unwrap();
+
+        let cache = Arc::new(LivePoolCache::new());
+        cache.upsert(
+            buy_pool,
+            CachedPoolState::Orca(OrcaWhirlpoolState {
+                token_mint_a: sol_mint,
+                token_mint_b: token_mint,
+                token_vault_a: Pubkey::new_unique(),
+                token_vault_b: Pubkey::new_unique(),
+                tick_current_index: -624,
+                sqrt_price: 1u128 << 64,
+                liquidity: 5_000_000_000,
+                fee_rate: 3000,
+                protocol_fee_rate: 300,
+                tick_spacing: 8,
+                vault_a_balance: Some(1_000_000_000_000),
+                vault_b_balance: Some(50_000_000_000),
+                token_a_program: None,
+                token_b_program: Some(token_2022),
+                whirlpool_quote_account_seeded: true,
+            }),
+            100,
+        );
+        cache.upsert(
+            sell_pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: token_mint,
+                token_y_mint: sol_mint,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: -281,
+                bin_step: 10,
+                reserve_x_balance: Some(1_000_000_000_000),
+                reserve_y_balance: Some(50_000_000_000),
+                dlmm_bin_params_account_seeded: true,
+            }),
+            100,
+        );
+
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mut handler = CrossDexHandler::new(rpc, Some(wallet.pubkey())).with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes");
+
+        let intent = orca_meteora_cross_dex_intent(&token_mint, &buy_pool, &sell_pool);
+        let validation = cross_dex_validation_fixture(&token_mint);
+        let plan = handler
+            .build_swap_plan(
+                &intent,
+                &validation,
+                CrossDexPlanOptions {
+                    skip_token_ata_create: false,
+                },
+            )
+            .await
+            .expect("orca token-2022 create plan");
+
+        let create_ix = &plan.buy_instructions[0];
+        assert_eq!(
+            create_ix.program_id,
+            Pubkey::new_from_array(spl_associated_token_account::id().to_bytes())
+        );
+        let create_ata = create_ix.accounts[1].pubkey;
+
+        let wallet_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(wallet.pubkey().to_bytes());
+        let mint_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(token_mint.to_bytes());
+        let token_2022_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(token_2022.to_bytes());
+        let expected_ata = Pubkey::new_from_array(
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &wallet_spl,
+                &mint_spl,
+                &token_2022_spl,
+            )
+            .to_bytes(),
+        );
+        assert_eq!(
+            create_ata, expected_ata,
+            "create must use Orca pool Token-2022 program"
+        );
+
+        let swap_ix = plan
+            .buy_instructions
+            .iter()
+            .find(|ix| ix.program_id.to_string() == ORCA_WHIRLPOOL_PROGRAM)
+            .expect("orca swap");
+        let swap_owner_b = swap_ix
+            .accounts
+            .iter()
+            .find(|a| a.pubkey == expected_ata)
+            .expect("orca swap must reference token_owner_account_b ATA");
+        assert!(swap_owner_b.is_writable);
     }
 
     #[test]
