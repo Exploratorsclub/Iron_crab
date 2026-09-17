@@ -3044,6 +3044,10 @@ impl TxIngestHost for MarketDataContext {
         self.priority_fee_tracker.sample_count()
     }
 
+    fn tx_priority_fee_should_publish_percentiles(&self, every: u64) -> bool {
+        self.priority_fee_tracker.should_publish_percentiles(every)
+    }
+
     fn tx_priority_fee_percentiles(
         &self,
     ) -> ironcrab::solana::priority_fee_tracker::FeePercentiles {

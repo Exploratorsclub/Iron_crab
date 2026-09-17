@@ -32,6 +32,7 @@ pub trait TxIngestHost: IngestHost + Send + Sync {
         compute_units: Option<u64>,
     ) -> Option<u64>;
     fn tx_priority_fee_sample_count(&self) -> usize;
+    fn tx_priority_fee_should_publish_percentiles(&self, every: u64) -> bool;
     fn tx_priority_fee_percentiles(&self) -> FeePercentiles;
     fn tx_priority_fee_for_tier(&self, tier: IntentTier) -> u64;
 
@@ -111,6 +112,10 @@ impl<T: TxIngestHost + ?Sized> TxIngestHost for std::sync::Arc<T> {
 
     fn tx_priority_fee_sample_count(&self) -> usize {
         (**self).tx_priority_fee_sample_count()
+    }
+
+    fn tx_priority_fee_should_publish_percentiles(&self, every: u64) -> bool {
+        (**self).tx_priority_fee_should_publish_percentiles(every)
     }
 
     fn tx_priority_fee_percentiles(&self) -> FeePercentiles {

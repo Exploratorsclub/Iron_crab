@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MD-TX-HANDLER-PRIORITY-FEE-LOG-STORM: TX-Ingest-Hang durch Priority-Fee-Publish-Cadence + INFO-Journal (I-4b)
+**Datum**: 2026-09-17  
+**Problem**: Prod SHA `85964e4`: serieller TX-Handler kehrte nach ~3.8M TX nicht zurück (`tx_handler_total` frozen, `lagged_total=0`). Nach Fensterfüllung (`window_size=50`) war `sample_count % 50 == 0` bei jedem weiteren Sample wahr → Dutzende `priority_fee: published percentiles` + `Parsed DEX transaction` **info!** pro ms → blockierendes journald-I/O auf dem TX-Task (PR165/166-Muster).  
+**Fix**: Monotoner `samples_added_total`; `should_publish_percentiles(every)` nur bei `added % every == 0`; Percentile-Recalc an `added % 10`, nicht `len() % 10`. Hot-Path-Logs → `debug!` (Priority-Fee-Publish, Parsed DEX, WalletBalanceSnapshot TX meta). Publish weiter `try_send`/Account-Pfad, kein RPC, Watchdog no-reconnect unverändert.  
+**Invarianten**: I-4b non-blocking ingest; I-7 kein RPC.  
+**Dateien**: `src/solana/priority_fee_tracker.rs`, `src/market_data/ingest/tx_handler.rs`, `src/market_data/ingest/tx_parse.rs`, `src/market_data/ingest/tx_host.rs`, `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-PUMP-V14-CPI-HARVEST-ARB-PIN-SEED: Pump v14 aus Multi-DEX-CPI + DexPoolAccounts bei Arb-Pin
 **Datum**: 2026-09-15  
 **Problem**: Orca→Pump-Arb hatte Quotes/Vaults, aber `create_arb_intent` ohne verifiziertes C: `try_parse_inner_instructions` lieferte nur ein `ParsedDexEvent` (Orca gewann, Pump-Fallback verworfen). Arb-Pin seedete `vault_balances` aus SLAVE (#447), nicht DexPoolAccounts.  

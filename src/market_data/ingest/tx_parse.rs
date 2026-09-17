@@ -23,7 +23,7 @@ use crate::solana::geyser_listener::{
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Wallet-owned WSOL `post_token_balances` row present — skip paired NATIVE_SOL publish (PR #201).
 pub fn wallet_tx_meta_has_wsol_post_balance(wallet: &Pubkey, tx: &GeyserTransactionUpdate) -> bool {
@@ -112,7 +112,7 @@ pub async fn process_wallet_balance_snapshots_from_tx_meta<H: TxIngestHost>(
                     false,
                 )
                 .await;
-                info!(
+                debug!(
                     wallet = %wallet_str,
                     sol_lamports = lamports,
                     slot = tx.slot,
@@ -177,7 +177,7 @@ pub async fn process_wallet_balance_snapshots_from_tx_meta<H: TxIngestHost>(
                 true,
             )
             .await;
-            info!(
+            debug!(
                 wallet = %wallet_str,
                 mint = %snapshot_mint,
                 balance_raw,
