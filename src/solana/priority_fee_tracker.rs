@@ -15,6 +15,7 @@
 
 use parking_lot::RwLock;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -85,6 +86,8 @@ pub struct PriorityFeeTracker {
     config: PriorityFeeConfig,
     samples: Arc<RwLock<VecDeque<FeeSample>>>,
     cached_percentiles: Arc<RwLock<FeePercentiles>>,
+    /// Monotonic count of samples successfully pushed (not window length).
+    samples_added_total: AtomicU64,
 }
 
 impl PriorityFeeTracker {
@@ -100,6 +103,7 @@ impl PriorityFeeTracker {
                 config.window_size + 10,
             ))),
             cached_percentiles: Arc::new(RwLock::new(FeePercentiles::default())),
+            samples_added_total: AtomicU64::new(0),
             config,
         }
     }
@@ -155,13 +159,28 @@ impl PriorityFeeTracker {
             }
         }
 
-        // Recalculate percentiles periodically (every 10 samples to reduce compute)
-        let sample_count = self.samples.read().len();
-        if sample_count % 10 == 0 || sample_count <= 10 {
+        let added = self.samples_added_total.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Recalculate percentiles every 10 successful adds (not window len — stuck at window_size).
+        if added % 10 == 0 || added <= 10 {
             self.recalculate_percentiles();
         }
 
         Some(priority_fee_micro)
+    }
+
+    /// Total successful samples added since tracker creation.
+    pub fn samples_added_total(&self) -> u64 {
+        self.samples_added_total.load(Ordering::Relaxed)
+    }
+
+    /// True when the latest `add_sample` ended on a publish cadence boundary (`added % every == 0`).
+    pub fn should_publish_percentiles(&self, every: u64) -> bool {
+        if every == 0 {
+            return false;
+        }
+        let added = self.samples_added_total.load(Ordering::Relaxed);
+        added > 0 && added % every == 0
     }
 
     /// Recalculate percentiles from current samples
@@ -386,5 +405,34 @@ mod tests {
 
         // Very low compute units
         assert!(tracker.add_sample(1, 10_000, Some(500)).is_none());
+
+        assert_eq!(tracker.samples_added_total(), 0);
+    }
+
+    #[test]
+    fn test_publish_percentiles_cadence_window_full() {
+        let config = PriorityFeeConfig {
+            window_size: 50,
+            ..PriorityFeeConfig::default()
+        };
+        let tracker = PriorityFeeTracker::with_config(config);
+        let every = 50u64;
+        let mut publish_at: Vec<u64> = Vec::new();
+
+        for i in 1..=120u64 {
+            let fee = 10_000 + i * 1_000;
+            assert!(tracker.add_sample(i, fee, Some(100_000)).is_some());
+            if tracker.should_publish_percentiles(every) {
+                publish_at.push(tracker.samples_added_total());
+            }
+        }
+
+        assert_eq!(
+            publish_at,
+            vec![50, 100],
+            "must not publish on every sample once window is full (51..=99)"
+        );
+        assert_eq!(tracker.sample_count(), 50);
+        assert_eq!(tracker.samples_added_total(), 120);
     }
 }

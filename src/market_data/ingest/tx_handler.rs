@@ -29,7 +29,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::debug;
 
 fn enqueue_pump_amm_trade_sidefx_from_trade<H: TxIngestHost>(
     md_tx_sidefx: &MdTxSidefxSenders,
@@ -117,8 +117,10 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
         tx_update.fee_lamports,
         tx_update.compute_units_consumed,
     ) {
-        let sample_count = host.tx_priority_fee_sample_count();
-        if sample_count % 50 == 0 && sample_count >= 10 {
+        if host.tx_priority_fee_should_publish_percentiles(50)
+            && host.tx_priority_fee_sample_count() >= 10
+        {
+            let sample_count = host.tx_priority_fee_sample_count();
             let percentiles = host.tx_priority_fee_percentiles();
             let fee_msg = PriorityFeePercentiles::new(
                 "market-data",
@@ -146,7 +148,7 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
                     debug!(error = %e, "Failed to publish priority fee percentiles");
                 }
             }
-            info!(
+            debug!(
                 samples = sample_count,
                 p50 = percentiles.p50,
                 p90 = percentiles.p90,
@@ -367,7 +369,7 @@ pub async fn handle_geyser_transaction_update<H: TxIngestHost>(
         _ => None,
     };
 
-    info!(
+    debug!(
         slot = tx_update.slot,
         sig = %tx_update.signature,
         "Parsed DEX transaction"
