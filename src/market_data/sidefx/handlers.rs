@@ -1116,7 +1116,7 @@ pub fn md_sidefx_process_pump_amm_trade(host: &dyn SidefxWorkerHost, job: &MdSid
                         merged_pre_fee_meta_1,
                     );
                 crate::metrics::record_pump_amm_geyser_sell_layout_ready();
-                info!(
+                debug!(
                     pool = %pool_address,
                     base_mint = %base_mint_pk,
                     slot = *slot,
@@ -2214,7 +2214,7 @@ pub fn md_sidefx_process_vault_balance_tick(
             true,
             false,
         );
-        info!(
+        debug!(
             pool = %vault_view.pool_address,
             slot = slot,
             "MASTER CACHE: PoolCacheUpdate::BalanceUpdated enqueued for JetStream"
@@ -2325,5 +2325,42 @@ pub fn md_sidefx_process_job(
         MdSidefxCommand::LivePoolCacheMintDecimals { .. } => {
             md_sidefx_process_live_pool_cache_mint_decimals(host, job)
         }
+    }
+}
+
+#[cfg(test)]
+mod sidefx_handlers_log_level_contract_tests {
+    const SELL_LAYOUT_READY_MSG: &str =
+        "pump_amm: Geyser SELL set sell_layout_ready (authoritative extended layout)";
+    const BALANCE_UPDATED_ENQUEUED_MSG: &str =
+        "MASTER CACHE: PoolCacheUpdate::BalanceUpdated enqueued for JetStream";
+
+    fn assert_literal_logged_at_debug_not_info(src: &str, literal: &str) {
+        assert!(
+            src.contains(literal),
+            "expected message literal in handlers.rs: {literal}"
+        );
+        let pos = src
+            .find(literal)
+            .unwrap_or_else(|| panic!("literal not found: {literal}"));
+        let window_start = pos.saturating_sub(400);
+        let window = &src[window_start..pos];
+        let info_pos = window.rfind("info!(");
+        let debug_pos = window
+            .rfind("debug!(")
+            .unwrap_or_else(|| panic!("no debug! macro in window before literal: {literal}"));
+        if info_pos.is_some_and(|i| i >= debug_pos) {
+            panic!("hot-path sidefx log must use debug!, not info!, before literal: {literal}");
+        }
+    }
+
+    /// I-4b: unbounded INFO on md-account-sidefx blocks on journald (same class as FIX-MD-TX-HANDLER-PRIORITY-FEE-LOG-STORM).
+    #[test]
+    fn sidefx_hot_path_sell_layout_ready_and_balance_updated_logs_are_debug() {
+        let src = include_str!("handlers.rs");
+        assert_literal_logged_at_debug_not_info(src, SELL_LAYOUT_READY_MSG);
+        assert_literal_logged_at_debug_not_info(src, BALANCE_UPDATED_ENQUEUED_MSG);
+        assert!(src.contains("record_pump_amm_geyser_sell_layout_ready"));
+        assert!(src.contains("set_pump_amm_sell_layout_authoritative"));
     }
 }
