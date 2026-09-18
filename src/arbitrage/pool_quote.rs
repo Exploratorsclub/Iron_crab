@@ -659,6 +659,14 @@ pub const ARB_TOKEN_OUT_MIN_RAW_FLOOR: u64 = 1_000;
 /// Trade size (lamports) at which the absolute raw floor applies.
 pub const ARB_TOKEN_OUT_FLOOR_TRADE_AMOUNT_LAMPORTS: u64 = 10_000_000;
 
+/// Haircut (basis points) applied to raw expected buy output for atomic arb sell `amount_in` (I-19a).
+pub const ATOMIC_ARB_SELL_HAIRCUT_BPS: u64 = 1_500;
+
+/// Pessimistic sell `amount_in` from raw expected token output after [`ATOMIC_ARB_SELL_HAIRCUT_BPS`].
+pub fn pessimistic_sell_amount_in(raw_expected: u64) -> u64 {
+    raw_expected.saturating_mul(10_000 - ATOMIC_ARB_SELL_HAIRCUT_BPS) / 10_000
+}
+
 /// Returns true when execution-engine can reliably build a cross-DEX swap plan for this pair.
 ///
 /// Strategy must not publish intents for unsupported pairs (I-12: log + metric, no silent drop).
@@ -3305,6 +3313,15 @@ mod tests {
         assert!(is_expected_token_output_plausible(
             1_500_000, estimate, 10_000_000
         ));
+    }
+
+    #[test]
+    fn pessimistic_sell_amount_in_applies_15_percent_haircut() {
+        assert_eq!(pessimistic_sell_amount_in(10_000), 8_500);
+        assert_eq!(pessimistic_sell_amount_in(1), 0);
+        let large = u64::MAX / 10_000;
+        let out = pessimistic_sell_amount_in(large);
+        assert_eq!(out, large.saturating_mul(8_500) / 10_000);
     }
 
     #[test]
