@@ -30,7 +30,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::arbitrage::pool_quote::{
-    is_expected_token_output_plausible, price_based_token_output_raw,
+    is_expected_token_output_plausible, pessimistic_sell_amount_in, price_based_token_output_raw,
+    ATOMIC_ARB_SELL_HAIRCUT_BPS,
 };
 use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache};
 use crate::ipc::TradeIntent;
@@ -175,6 +176,8 @@ pub struct CrossDexValidation {
     pub actual_spread_bps: i64,
     pub estimated_profit_lamports: i64,
     pub reject_reason: Option<String>,
+    /// Raw expected token output before I-19a haircut (logging / forensics).
+    pub raw_expected_token_out: Option<u64>,
 }
 
 /// Options for [`CrossDexHandler::build_swap_plan`] (bundle size / hot-path hints).
@@ -915,6 +918,7 @@ impl CrossDexHandler {
                 actual_spread_bps: 0,
                 estimated_profit_lamports: 0,
                 reject_reason: Some("Expected exactly 2 pools for cross-DEX arb".to_string()),
+                raw_expected_token_out: None,
             });
         }
 
@@ -934,6 +938,7 @@ impl CrossDexHandler {
                 actual_spread_bps: 0,
                 estimated_profit_lamports: 0,
                 reject_reason: Some(format!("Unknown buy DEX: {}", buy_dex)),
+                raw_expected_token_out: None,
             });
         }
 
@@ -945,6 +950,7 @@ impl CrossDexHandler {
                 actual_spread_bps: 0,
                 estimated_profit_lamports: 0,
                 reject_reason: Some(format!("Unknown sell DEX: {}", sell_dex)),
+                raw_expected_token_out: None,
             });
         }
 
@@ -964,6 +970,7 @@ impl CrossDexHandler {
                     actual_spread_bps: 0,
                     estimated_profit_lamports: 0,
                     reject_reason: Some("LivePoolCache not available".to_string()),
+                    raw_expected_token_out: None,
                 });
             }
         };
@@ -986,6 +993,7 @@ impl CrossDexHandler {
                 actual_spread_bps: 0,
                 estimated_profit_lamports: 0,
                 reject_reason: Some(format!("Buy pool {} not in LivePoolCache", buy_pool)),
+                raw_expected_token_out: None,
             });
         }
 
@@ -997,6 +1005,7 @@ impl CrossDexHandler {
                 actual_spread_bps: 0,
                 estimated_profit_lamports: 0,
                 reject_reason: Some(format!("Sell pool {} not in LivePoolCache", sell_pool)),
+                raw_expected_token_out: None,
             });
         }
 
@@ -1034,83 +1043,93 @@ impl CrossDexHandler {
         );
 
         // =========================================================================
-        // OPTION D: Use expected_token_output from arb-strategy (calculated from reserves)
+        // I-19a: Pessimistic sell amount_in from raw expected buy output
         // =========================================================================
-        // arb-strategy calculates exact token output using:
-        // - Cached pool reserves from Geyser (PoolStateUpdate events)
-        // - Constant product formula with fee deduction
-        //
-        // This eliminates the need for safety margins because:
-        // - The value is computed from the same Geyser data the simulation uses
-        // - No stale price estimation, no guessing
-        //
-        // Fallback (if arb-strategy didn't provide it or value is implausible vs buy_price):
-        // - Price-based estimation with 15% safety margin (for DLMM or missing reserves)
+        // raw_expected: plausible reserve-based `expected_token_output` (Option D) or
+        // `price_based_token_output_raw` — then apply ATOMIC_ARB_SELL_HAIRCUT_BPS for sell leg.
         let token_decimals = 6u8;
         let price_based_estimate = buy_price_str
             .parse::<Decimal>()
             .ok()
             .and_then(|p| price_based_token_output_raw(trade_amount, p, token_decimals));
-        let expected_tokens_out: u64 = intent
+        let metadata_token_out = intent
             .metadata
             .get("expected_token_output")
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&token_out| {
-                is_expected_token_output_plausible(token_out, price_based_estimate, trade_amount)
-            })
-            .inspect(|&token_out| {
+            .and_then(|s| s.parse::<u64>().ok());
+        let raw_expected = if let Some(token_out) = metadata_token_out {
+            if is_expected_token_output_plausible(token_out, price_based_estimate, trade_amount) {
                 info!(
-                    token_out,
+                    raw_expected = token_out,
                     price_based_estimate = ?price_based_estimate,
                     source = "arb-strategy (Option D)",
                     "Using expected_token_output from intent metadata (reserve-based)"
                 );
-            })
-            .unwrap_or_else(|| {
-                if let Some(ignored) = intent
-                    .metadata
-                    .get("expected_token_output")
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    warn!(
-                        token_out = ignored,
-                        price_based_estimate = ?price_based_estimate,
-                        trade_amount,
-                        buy_price,
-                        "Ignoring implausible expected_token_output in intent metadata"
-                    );
-                }
-                // Fallback: price-based estimation for DLMM or when reserves unavailable
-                if buy_price > 0.0 {
-                    let sol_amount = trade_amount as f64 / 1_000_000_000.0;
-                    let tokens = sol_amount / buy_price;
-                    let raw_tokens = (tokens * 1_000_000.0) as u64;
-                    // 15% safety margin for price-based estimation
-                    // DLMM bin concentration can cause significant deviation from price-based estimates
-                    // This ensures sell_amount_in <= actual buy output to prevent "insufficient funds"
-                    let with_safety = (raw_tokens as f64 * 0.85) as u64;
-                    info!(
-                        raw_tokens,
-                        with_safety,
-                        safety_margin_pct = 15,
-                        source = "price-based (fallback)",
-                        "Using price-based estimation (no expected_token_output in metadata)"
-                    );
-                    with_safety
-                } else {
-                    warn!(
-                        buy_price,
-                        trade_amount,
-                        "buy_price missing or zero, using trade_amount as token estimate"
-                    );
-                    trade_amount
-                }
+                Some(token_out)
+            } else {
+                warn!(
+                    token_out,
+                    price_based_estimate = ?price_based_estimate,
+                    trade_amount,
+                    buy_price,
+                    "Ignoring implausible expected_token_output in intent metadata"
+                );
+                price_based_estimate
+            }
+        } else {
+            if price_based_estimate.is_some() {
+                info!(
+                    raw_expected = ?price_based_estimate,
+                    source = "price-based (fallback)",
+                    "No plausible expected_token_output in metadata; using price-based raw estimate"
+                );
+            }
+            price_based_estimate
+        };
+
+        let raw_expected = match raw_expected {
+            Some(v) => v,
+            None => {
+                return Ok(CrossDexValidation {
+                    is_valid: false,
+                    buy_quote: None,
+                    sell_quote: None,
+                    actual_spread_bps: 0,
+                    estimated_profit_lamports: 0,
+                    reject_reason: Some(
+                        "I-19a: no plausible expected_token_output or price-based token estimate"
+                            .to_string(),
+                    ),
+                    raw_expected_token_out: None,
+                });
+            }
+        };
+
+        let pessimistic_sell_in = pessimistic_sell_amount_in(raw_expected);
+        if pessimistic_sell_in == 0 {
+            return Ok(CrossDexValidation {
+                is_valid: false,
+                buy_quote: None,
+                sell_quote: None,
+                actual_spread_bps: 0,
+                estimated_profit_lamports: 0,
+                reject_reason: Some(
+                    "I-19a: pessimistic sell_amount_in is zero after haircut".to_string(),
+                ),
+                raw_expected_token_out: Some(raw_expected),
             });
+        }
+
+        info!(
+            raw_expected_token_out = raw_expected,
+            pessimistic_sell_amount_in = pessimistic_sell_in,
+            haircut_bps = ATOMIC_ARB_SELL_HAIRCUT_BPS,
+            "I-19a: applied pessimistic haircut to cross-DEX sell amount_in"
+        );
 
         // Build quotes for build_swap_plan
-        // buy_quote.amount_out is used as sell_amount_in for the sell leg
+        // buy_quote.amount_out is used as sell_amount_in for the sell leg (already pessimistic)
         let buy_quote = Quote {
-            amount_out: expected_tokens_out, // From Option D (reserves) or fallback (price-based)
+            amount_out: pessimistic_sell_in,
             price_impact_bps: 0,
             route: vec![buy_pool.clone()],
             fee_bps: 30,
@@ -1140,6 +1159,7 @@ impl CrossDexHandler {
             actual_spread_bps: strategy_spread_bps,
             estimated_profit_lamports: strategy_profit,
             reject_reason: None,
+            raw_expected_token_out: Some(raw_expected),
         })
     }
 
@@ -1646,8 +1666,9 @@ impl CrossDexHandler {
         info!(
             sell_amount_in,
             buy_quote_amount_out = buy_quote.amount_out,
+            raw_expected_token_out = validation.raw_expected_token_out,
             sell_min_out,
-            "Building sell instruction with expected buy output as amount_in (Option D)"
+            "Building sell instruction with I-19a pessimistic buy output as amount_in"
         );
 
         let sell_instructions = if sell_dex == "pump_amm" {
@@ -2038,6 +2059,7 @@ mod tests {
             actual_spread_bps: 50,
             estimated_profit_lamports: 500_000,
             reject_reason: None,
+            raw_expected_token_out: Some(1_000_000),
         }
     }
 

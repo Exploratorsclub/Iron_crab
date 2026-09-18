@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-I19A-SELL-SIZE: Atomic arb Pump sell `insufficient funds` (Custom 1) ix4 nach erfolgreichem Buy
+**Datum**: 2026-09-18  
+**Problem**: Prod post-#450 (`41f07ce`): 9/9 Orca→Pump-Arb-Intents SimFailed — Whirlpool-Buy ok, Pump-Sell ix4 Tokenkeg `insufficient funds`. EE setzte `sell_amount_in` auf ungehaircutete `expected_token_output` (Option D); Whirlpool-Fill lag unter Reserve-Quote.  
+**Fix**: I-19a — `pessimistic_sell_amount_in` (1500 bps Integer-Haircut) auf raw plausible `expected_token_output` oder `price_based_token_output_raw`; `buy_quote.amount_out` = pessimistisch; `sell_amount_in == 0` → Validation reject (I-12). `buy_min_out`/`sell_min_out` bleiben 1 (Option B).  
+**Invarianten**: I-19a, I-9, I-12, I-7 kein RPC.  
+**Dateien**: `src/arbitrage/pool_quote.rs`, `src/arbitrage/mod.rs`, `src/solana/cross_dex_handler.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-TX-HANDLER-PRIORITY-FEE-LOG-STORM: TX-Ingest-Hang durch Priority-Fee-Publish-Cadence + INFO-Journal (I-4b)
 **Datum**: 2026-09-17  
 **Problem**: Prod SHA `85964e4`: serieller TX-Handler kehrte nach ~3.8M TX nicht zurück (`tx_handler_total` frozen, `lagged_total=0`). Nach Fensterfüllung (`window_size=50`) war `sample_count % 50 == 0` bei jedem weiteren Sample wahr → Dutzende `priority_fee: published percentiles` + `Parsed DEX transaction` **info!** pro ms → blockierendes journald-I/O auf dem TX-Task (PR165/166-Muster).  
