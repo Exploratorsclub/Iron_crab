@@ -664,32 +664,71 @@ pub fn md_sidefx_try_enqueue_classed(
     }
 }
 
-pub fn md_sidefx_coalesce_key(job: &MdSidefxCommand) -> Option<Pubkey> {
+/// Coalesce bucket: same address **and** same command variant (A.52 — LRU must not evict C jobs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MdSidefxCoalesceKind {
+    PumpFunPoolMintMapInsert,
+    PumpAmmTradeWithAccounts,
+    PumpAmmCreatePoolObserved,
+    GenericDexFirstTradeAccounts,
+    TradePoolLruTouch,
+    LivePoolCacheAccountUpdate,
+    VaultBalanceTick,
+    TouchBinArrayTick,
+    DlmmPoolStatePublishSignal,
+}
+
+pub fn md_sidefx_coalesce_key(job: &MdSidefxCommand) -> Option<(Pubkey, MdSidefxCoalesceKind)> {
     match job {
-        MdSidefxCommand::PumpFunPoolMintMapInsert { pool_address, .. } => Some(*pool_address),
-        MdSidefxCommand::PumpAmmTradeWithAccounts { pool_address, .. } => Some(*pool_address),
-        MdSidefxCommand::PumpAmmCreatePoolObserved { pool_address, .. } => Some(*pool_address),
-        MdSidefxCommand::LivePoolCacheAccountUpdate { pool_pubkey, .. } => Some(*pool_pubkey),
-        MdSidefxCommand::VaultBalanceTick { vault_pubkey, .. } => Some(*vault_pubkey),
-        MdSidefxCommand::TouchBinArrayTick { pda, .. } => Some(*pda),
-        MdSidefxCommand::DlmmPoolStatePublishSignal { pool_address, .. } => Some(*pool_address),
-        MdSidefxCommand::TradePoolLruTouch { pool } => Some(*pool),
+        MdSidefxCommand::PumpFunPoolMintMapInsert { pool_address, .. } => Some((
+            *pool_address,
+            MdSidefxCoalesceKind::PumpFunPoolMintMapInsert,
+        )),
+        MdSidefxCommand::PumpAmmTradeWithAccounts { pool_address, .. } => Some((
+            *pool_address,
+            MdSidefxCoalesceKind::PumpAmmTradeWithAccounts,
+        )),
+        MdSidefxCommand::PumpAmmCreatePoolObserved { pool_address, .. } => Some((
+            *pool_address,
+            MdSidefxCoalesceKind::PumpAmmCreatePoolObserved,
+        )),
+        MdSidefxCommand::GenericDexFirstTradeAccounts { pool_address, .. } => Some((
+            *pool_address,
+            MdSidefxCoalesceKind::GenericDexFirstTradeAccounts,
+        )),
+        MdSidefxCommand::LivePoolCacheAccountUpdate { pool_pubkey, .. } => Some((
+            *pool_pubkey,
+            MdSidefxCoalesceKind::LivePoolCacheAccountUpdate,
+        )),
+        MdSidefxCommand::VaultBalanceTick { vault_pubkey, .. } => {
+            Some((*vault_pubkey, MdSidefxCoalesceKind::VaultBalanceTick))
+        }
+        MdSidefxCommand::TouchBinArrayTick { pda, .. } => {
+            Some((*pda, MdSidefxCoalesceKind::TouchBinArrayTick))
+        }
+        MdSidefxCommand::DlmmPoolStatePublishSignal { pool_address, .. } => Some((
+            *pool_address,
+            MdSidefxCoalesceKind::DlmmPoolStatePublishSignal,
+        )),
+        MdSidefxCommand::TradePoolLruTouch { pool } => {
+            Some((*pool, MdSidefxCoalesceKind::TradePoolLruTouch))
+        }
         _ => None,
     }
 }
 
 pub fn md_sidefx_coalesce_burst(jobs: Vec<MdSidefxCommand>) -> Vec<MdSidefxCommand> {
     let mut out: Vec<MdSidefxCommand> = Vec::with_capacity(jobs.len());
-    let mut coalesced: HashMap<Pubkey, usize> = HashMap::new();
+    let mut coalesced: HashMap<(Pubkey, MdSidefxCoalesceKind), usize> = HashMap::new();
     for job in jobs {
-        if let Some(pool) = md_sidefx_coalesce_key(&job) {
-            if let Some(&idx) = coalesced.get(&pool) {
+        if let Some(key) = md_sidefx_coalesce_key(&job) {
+            if let Some(&idx) = coalesced.get(&key) {
                 let merged_class = md_sidefx_job_update_class(&out[idx])
                     .merge_priority(md_sidefx_job_update_class(&job));
                 out[idx] = job;
                 md_sidefx_apply_update_class(&mut out[idx], merged_class);
             } else {
-                coalesced.insert(pool, out.len());
+                coalesced.insert(key, out.len());
                 out.push(job);
             }
         } else {
@@ -1012,6 +1051,45 @@ mod tests {
         MdSidefxCommand::TradePoolLruTouch { pool }
     }
 
+    fn mk_pump_amm_trade_with_accounts(
+        pool: Pubkey,
+        pool_accounts: Vec<Pubkey>,
+        slot: u64,
+        is_buy: bool,
+    ) -> MdSidefxCommand {
+        MdSidefxCommand::PumpAmmTradeWithAccounts {
+            run_id: "r".into(),
+            pool_address: pool,
+            base_mint_pk: Pubkey::new_unique(),
+            slot,
+            is_buy,
+            pool_accounts,
+            pump_amm_sell_requires_cashback_remaining: false,
+            pump_amm_sell_cashback_third_meta: None,
+            pump_amm_sell_extended_tail_0: None,
+            pump_amm_sell_extended_tail_1: None,
+            pump_amm_sell_extended_fee_tail_0: None,
+            pump_amm_sell_extended_fee_tail_1: None,
+            pump_amm_sell_requires_fee_tail: false,
+            pump_amm_sell_requires_pre_fee_metas: false,
+            pump_amm_sell_pre_fee_meta_1: None,
+            tx_geyser_recv_at: Instant::now(),
+        }
+    }
+
+    fn mk_generic_dex_first_trade_accounts(pool: Pubkey) -> MdSidefxCommand {
+        MdSidefxCommand::GenericDexFirstTradeAccounts {
+            run_id: "r".into(),
+            pool_address: pool,
+            mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            dex: DexType::OrcaWhirlpool,
+            pool_accounts: vec![pool],
+            slot: 1,
+            tx_geyser_recv_at: Instant::now(),
+        }
+    }
+
     struct HotPoolTestHost {
         hot: Pubkey,
     }
@@ -1272,6 +1350,89 @@ mod tests {
             &vec![1],
             "latest-wins data from last job in burst"
         );
+    }
+
+    #[test]
+    fn md_sidefx_coalesce_preserves_pump_v14_over_lru_touch_same_pool() {
+        let pool = Pubkey::new_unique();
+        let accounts: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let mut accounts = accounts;
+        accounts[0] = pool;
+        let pump = mk_pump_amm_trade_with_accounts(pool, accounts.clone(), 1, true);
+        let lru = MdSidefxCommand::TradePoolLruTouch { pool };
+        let out = md_sidefx_coalesce_burst(vec![pump, lru]);
+        assert_eq!(out.len(), 2);
+        let pump_jobs = out
+            .iter()
+            .filter(|j| matches!(j, MdSidefxCommand::PumpAmmTradeWithAccounts { .. }))
+            .count();
+        let lru_jobs = out
+            .iter()
+            .filter(|j| matches!(j, MdSidefxCommand::TradePoolLruTouch { .. }))
+            .count();
+        assert_eq!(pump_jobs, 1);
+        assert_eq!(lru_jobs, 1);
+        let MdSidefxCommand::PumpAmmTradeWithAccounts { pool_accounts, .. } = out
+            .iter()
+            .find(|j| matches!(j, MdSidefxCommand::PumpAmmTradeWithAccounts { .. }))
+            .expect("pump job")
+        else {
+            panic!("expected PumpAmmTradeWithAccounts");
+        };
+        assert_eq!(pool_accounts.len(), 14);
+        assert_eq!(pool_accounts[0], pool);
+    }
+
+    #[test]
+    fn md_sidefx_coalesce_preserves_pump_v14_when_lru_touch_first() {
+        let pool = Pubkey::new_unique();
+        let accounts: Vec<Pubkey> = std::iter::repeat_with(Pubkey::new_unique)
+            .take(14)
+            .collect();
+        let mut accounts = accounts;
+        accounts[0] = pool;
+        let lru = MdSidefxCommand::TradePoolLruTouch { pool };
+        let pump = mk_pump_amm_trade_with_accounts(pool, accounts, 2, false);
+        let out = md_sidefx_coalesce_burst(vec![lru, pump]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn md_sidefx_coalesce_latest_wins_same_pump_v14_variant() {
+        let pool = Pubkey::new_unique();
+        let short: Vec<Pubkey> = (0..14).map(|_| Pubkey::new_unique()).collect();
+        let long: Vec<Pubkey> = (0..16).map(|_| Pubkey::new_unique()).collect();
+        let first = mk_pump_amm_trade_with_accounts(pool, short, 1, true);
+        let second = mk_pump_amm_trade_with_accounts(pool, long, 2, false);
+        let out = md_sidefx_coalesce_burst(vec![first, second]);
+        assert_eq!(out.len(), 1);
+        let MdSidefxCommand::PumpAmmTradeWithAccounts {
+            slot,
+            is_buy,
+            pool_accounts,
+            ..
+        } = &out[0]
+        else {
+            panic!("expected PumpAmmTradeWithAccounts");
+        };
+        assert_eq!(*slot, 2);
+        assert!(!*is_buy);
+        assert_eq!(pool_accounts.len(), 16);
+    }
+
+    #[test]
+    fn md_sidefx_coalesce_preserves_generic_dex_first_trade_over_lru_touch() {
+        let pool = Pubkey::new_unique();
+        let generic = mk_generic_dex_first_trade_accounts(pool);
+        let lru = MdSidefxCommand::TradePoolLruTouch { pool };
+        let out = md_sidefx_coalesce_burst(vec![generic, lru]);
+        assert_eq!(out.len(), 2);
+        assert!(out
+            .iter()
+            .any(|j| matches!(j, MdSidefxCommand::GenericDexFirstTradeAccounts { .. })));
+        assert!(out
+            .iter()
+            .any(|j| matches!(j, MdSidefxCommand::TradePoolLruTouch { .. })));
     }
 
     #[test]

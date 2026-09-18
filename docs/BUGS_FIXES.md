@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MD-SIDEFX-COALESCE-LRU-VS-C: Burst-Coalesce verdrängte Pump v14 / Generic-DEX-C durch LRU-Touch
+**Datum**: 2026-09-18  
+**Problem**: Prod post-#451: Mint `Cz7LGKdZPpAxonXx23ZYPW3RtDQvjcf17ZDCZEzFpump`, Pool `7oM3hr4rHmJ4mwe7BVdSqmSPkm3tjCYZpLvtiN6muNFz` — 13 `Trade` `dex=pump_amm`, **0** `DexPoolAccounts` pump_amm; `md_sidefx_process_pump_amm_trade` lief nicht. TX-Burst enqueued `PumpAmmTradeWithAccounts` + `TradePoolLruTouch` (gleiche Pool-Pubkey); `md_sidefx_coalesce_burst` keyed nur die Adresse → LRU latest-wins, C-Job weg.  
+**Fix**: Coalesce-Key `(Pubkey, MdSidefxCoalesceKind)` — gleiche Variante latest-wins, verschiedene Varianten (v14 vs LRU) bleiben beide.  
+**Invarianten**: A.52, I-MD-5, I-7 kein RPC, I-12 keine erfundene v14.  
+**Dateien**: `src/market_data/sidefx/worker.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ARB-I19A-SELL-SIZE: Atomic arb Pump sell `insufficient funds` (Custom 1) ix4 nach erfolgreichem Buy
 **Datum**: 2026-09-18  
 **Problem**: Prod post-#450 (`41f07ce`): 9/9 Orca→Pump-Arb-Intents SimFailed — Whirlpool-Buy ok, Pump-Sell ix4 Tokenkeg `insufficient funds`. EE setzte `sell_amount_in` auf ungehaircutete `expected_token_output` (Option D); Whirlpool-Fill lag unter Reserve-Quote.  
