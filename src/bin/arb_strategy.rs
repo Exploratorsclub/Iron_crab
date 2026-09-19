@@ -48,12 +48,12 @@ use ironcrab::arbitrage::{
     populate_arb_slave_from_live_pool_cache, price_based_token_output_raw, quote_exact_in,
     quote_exact_in_with_freshness, quotes_pairable, round_trip_profit_lamports,
     select_arb_track_pools, state_fingerprint, sync_arb_slave_from_pool_cache_update,
-    MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch, NoCrossDexSellDetailReason,
-    OrcaTickArrays, OrcaWhirlpoolQuoteInput, PoolQuote, QuoteFreshnessConfig, QuoteKind,
-    QuotePoolInput, QuoteVaultInput, RoundTripInsufficient, RoundTripInsufficientSubreason,
-    RoundTripLeg, RoundTripPoolCandidate, RoundTripSelectFailure, SellQuoteNoneDetailReason,
-    TrackCandidateCounts, TrackMintInput, TrackPoolInput, TrackPoolReadiness, TrackSelectionConfig,
-    DLMM_PROBE_SOL_LAMPORTS,
+    DlmmBinArrays, MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch,
+    NoCrossDexSellDetailReason, OrcaTickArrays, OrcaWhirlpoolQuoteInput, PoolQuote,
+    QuoteFreshnessConfig, QuoteKind, QuotePoolInput, QuoteVaultInput, RoundTripInsufficient,
+    RoundTripInsufficientSubreason, RoundTripLeg, RoundTripPoolCandidate, RoundTripSelectFailure,
+    SellQuoteNoneDetailReason, TrackCandidateCounts, TrackMintInput, TrackPoolInput,
+    TrackPoolReadiness, TrackSelectionConfig, DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::bundle_auction::BundleAuctionParams;
@@ -3928,6 +3928,48 @@ impl TokenArbTracker {
         }
     }
 
+    /// I-19a: ExecutableMarginal buy `amount_out` at trade size (no linear probe scale-up).
+    #[allow(clippy::too_many_arguments)]
+    fn v2_buy_token_out_for_trade(
+        buy_quote: &PoolQuote,
+        trade_amount_lamports: u64,
+        probe: u64,
+        buy_pool: &QuotePoolInput,
+        buy_vault: Option<&QuoteVaultInput>,
+        buy_dlmm_bins: Option<&DlmmBinArrays>,
+        buy_orca: OrcaExecCtx<'_>,
+        freshness: &QuoteFreshnessConfig,
+    ) -> Option<u64> {
+        if buy_quote.amount_in == trade_amount_lamports {
+            return (buy_quote.amount_out > 0).then_some(buy_quote.amount_out);
+        }
+        if trade_amount_lamports == probe {
+            return None;
+        }
+        let now = Instant::now();
+        let trade_quote = quote_exact_in_with_orca(
+            buy_pool,
+            buy_vault,
+            buy_dlmm_bins,
+            buy_orca,
+            NATIVE_SOL_MINT,
+            &buy_pool.token_mint,
+            trade_amount_lamports,
+            freshness,
+        )?;
+        if !is_quote_fresh_with_orca(
+            &trade_quote,
+            freshness,
+            buy_vault,
+            buy_dlmm_bins,
+            buy_orca,
+            now,
+        ) {
+            return None;
+        }
+        (trade_quote.amount_out > 0).then_some(trade_quote.amount_out)
+    }
+
     /// I-ARB-6: profit-first 2-hop via round-trip quotes (no legacy mid-spread gates).
     fn check_arbitrage_v2(
         &self,
@@ -4257,6 +4299,35 @@ impl TokenArbTracker {
         };
         let estimated_profit_lamports = (profit_lamports as i128 * scale).max(0) as u64;
 
+        let buy_vault = vault_balances
+            .get(&selection.buy_pool_address)
+            .map(|v| {
+                vault_cache_to_quote_input(
+                    &selection.buy_pool_address,
+                    v,
+                    check_ctx.live_pool_cache,
+                )
+            });
+        let buy_dlmm_bins = bin_arrays
+            .get(&selection.buy_pool_address)
+            .map(flatten_bin_array_cache);
+        let buy_pool_quote_input =
+            pool_state_to_quote_input(buy_pool, &self.base_mint, token_decimals);
+        let buy_orca = orca_map
+            .get(selection.buy_pool_address.as_str())
+            .copied()
+            .unwrap_or(OrcaExecCtx::NONE);
+        let buy_token_out = Self::v2_buy_token_out_for_trade(
+            &selection.buy_quote,
+            trade_amount_lamports,
+            probe,
+            &buy_pool_quote_input,
+            buy_vault.as_ref(),
+            buy_dlmm_bins.as_ref(),
+            buy_orca,
+            &freshness,
+        );
+
         Some(ArbOpportunity {
             base_mint: self.base_mint.clone(),
             buy_dex: selection.buy_dex,
@@ -4268,6 +4339,7 @@ impl TokenArbTracker {
             spread_bps: spread_bps.max(0) as u32,
             trade_amount_lamports,
             estimated_profit_lamports,
+            buy_token_out,
         })
     }
 
@@ -4604,6 +4676,7 @@ impl TokenArbTracker {
             spread_bps: spread_bps as u32,
             trade_amount_lamports,
             estimated_profit_lamports: net_profit,
+            buy_token_out: None,
         })
     }
 }
@@ -4620,8 +4693,8 @@ struct ArbOpportunity {
     spread_bps: u32,
     trade_amount_lamports: u64,
     estimated_profit_lamports: u64,
-    // NOTE: expected_token_output is calculated in create_arb_intent() using ArbContext
-    // because TokenArbTracker doesn't have access to vault_balances cache.
+    /// V2 ExecutableMarginal buy `amount_out` at `trade_amount_lamports` (I-19a raw_expected).
+    buy_token_out: Option<u64>,
 }
 
 // ============================================================================
@@ -8583,12 +8656,14 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     // When bins are incomplete or the walker yields a degenerate quote, omit metadata
     // so EE falls back to price-based sizing (15% safety margin).
     let token_decimals = ctx.get_token_decimals_for_mint(&opp.base_mint);
-    let mut expected_token_output = ctx.calculate_expected_token_output(
-        &opp.buy_pool,
-        &opp.buy_dex,
-        opp.trade_amount_lamports,
-        token_decimals,
-    );
+    let mut expected_token_output = opp.buy_token_out.filter(|&x| x > 0).or_else(|| {
+        ctx.calculate_expected_token_output(
+            &opp.buy_pool,
+            &opp.buy_dex,
+            opp.trade_amount_lamports,
+            token_decimals,
+        )
+    });
 
     let price_based_estimate =
         price_based_token_output_raw(opp.trade_amount_lamports, opp.buy_price, token_decimals);
@@ -8618,9 +8693,10 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
                 buy_dex = %opp.buy_dex,
                 sol_in = opp.trade_amount_lamports,
                 token_out,
+                from_v2_buy_quote = opp.buy_token_out.is_some(),
                 price_based_estimate = ?price_based_estimate,
                 token_decimals,
-                "Option D: calculated expected_token_output from reserves/bin walker"
+                "Option D: expected_token_output for EE sell sizing"
             );
         }
     } else {
@@ -16670,9 +16746,55 @@ mod two_hop_price_tests {
 
 #[cfg(test)]
 mod expected_token_output_gate_tests {
-    use ironcrab::arbitrage::{is_expected_token_output_plausible, price_based_token_output_raw};
+    use super::*;
+    use ironcrab::arbitrage::{
+        is_expected_token_output_plausible, price_based_token_output_raw, QuoteSide,
+    };
     use rust_decimal::Decimal;
     use std::str::FromStr;
+    use std::time::Instant;
+
+    #[test]
+    fn v2_buy_token_out_skips_linear_probe_scale_when_trade_equals_probe() {
+        let probe = 10_000_000u64;
+        let trade_amount = probe;
+        let buy_quote = PoolQuote {
+            pool_address: "pool".into(),
+            dex: "orca".into(),
+            kind: QuoteKind::ExecutableMarginal,
+            side: QuoteSide::Buy,
+            as_of_slot: 1,
+            as_of_ts: Instant::now(),
+            fresh: true,
+            state_fingerprint: 0,
+            amount_in: probe / 2,
+            amount_out: 50_000_000,
+        };
+        let pool = QuotePoolInput {
+            pool_address: "pool".to_string(),
+            dex: "orca".to_string(),
+            token_mint: USDC_MINT.to_string(),
+            trade_price_buy: None,
+            trade_price_sell: None,
+            trade_updated_at: Instant::now(),
+            has_reserve_data: true,
+            token_decimals: 6,
+        };
+        assert_eq!(
+            TokenArbTracker::v2_buy_token_out_for_trade(
+                &buy_quote,
+                trade_amount,
+                probe,
+                &pool,
+                None,
+                None,
+                OrcaExecCtx::NONE,
+                &QuoteFreshnessConfig::default(),
+            ),
+            None,
+            "must not scale probe quote when amount_in != trade_amount"
+        );
+    }
 
     /// Prod 2026-08-05: meteora_dlmm buy published `expected_token_output=11` for 0.1 SOL.
     #[test]
@@ -16777,6 +16899,7 @@ mod pool_accounts_coverage_tests {
             spread_bps: 72,
             trade_amount_lamports: 10_000_000,
             estimated_profit_lamports: 673_000,
+            buy_token_out: None,
         };
 
         let before_missing = ARB_REJECTED_MISSING_ACCOUNTS.load(Ordering::Relaxed);
@@ -16804,6 +16927,49 @@ mod pool_accounts_coverage_tests {
             ARB_REJECTED_MISSING_ACCOUNTS.load(Ordering::Relaxed),
             before_missing,
             "missing-accounts reject must not fire when cache backfill succeeded"
+        );
+    }
+
+    /// Prod 2026-09-19 post-#453: Orca ExecutableMarginal buy quote must reach EE metadata (I-19a).
+    #[test]
+    fn orca_v2_buy_quote_sets_expected_token_output_metadata() {
+        let meteora_pool = Pubkey::new_unique();
+        let orca_pool = Pubkey::new_unique();
+        let cache = usdc_meteora_orca_cache(meteora_pool, orca_pool);
+        let ctx = test_arb_context(cache);
+
+        let mut tracker = TokenArbTracker::new(USDC_MINT);
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(pool_state("orca", &orca_pool.to_string()));
+        tracker.upsert_pool(pool_state("meteora_dlmm", &meteora_pool.to_string()));
+        ctx.trackers.write().insert(USDC_MINT.to_string(), tracker);
+
+        let trade_amount = 100_000_000u64;
+        let executable_buy_out = 399_317_788u64;
+        let buy_price = Decimal::from_str("0.00021286").unwrap();
+
+        let opp = ArbOpportunity {
+            base_mint: USDC_MINT.to_string(),
+            buy_dex: "orca".to_string(),
+            buy_pool: orca_pool.to_string(),
+            buy_price,
+            sell_dex: "meteora_dlmm".to_string(),
+            sell_pool: meteora_pool.to_string(),
+            sell_price: Decimal::ONE,
+            spread_bps: 960,
+            trade_amount_lamports: trade_amount,
+            estimated_profit_lamports: 673_000,
+            buy_token_out: Some(executable_buy_out),
+        };
+
+        let intent =
+            create_arb_intent(&ctx, &opp).expect("orca buy must publish when accounts resolve");
+        assert_eq!(
+            intent
+                .metadata
+                .get("expected_token_output")
+                .map(String::as_str),
+            Some(executable_buy_out.to_string().as_str())
         );
     }
 
@@ -16846,6 +17012,7 @@ mod pool_accounts_coverage_tests {
             spread_bps: 47,
             trade_amount_lamports: 100_000_000,
             estimated_profit_lamports: 423_802,
+            buy_token_out: None,
         };
 
         let before = ironcrab::metrics::ARB_BUNDLE_PROFIT_INSUFFICIENT.load(Ordering::Relaxed);
@@ -16954,6 +17121,7 @@ mod pool_accounts_coverage_tests {
             spread_bps: 50,
             trade_amount_lamports: 10_000_000,
             estimated_profit_lamports: 100_000,
+            buy_token_out: None,
         };
 
         let sell = ctx
