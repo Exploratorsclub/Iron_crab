@@ -16,8 +16,8 @@ use super::orca_tick_array::{
 #[derive(Debug, Clone)]
 pub struct OrcaWhirlpoolQuoteInput {
     pub pool: Pubkey,
-    pub token_mint_a: String,
-    pub token_mint_b: String,
+    pub token_mint_a: Pubkey,
+    pub token_mint_b: Pubkey,
     pub sqrt_price: u128,
     pub liquidity: u128,
     pub tick_current_index: i32,
@@ -1552,15 +1552,19 @@ mod whirlpool_math {
     pub use token::FEE_RATE_MUL_VALUE;
 }
 
-fn mints_match(a: &str, b: &str) -> bool {
-    a == b
+fn mint_str_matches(mint: &str, pk: &Pubkey) -> bool {
+    mint == pk.to_string().as_str()
 }
 
 fn resolve_a_to_b(input: &OrcaWhirlpoolQuoteInput, mint_in: &str, mint_out: &str) -> Option<bool> {
-    if mints_match(mint_in, &input.token_mint_a) && mints_match(mint_out, &input.token_mint_b) {
+    if mint_str_matches(mint_in, &input.token_mint_a)
+        && mint_str_matches(mint_out, &input.token_mint_b)
+    {
         return Some(true);
     }
-    if mints_match(mint_in, &input.token_mint_b) && mints_match(mint_out, &input.token_mint_a) {
+    if mint_str_matches(mint_in, &input.token_mint_b)
+        && mint_str_matches(mint_out, &input.token_mint_a)
+    {
         return Some(false);
     }
     None
@@ -1857,14 +1861,14 @@ mod tests {
         sqrt_price: u128,
         liquidity: u128,
         tick: i32,
-    ) -> (OrcaWhirlpoolQuoteInput, String, String) {
+    ) -> (OrcaWhirlpoolQuoteInput, Pubkey, Pubkey) {
         let pool_pk = Pubkey::new_unique();
-        let mint_a = Pubkey::new_unique().to_string();
-        let mint_b = Pubkey::new_unique().to_string();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
         let input = OrcaWhirlpoolQuoteInput {
             pool: pool_pk,
-            token_mint_a: mint_a.clone(),
-            token_mint_b: mint_b.clone(),
+            token_mint_a: mint_a,
+            token_mint_b: mint_b,
             sqrt_price,
             liquidity,
             tick_current_index: tick,
@@ -1900,8 +1904,22 @@ mod tests {
         let liq = 1_000_000_000_000u128;
         let (pool, mint_a, mint_b) = sample_pool(sqrt, liq, tick);
         let ticks = insert_arrays(&pool, tick, true, &[]);
-        let q1 = orca_quote_exact_in(&pool, &ticks, &mint_a, &mint_b, 1_000).expect("q1");
-        let q2 = orca_quote_exact_in(&pool, &ticks, &mint_a, &mint_b, 10_000).expect("q2");
+        let q1 = orca_quote_exact_in(
+            &pool,
+            &ticks,
+            &mint_a.to_string(),
+            &mint_b.to_string(),
+            1_000,
+        )
+        .expect("q1");
+        let q2 = orca_quote_exact_in(
+            &pool,
+            &ticks,
+            &mint_a.to_string(),
+            &mint_b.to_string(),
+            10_000,
+        )
+        .expect("q2");
         assert!(q1 > 0);
         assert!(q2 > q1);
     }
@@ -1993,7 +2011,14 @@ mod tests {
         let liq = 1_000u128;
         let (pool, mint_a, mint_b) = sample_pool(sqrt, liq, tick);
         let ticks = insert_arrays(&pool, tick, true, &[]);
-        assert!(orca_quote_exact_in(&pool, &ticks, &mint_a, &mint_b, u64::MAX).is_none());
+        assert!(orca_quote_exact_in(
+            &pool,
+            &ticks,
+            &mint_a.to_string(),
+            &mint_b.to_string(),
+            u64::MAX
+        )
+        .is_none());
     }
 
     fn cpmm_amount_out(amount_in: u64, sqrt_price: u128, fee_rate: u16, a_to_b: bool) -> u64 {
@@ -2023,7 +2048,14 @@ mod tests {
         let (pool, mint_a, mint_b) = sample_pool(sqrt, liq, tick);
         let ticks = insert_arrays(&pool, tick, true, &[(64, true, 500_000_000_000i128)]);
         let amount = 25_000_000u64;
-        let walk = orca_quote_exact_in(&pool, &ticks, &mint_a, &mint_b, amount).expect("walk");
+        let walk = orca_quote_exact_in(
+            &pool,
+            &ticks,
+            &mint_a.to_string(),
+            &mint_b.to_string(),
+            amount,
+        )
+        .expect("walk");
         let cpmm = cpmm_amount_out(amount, sqrt, pool.fee_rate, true);
         assert_ne!(walk, cpmm);
     }
