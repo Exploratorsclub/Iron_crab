@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MD-SIDEFX-SELL-LAYOUT-LOG-STORM: md-account-sidefx-Hang durch `sell_layout_ready` / BalanceUpdated INFO-Journal (I-4b)
+**Datum**: 2026-09-18  
+**Problem**: Prod SHA `5025295` (Deploy #452, Units seit 22:17 CEST): Geyser-Listener/Head lebten; **TX-Handler + `md-account-sidefx` tot** ab ~23:18:44 CEST. Dutzende `pump_amm: Geyser SELL set sell_layout_ready` + `MASTER CACHE: PoolCacheUpdate::BalanceUpdated` **info!** in derselben ms (~110k / ~17k seit Deploy, ~30/s) → synchrones `tracing_subscriber::fmt()` → systemd-journald Rate-Limit → blockierendes `write` auf dem seriellen Sidefx-Task; Logger-Mutex → TX-Handler `stale` ohne Reconnect (PR165/166). Restart leert nur kurz das Journal-Limit — keine Dauerheilung. Mint `Cz7LGKdZPpAxonXx23ZYPW3RtDQvjcf17ZDCZEzFpump` / Arb-HIGH-Freeze Folge (keine Vault-Ticks).  
+**Fix**: Die beiden Hot-Path-**info!** in `md_sidefx_process_pump_amm_trade` (layout-ready SELL) und `md_sidefx_process_vault_balance_tick` (JetStream BalanceUpdated enqueue) → **debug!**. Metriken `record_pump_amm_geyser_sell_layout_ready` / Layout-Merge / Enqueue unverändert. Source-Grep-Test in `handlers.rs`. Gleiche Klasse wie FIX-MD-TX-HANDLER-PRIORITY-FEE-LOG-STORM (#450).  
+**Invarianten**: I-4b non-blocking ingest/sidefx; I-7 kein RPC; Watchdog `WarnHandlerStuckNoReconnect` unverändert.  
+**Dateien**: `src/market_data/sidefx/handlers.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-SIDEFX-COALESCE-LRU-VS-C: Burst-Coalesce verdrängte Pump v14 / Generic-DEX-C durch LRU-Touch
 **Datum**: 2026-09-18  
 **Problem**: Prod post-#451: Mint `Cz7LGKdZPpAxonXx23ZYPW3RtDQvjcf17ZDCZEzFpump`, Pool `7oM3hr4rHmJ4mwe7BVdSqmSPkm3tjCYZpLvtiN6muNFz` — 13 `Trade` `dex=pump_amm`, **0** `DexPoolAccounts` pump_amm; `md_sidefx_process_pump_amm_trade` lief nicht. TX-Burst enqueued `PumpAmmTradeWithAccounts` + `TradePoolLruTouch` (gleiche Pool-Pubkey); `md_sidefx_coalesce_burst` keyed nur die Adresse → LRU latest-wins, C-Job weg.  
