@@ -22317,13 +22317,7 @@ mod pr_b_geyser_tracking_tests {
         ctx.live_pool_cache
             .upsert(pool, test_orca_whirlpool_cached_state(0, 8), 1);
         assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
-        let pda = ctx
-            .tracked_orca_tick_arrays
-            .read()
-            .keys()
-            .next()
-            .unwrap()
-            .clone();
+        let pda = *ctx.tracked_orca_tick_arrays.read().keys().next().unwrap();
         let bytes = build_tick_array_account_bytes(0, pool, 8, &[]);
         assert!(ironcrab::solana::dex::orca_tick_array::parse_tick_array(&bytes).is_some());
         assert!(ctx
