@@ -12772,8 +12772,8 @@ mod two_hop_price_tests {
     #[test]
     fn orca_v2_fixture_enables_executable_buy_quote() {
         use ironcrab::arbitrage::pool_quote::{
-            quote_exact_in_with_orca, DLMM_PROBE_SOL_LAMPORTS, NATIVE_SOL_MINT, OrcaExecCtx,
-            QuoteFreshnessConfig,
+            quote_exact_in_with_orca, OrcaExecCtx, QuoteFreshnessConfig, DLMM_PROBE_SOL_LAMPORTS,
+            NATIVE_SOL_MINT,
         };
 
         let cache = create_shared_cache();
@@ -13618,19 +13618,27 @@ mod two_hop_price_tests {
 
         let count_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT.load(Ordering::Relaxed);
         let equal_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_EQUAL_TOTAL.load(Ordering::Relaxed);
+        let buy_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_BUY_TOTAL.load(Ordering::Relaxed);
+        let sell_before = ARB_QUOTE_PAIR_SLOT_SKEW_LEG_SELL_TOTAL.load(Ordering::Relaxed);
         let sum_before = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_SUM.load(Ordering::Relaxed);
 
         let delta = run_v2_slot_skew_screen(50, 50);
         assert_eq!(delta.count, 1);
         assert_eq!(delta.equal, 1);
+        assert_eq!(delta.buy, 0);
+        assert_eq!(delta.sell, 0);
         assert_eq!(delta.sum, 0);
 
         let delta = run_v2_slot_skew_screen(48, 50);
         assert_eq!(delta.count, 1);
+        assert_eq!(delta.equal, 0);
+        assert_eq!(delta.buy + delta.sell, 1);
         assert_eq!(delta.sum, 2);
 
         let delta = run_v2_slot_skew_screen(1, 101);
         assert_eq!(delta.count, 1);
+        assert_eq!(delta.equal, 0);
+        assert_eq!(delta.buy + delta.sell, 1);
         assert_eq!(delta.sum, 100);
 
         let count_after = ARB_QUOTE_PAIR_SLOT_DELTA_SLOTS_COUNT.load(Ordering::Relaxed);
@@ -13641,9 +13649,10 @@ mod two_hop_price_tests {
 
         assert_eq!(count_after - count_before, 3);
         assert_eq!(equal_after - equal_before, 1);
-        assert!(
-            buy_after + sell_after >= 1,
-            "non-equal slot deltas must attribute skew to buy or sell leg"
+        assert_eq!(
+            (buy_after - buy_before) + (sell_after - sell_before),
+            2,
+            "two skewed slot pairs must attribute stale leg once each"
         );
         assert_eq!(sum_after - sum_before, 102);
     }
