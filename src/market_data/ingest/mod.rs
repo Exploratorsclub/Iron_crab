@@ -20,7 +20,9 @@ pub use account_handler::{
     handle_geyser_account_update, publish_meteora_dlmm_bin_array_from_geyser,
     DlmmBinArrayPublishOutcome,
 };
-pub use account_host::{AccountBinArrayView, AccountIngestHost, AccountTrackedWalletView};
+pub use account_host::{
+    AccountBinArrayView, AccountIngestHost, AccountOrcaTickArrayView, AccountTrackedWalletView,
+};
 pub use account_parse::{
     try_parse_mint_account, try_parse_token_account_balance, wallet_geyser_snapshots_to_publish,
     wsol_ata_balance_lamports_from_geyser_data, WalletGeyserSnapshotMint,
@@ -67,6 +69,13 @@ impl<T: IngestHost + ?Sized> IngestHost for Arc<T> {
 
     fn ingest_membership_bin_array_contains(&self, pubkey: &solana_sdk::pubkey::Pubkey) -> bool {
         (**self).ingest_membership_bin_array_contains(pubkey)
+    }
+
+    fn ingest_membership_orca_tick_array_contains(
+        &self,
+        pubkey: &solana_sdk::pubkey::Pubkey,
+    ) -> bool {
+        (**self).ingest_membership_orca_tick_array_contains(pubkey)
     }
 
     fn ingest_exec_hot_vault_contains(&self, pubkey: &solana_sdk::pubkey::Pubkey) -> bool {

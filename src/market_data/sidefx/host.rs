@@ -93,6 +93,9 @@ pub trait SidefxWorkerHost: Send + Sync {
     /// Re-register DLMM bin-array window when hot-pool `active_id` drifts (Mom + Arb, C1d/C1g).
     fn maybe_refresh_arb_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool;
 
+    /// Re-register Orca tick-array window when hot-pool `tick_current_index` drifts.
+    fn maybe_refresh_arb_orca_tick_window(&self, pool: Pubkey, new_tick: i32) -> bool;
+
     /// C1g: enqueue deferred vault/bin registration retry after LivePoolCache gains layout.
     fn maybe_retry_deferred_hot_pool_reserves_on_cache_fill(&self, pool: &Pubkey);
 

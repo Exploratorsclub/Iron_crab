@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ORCA-TICK-ARRAY-INGEST: Arb-gepinnte Orca TickArray Geyser pin + OrcaTickArrayUpdate (quote still k)
+**Datum**: 2026-09-19  
+**Problem**: Arb-pinned Orca Whirlpools had vault/pool explicit Geyser only — no tick-array PDAs for a future CLMM walk quote (Job 3).  
+**Fix**: Plan/register five tick-array PDAs per hot Orca pool (`planned_orca_tick_array_pubkeys`), `tracked_orca_tick_arrays` + membership ingest (`parse_tick_array`, not DLMM), window refresh on `tick_current_index` drift, `MarketEventKind::OrcaTickArrayUpdate` → arb-strategy cache. **Production Orca quote path unchanged** (still vault-k until Job 3).  
+**Invarianten**: I-4/I-7 Geyser-only; I-4b debug-only on tick apply; I-MD-5 arb-pinned only.  
+**Dateien**: `src/bin/market_data.rs`, `src/market_data/orca_tick_publish.rs`, `src/ipc/schema.rs`, `src/bin/arb_strategy.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ORCA-CLMM-WALKER-LIB: Orca Whirlpool tick-walking quote library (not wired)
 **Datum**: 2026-09-19  
 **Problem**: Hot-path Orca quotes still use reserve/CPMM approximations; accurate CLMM exact-in requires walking initialized ticks across the three swap-direction tick arrays with on-chain Whirlpool math.  

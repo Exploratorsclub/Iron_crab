@@ -169,6 +169,15 @@ pub struct BinData {
     pub amount_y: u64,
 }
 
+/// Single Whirlpool tick slot for Orca CLMM tick-array events (Geyser-only).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrcaTickSnapshot {
+    pub tick_index: i32,
+    pub initialized: bool,
+    /// `liquidity_net` as decimal string (i128).
+    pub liquidity_net: String,
+}
+
 // ============================================================================
 // MarketEvent (produced by market-data)
 // ============================================================================
@@ -337,6 +346,13 @@ pub enum MarketEventKind {
         /// Bin data (compact: only bins with liquidity)
         bins: Vec<BinData>,
         /// Slot when this update was observed
+        update_slot: u64,
+    },
+    /// Orca Whirlpool classic TickArray update (via Geyser explicit pin + account subscription)
+    OrcaTickArrayUpdate {
+        pool_address: String,
+        start_tick_index: i32,
+        ticks: Vec<OrcaTickSnapshot>,
         update_slot: u64,
     },
     /// PumpFun bonding curve progress update (via Geyser account parsing)

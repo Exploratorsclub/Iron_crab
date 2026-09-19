@@ -62,6 +62,7 @@ pub enum ExplicitAccountKind {
     Mint,
     Vault,
     BinArray,
+    OrcaTickArray,
     WalletToken,
 }
 
