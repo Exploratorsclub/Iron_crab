@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-I19A-V2-BUY-QUOTE-SELL-SIZE: Orca→Pump SimFailed `insufficient funds` ix4 trotz I-19a Haircut (Price-Fallback)
+**Datum**: 2026-09-19  
+**Problem**: Prod SHA `09c5fed` (post-#453): 3/3 Intents Mint `Ce2gx9KG…`, Orca Buy → Pump Sell, 0,1 SOL — I-19a Haircut angewendet, aber `raw_expected` aus Mid-`buy_price` (`No plausible expected_token_output in metadata; using price-based raw estimate`). Whirlpool-Fill unter 85 % Mid → Pump Sell Tokenkeg `Custom(1)` ix4, 0 Bundles (I-9). Ursache: V2 Round-Trip nutzte `selection.buy_quote.amount_out` für Profit, speicherte es nicht auf `ArbOpportunity`; `calculate_expected_token_output` liefert für Orca `None` → EE Price-Fallback.  
+**Fix**: `ArbOpportunity.buy_token_out` aus V2 ExecutableMarginal (`amount_in == trade_amount` oder frische `quote_exact_in` für `trade_amount`, kein lineares `amount_out * trade / probe`). `create_arb_intent` bevorzugt `buy_token_out` vor Reserve/Bin-Fallback. Haircut 1500 bps / `cross_dex_handler` unverändert.  
+**Invarianten**: I-19a, I-9, I-12, I-7 kein RPC, KNOWN_BUG #19 (kein Haircut-BPS-Pflaster).  
+**Dateien**: `src/bin/arb_strategy.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-SIDEFX-SELL-LAYOUT-LOG-STORM: md-account-sidefx-Hang durch `sell_layout_ready` / BalanceUpdated INFO-Journal (I-4b)
 **Datum**: 2026-09-18  
 **Problem**: Prod SHA `5025295` (Deploy #452, Units seit 22:17 CEST): Geyser-Listener/Head lebten; **TX-Handler + `md-account-sidefx` tot** ab ~23:18:44 CEST. Dutzende `pump_amm: Geyser SELL set sell_layout_ready` + `MASTER CACHE: PoolCacheUpdate::BalanceUpdated` **info!** in derselben ms (~110k / ~17k seit Deploy, ~30/s) → synchrones `tracing_subscriber::fmt()` → systemd-journald Rate-Limit → blockierendes `write` auf dem seriellen Sidefx-Task; Logger-Mutex → TX-Handler `stale` ohne Reconnect (PR165/166). Restart leert nur kurz das Journal-Limit — keine Dauerheilung. Mint `Cz7LGKdZPpAxonXx23ZYPW3RtDQvjcf17ZDCZEzFpump` / Arb-HIGH-Freeze Folge (keine Vault-Ticks).  
