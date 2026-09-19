@@ -1487,6 +1487,7 @@ enum GeyserPruneMap {
     Mints,
     Vaults,
     Bins,
+    OrcaTicks,
     Wallets,
     Done,
 }
@@ -1496,7 +1497,8 @@ impl GeyserPruneMap {
         match self {
             Self::Mints => Self::Vaults,
             Self::Vaults => Self::Bins,
-            Self::Bins => Self::Wallets,
+            Self::Bins => Self::OrcaTicks,
+            Self::OrcaTicks => Self::Wallets,
             Self::Wallets | Self::Done => Self::Done,
         }
     }
@@ -4230,6 +4232,14 @@ impl MarketDataContext {
         {
             return true;
         }
+        if self
+            .tracked_orca_tick_arrays
+            .read()
+            .keys()
+            .any(|pk| !admitted.contains(pk))
+        {
+            return true;
+        }
         self.tracked_wallet_token_accounts
             .read()
             .iter()
@@ -4258,6 +4268,13 @@ impl MarketDataContext {
                 .collect(),
             GeyserPruneMap::Bins => self
                 .tracked_bin_arrays
+                .read()
+                .keys()
+                .filter(|pk| !admitted.contains(*pk))
+                .copied()
+                .collect(),
+            GeyserPruneMap::OrcaTicks => self
+                .tracked_orca_tick_arrays
                 .read()
                 .keys()
                 .filter(|pk| !admitted.contains(*pk))
@@ -4295,6 +4312,14 @@ impl MarketDataContext {
                 for pk in batch {
                     if let Some(info) = bins.remove(pk) {
                         self.pool_tracked_legs_remove_bin(info.pool_address, *pk);
+                    }
+                }
+            }
+            GeyserPruneMap::OrcaTicks => {
+                let mut ticks = self.tracked_orca_tick_arrays.write();
+                for pk in batch {
+                    if let Some(info) = ticks.remove(pk) {
+                        self.pool_tracked_legs_remove_orca_tick(info.pool_address, *pk);
                     }
                 }
             }
@@ -16573,7 +16598,7 @@ mod pr_b_geyser_tracking_tests {
             geyser_full_reconnect_threshold_live: Arc::new(AtomicUsize::new(0)),
             nats: None,
             jsonl_writer,
-            started_at: Instant::now(),
+            started_at: Instant::now() - MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW,
             event_counter: std::sync::atomic::AtomicU64::new(0),
             wallet_tracker: WalletTracker::new(WalletTrackerCfg::default()),
             priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
@@ -16592,7 +16617,7 @@ mod pr_b_geyser_tracking_tests {
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
             tracked_orca_tick_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            tracked_orca_tick_arrays_tx: watch::channel(Vec::<Pubkey>::new()).0,
+            tracked_orca_tick_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
             pool_mint_map_pools_snapshot: ArcSwap::from_pointee(HashSet::new()),
@@ -20660,7 +20685,14 @@ mod pr_b_geyser_tracking_tests {
             let _ = ctx.tracked_mints_tx.send(vec![pk]);
         }
 
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            if MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL.load(Ordering::Relaxed) > coalesced0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         let n = combined_change_count.load(Ordering::Relaxed);
         assert!(
