@@ -11,6 +11,8 @@ pub mod meteora_dlmm_layout;
 pub mod meteora_swap_builder;
 pub mod orca;
 pub mod orca_reserve_cache;
+pub mod orca_tick_array;
+pub mod orca_tick_walker;
 pub mod orca_whirlpool_layout;
 pub mod pumpfun;
 pub mod pumpfun_amm;

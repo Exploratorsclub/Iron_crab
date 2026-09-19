@@ -1666,8 +1666,7 @@ impl Orca {
 
 // (Removed) WhirlpoolMeta replaced by canonical parser struct in layout module.
 
-/// Orca Whirlpool constants
-const TICK_ARRAY_SIZE: i32 = 88; // Number of ticks per TickArray
+use super::orca_tick_array::{derive_tick_array_pda, get_tick_array_start_index, TICK_ARRAY_SIZE};
 
 /// Tick-array PDAs for a Whirlpool exact-in swap using **cached** tick data — must stay aligned
 /// with [`Orca::build_swap_ix_async`].
@@ -1707,24 +1706,9 @@ fn whirlpool_swap_tick_array_pdas_for_cached_swap(
 /// Tick-array PDA seeds must match Orca Whirlpool on-chain + `@orca-so/whirlpools-sdk`
 /// [`getTickArrayAddress`]: Anchor uses `start_tick_index.to_string().as_bytes()` (decimal ASCII),
 /// **not** `i32::to_le_bytes()`. Fixed and dynamic tick arrays share the same seed layout
-/// (`programs/whirlpool`: `initialize_tick_array`, `initialize_dynamic_tick_array`).
-fn derive_tick_array_pda(pool: &Pubkey, start_tick_index: i32) -> Pubkey {
-    let start_tick_str = start_tick_index.to_string();
-    let seeds: &[&[u8]] = &[b"tick_array", pool.as_ref(), start_tick_str.as_bytes()];
-    Pubkey::find_program_address(seeds, &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap()).0
-}
-
 fn derive_oracle_pda(pool: &Pubkey) -> Pubkey {
     let seeds: &[&[u8]] = &[b"oracle", pool.as_ref()];
     Pubkey::find_program_address(seeds, &Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap()).0
-}
-
-/// First tick index of the tick array that contains `tick_index`.
-/// Matches `@orca-so/whirlpools-core` / on-chain Orca: `tick_index.div_euclid(spacing).div_euclid(88) * spacing * 88`.
-fn get_tick_array_start_index(tick_index: i32, tick_spacing: i32) -> i32 {
-    let ts = tick_spacing;
-    let real_index = tick_index.div_euclid(ts).div_euclid(TICK_ARRAY_SIZE);
-    real_index * ts * TICK_ARRAY_SIZE
 }
 
 /// Validate that a tick array start index contains the given tick
@@ -1738,6 +1722,9 @@ fn tick_array_contains_tick(array_start: i32, tick_index: i32, tick_spacing: i32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solana::dex::orca_tick_array::{
+        self, derive_tick_array_pda, get_tick_array_start_index,
+    };
     use crate::solana::dex::orca_whirlpool_layout as layout;
     use std::sync::Arc;
 
@@ -1893,7 +1880,7 @@ mod tests {
     fn whirlpool_cached_swap_tick_pdas_no_opposite_direction_array() {
         let pool = Pubkey::new_unique();
         let spacing = 64;
-        let ticks_per_array = spacing * super::TICK_ARRAY_SIZE;
+        let ticks_per_array = spacing * orca_tick_array::TICK_ARRAY_SIZE;
         let tick_now = 2800;
         let (_, _, _, start0, start1, start2) =
             super::whirlpool_swap_tick_array_pdas_for_cached_swap(&pool, tick_now, spacing, true);
@@ -1916,7 +1903,7 @@ mod tests {
     fn tick_array_pda_uses_anchor_decimal_string_seed() {
         let pool = Pubkey::new_unique();
         let start = -704i32;
-        let correct = super::derive_tick_array_pda(&pool, start);
+        let correct = derive_tick_array_pda(&pool, start);
         let wrong_seeds: &[&[u8]] = &[b"tick_array", pool.as_ref(), &start.to_le_bytes()];
         let wrong = Pubkey::find_program_address(
             wrong_seeds,
@@ -1932,12 +1919,12 @@ mod tests {
     /// Parity with `@orca-so/whirlpools-core` `getTickArrayStartTickIndex` (see orca-so/whirlpools tick.rs tests).
     #[test]
     fn get_tick_array_start_index_matches_orca_core_examples() {
-        assert_eq!(super::get_tick_array_start_index(0, 8), 0);
-        assert_eq!(super::get_tick_array_start_index(740, 8), 704);
-        assert_eq!(super::get_tick_array_start_index(-624, 8), -704);
-        assert_eq!(super::get_tick_array_start_index(338433, 128), 337920);
-        assert_eq!(super::get_tick_array_start_index(-337409, 128), -337920);
-        assert_ne!(super::get_tick_array_start_index(2354285, 8), 2353573);
+        assert_eq!(get_tick_array_start_index(0, 8), 0);
+        assert_eq!(get_tick_array_start_index(740, 8), 704);
+        assert_eq!(get_tick_array_start_index(-624, 8), -704);
+        assert_eq!(get_tick_array_start_index(338433, 128), 337920);
+        assert_eq!(get_tick_array_start_index(-337409, 128), -337920);
+        assert_ne!(get_tick_array_start_index(2354285, 8), 2353573);
     }
 
     #[test]
