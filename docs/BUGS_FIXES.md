@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ORCA-CLMM-QUOTE-WIRE: Arb V2 ExecutableMarginal Orca = tick walk (A.54)
+**Datum**: 2026-09-19  
+**Problem**: Orca in `supports_cpmm` / `cpmm_amount_out` on vault reserves — Arb screening and I-19a `raw_expected` used vault-k, not on-chain Whirlpool tick walk (prod: Orca buy sim ok, Pump sell Tokenkeg `0x1`).  
+**Fix**: Wire `orca_quote_exact_in` + cached tick arrays into `pool_quote` / `arb_strategy` round-trip (DLMM pattern). Remove `"orca"` from `supports_cpmm`; incomplete ticks → `None` (no k-fallback). Fingerprint includes tick window (A.48).  
+**Invarianten**: I-7/I-4 no hot-path RPC; I-4b no info per quote; I-19a haircut unchanged in EE.  
+**Dateien**: `src/arbitrage/pool_quote.rs`, `src/bin/arb_strategy.rs`, `src/arbitrage/mod.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ORCA-TICK-ARRAY-INGEST: Arb-gepinnte Orca TickArray Geyser pin + OrcaTickArrayUpdate (quote still k)
 **Datum**: 2026-09-19  
 **Problem**: Arb-pinned Orca Whirlpools had vault/pool explicit Geyser only — no tick-array PDAs for a future CLMM walk quote (Job 3).  

@@ -10,8 +10,8 @@ use crate::nats::{ArbTrackActiveReason, ArbTrackRemovedReason};
 
 use super::pool_quote::{
     is_quote_fresh_with_bins, quote_exact_in_with_freshness, select_round_trip_pools,
-    DlmmBinArrays, QuoteFreshnessConfig, QuotePoolInput, QuoteVaultInput, RoundTripPoolCandidate,
-    NATIVE_SOL_MINT,
+    DlmmBinArrays, OrcaTickArrays, QuoteFreshnessConfig, QuotePoolInput, QuoteVaultInput,
+    RoundTripPoolCandidate, NATIVE_SOL_MINT,
 };
 
 /// Readiness tier for a pool candidate (lowest ordinal = highest priority).
@@ -43,6 +43,7 @@ pub struct TrackPoolInput {
     pub quote_pool: QuotePoolInput,
     pub vault: Option<QuoteVaultInput>,
     pub dlmm_bins: Option<DlmmBinArrays>,
+    pub orca_ticks: Option<OrcaTickArrays>,
     pub token_decimals: u8,
     /// Latest activity from tracker/cache state (unix ms).
     pub last_activity_unix_ms: u64,
@@ -716,6 +717,7 @@ mod tests {
             quote_pool: quote_pool(dex, addr, mint, has_reserve),
             vault,
             dlmm_bins: None,
+            orca_ticks: None,
             token_decimals: 6,
             last_activity_unix_ms: activity_ms,
         }
