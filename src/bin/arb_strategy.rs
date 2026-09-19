@@ -4299,15 +4299,9 @@ impl TokenArbTracker {
         };
         let estimated_profit_lamports = (profit_lamports as i128 * scale).max(0) as u64;
 
-        let buy_vault = vault_balances
-            .get(&selection.buy_pool_address)
-            .map(|v| {
-                vault_cache_to_quote_input(
-                    &selection.buy_pool_address,
-                    v,
-                    check_ctx.live_pool_cache,
-                )
-            });
+        let buy_vault = vault_balances.get(&selection.buy_pool_address).map(|v| {
+            vault_cache_to_quote_input(&selection.buy_pool_address, v, check_ctx.live_pool_cache)
+        });
         let buy_dlmm_bins = bin_arrays
             .get(&selection.buy_pool_address)
             .map(flatten_bin_array_cache);
