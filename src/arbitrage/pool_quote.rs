@@ -14,8 +14,11 @@ use std::time::{Duration, Instant};
 use crate::execution::live_pool_cache::{CachedPoolState, MeteoraState};
 use crate::ipc::BinData;
 use crate::solana::dex::meteora_bin_walker::{dlmm_fee_bps, walker_from_bins};
-use crate::solana::dex::orca_tick_walker::{orca_quote_exact_in, OrcaWhirlpoolQuoteInput};
 use solana_sdk::pubkey::Pubkey;
+
+pub use crate::solana::dex::orca_tick_walker::{
+    orca_quote_exact_in, OrcaTickArrays, OrcaWhirlpoolQuoteInput,
+};
 
 pub const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 /// Small SOL probe for DLMM marginal price / screening (0.01 SOL).
@@ -45,31 +48,53 @@ impl Default for QuoteFreshnessConfig {
 
 /// Hash of vault reserve snapshot used for ExecutableMarginal freshness.
 pub fn state_fingerprint(vault: &QuoteVaultInput) -> u64 {
-    state_fingerprint_with_bins(vault, None, None)
+    state_fingerprint_with_bins(vault, None)
 }
 
 /// Hash of vault + optional DLMM bin liquidity for ExecutableMarginal freshness.
 pub fn state_fingerprint_with_bins(
     vault: &QuoteVaultInput,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
+) -> u64 {
+    state_fingerprint_for_executable(vault, dlmm_bins, OrcaExecCtx::NONE)
+}
+
+/// Orca whirlpool + tick window for A.48 ExecutableMarginal fingerprint (arb V2 only).
+#[derive(Clone, Copy, Default)]
+/// Arb V2 wiring: whirlpool state + tick window (not part of Eval `QuoteVaultInput`).
+pub struct OrcaExecCtx<'a> {
+    pub whirlpool: Option<&'a OrcaWhirlpoolQuoteInput>,
+    pub ticks: Option<&'a OrcaTickArrays>,
+}
+
+impl<'a> OrcaExecCtx<'a> {
+    pub const NONE: Self = Self {
+        whirlpool: None,
+        ticks: None,
+    };
+}
+
+pub(crate) fn state_fingerprint_for_executable(
+    vault: &QuoteVaultInput,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    orca: OrcaExecCtx<'_>,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
     vault.reserve_base.hash(&mut hasher);
     vault.reserve_quote.hash(&mut hasher);
     vault.active_id.hash(&mut hasher);
     vault.bin_step.hash(&mut hasher);
-    if let Some(orca) = &vault.orca {
-        orca.sqrt_price.hash(&mut hasher);
-        orca.liquidity.hash(&mut hasher);
-        orca.tick_current_index.hash(&mut hasher);
-        orca.tick_spacing.hash(&mut hasher);
-        orca.fee_rate.hash(&mut hasher);
+    if let Some(wp) = orca.whirlpool {
+        wp.sqrt_price.hash(&mut hasher);
+        wp.liquidity.hash(&mut hasher);
+        wp.tick_current_index.hash(&mut hasher);
+        wp.tick_spacing.hash(&mut hasher);
+        wp.fee_rate.hash(&mut hasher);
     }
     if let Some(bins) = dlmm_bins {
         hash_dlmm_bins_for_fingerprint(&mut hasher, bins);
     }
-    if let Some(ticks) = orca_ticks {
+    if let Some(ticks) = orca.ticks {
         hash_orca_ticks_for_fingerprint(&mut hasher, ticks);
     }
     hasher.finish()
@@ -137,7 +162,7 @@ pub fn dlmm_quote_window_bins_fingerprint(active_id: i32, bin_arrays: &DlmmBinAr
 pub fn dlmm_quote_window_fingerprint(vault: &QuoteVaultInput, bin_arrays: &DlmmBinArrays) -> u64 {
     if let Some(active_id) = vault.active_id {
         let windowed = filter_bins_to_quote_window(active_id, bin_arrays);
-        state_fingerprint_with_bins(vault, Some(&windowed), None)
+        state_fingerprint_with_bins(vault, Some(&windowed))
     } else {
         state_fingerprint(vault)
     }
@@ -150,7 +175,7 @@ pub fn is_quote_fresh(
     current_vault: Option<&QuoteVaultInput>,
     now: Instant,
 ) -> bool {
-    is_quote_fresh_with_bins(quote, config, current_vault, None, None, now)
+    is_quote_fresh_with_bins(quote, config, current_vault, None, now)
 }
 
 /// I-ARB-4: re-check quote freshness including optional DLMM bin snapshot.
@@ -159,11 +184,20 @@ pub fn is_quote_fresh_with_bins(
     config: &QuoteFreshnessConfig,
     current_vault: Option<&QuoteVaultInput>,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
     now: Instant,
 ) -> bool {
-    diagnose_quote_not_fresh_with_bins(quote, config, current_vault, dlmm_bins, orca_ticks, now)
-        .is_none()
+    diagnose_quote_not_fresh_with_bins(quote, config, current_vault, dlmm_bins, now).is_none()
+}
+
+pub fn is_quote_fresh_with_orca(
+    quote: &PoolQuote,
+    config: &QuoteFreshnessConfig,
+    current_vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    orca: OrcaExecCtx<'_>,
+    now: Instant,
+) -> bool {
+    diagnose_quote_not_fresh_with_orca(quote, config, current_vault, dlmm_bins, orca, now).is_none()
 }
 
 /// Age bucket for vault/state-stale forensics (C1h2).
@@ -257,7 +291,7 @@ pub fn diagnose_quote_not_fresh(
     current_vault: Option<&QuoteVaultInput>,
     now: Instant,
 ) -> Option<QuoteNotFreshDiagnosis> {
-    diagnose_quote_not_fresh_with_bins(quote, config, current_vault, None, None, now)
+    diagnose_quote_not_fresh_with_bins(quote, config, current_vault, None, now)
 }
 
 /// Returns `Some(diagnosis)` when quote fails freshness re-check (with DLMM bins).
@@ -266,7 +300,24 @@ pub fn diagnose_quote_not_fresh_with_bins(
     config: &QuoteFreshnessConfig,
     current_vault: Option<&QuoteVaultInput>,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
+    now: Instant,
+) -> Option<QuoteNotFreshDiagnosis> {
+    diagnose_quote_not_fresh_with_orca(
+        quote,
+        config,
+        current_vault,
+        dlmm_bins,
+        OrcaExecCtx::NONE,
+        now,
+    )
+}
+
+pub(crate) fn diagnose_quote_not_fresh_with_orca(
+    quote: &PoolQuote,
+    config: &QuoteFreshnessConfig,
+    current_vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    orca: OrcaExecCtx<'_>,
     now: Instant,
 ) -> Option<QuoteNotFreshDiagnosis> {
     let kind = QuoteNotFreshKind::from_quote_kind(quote.kind);
@@ -289,7 +340,7 @@ pub fn diagnose_quote_not_fresh_with_bins(
             }
             match current_vault {
                 Some(vault)
-                    if state_fingerprint_with_bins(vault, dlmm_bins, orca_ticks)
+                    if state_fingerprint_for_executable(vault, dlmm_bins, orca)
                         != quote.state_fingerprint =>
                 {
                     Some(QuoteNotFreshDiagnosis {
@@ -330,16 +381,35 @@ pub fn diagnose_no_fresh_buy_quote(
     pool: &QuotePoolInput,
     vault: Option<&QuoteVaultInput>,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
     probe_lamports: u64,
     freshness: &QuoteFreshnessConfig,
     now: Instant,
 ) -> NoFreshBuyQuoteSubreason {
-    let buy_quote = quote_exact_in_with_freshness(
+    diagnose_no_fresh_buy_quote_with_orca(
         pool,
         vault,
         dlmm_bins,
-        orca_ticks,
+        OrcaExecCtx::NONE,
+        probe_lamports,
+        freshness,
+        now,
+    )
+}
+
+pub(crate) fn diagnose_no_fresh_buy_quote_with_orca(
+    pool: &QuotePoolInput,
+    vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    orca: OrcaExecCtx<'_>,
+    probe_lamports: u64,
+    freshness: &QuoteFreshnessConfig,
+    now: Instant,
+) -> NoFreshBuyQuoteSubreason {
+    let buy_quote = quote_exact_in_with_orca(
+        pool,
+        vault,
+        dlmm_bins,
+        orca,
         NATIVE_SOL_MINT,
         &pool.token_mint,
         probe_lamports,
@@ -353,12 +423,10 @@ pub fn diagnose_no_fresh_buy_quote(
         }
         return NoFreshBuyQuoteSubreason::NoExecutableMarginal;
     };
-    if is_quote_fresh_with_bins(&buy_quote, freshness, vault, dlmm_bins, None, now) {
+    if is_quote_fresh_with_orca(&buy_quote, freshness, vault, dlmm_bins, orca, now) {
         return NoFreshBuyQuoteSubreason::NotFreshAfterQuote;
     }
-    match diagnose_quote_not_fresh_with_bins(
-        &buy_quote, freshness, vault, dlmm_bins, orca_ticks, now,
-    ) {
+    match diagnose_quote_not_fresh_with_orca(&buy_quote, freshness, vault, dlmm_bins, orca, now) {
         Some(QuoteNotFreshDiagnosis {
             kind: QuoteNotFreshKind::LastTradeMid,
             ..
@@ -424,19 +492,6 @@ pub struct QuotePoolInput {
     pub token_decimals: u8,
 }
 
-/// Whirlpool CLMM fields for Orca ExecutableMarginal (from LivePoolCache / Geyser, not vault-k).
-#[derive(Debug, Clone)]
-pub struct OrcaVaultQuoteFields {
-    pub pool: Pubkey,
-    pub token_mint_a: Pubkey,
-    pub token_mint_b: Pubkey,
-    pub sqrt_price: u128,
-    pub liquidity: u128,
-    pub tick_current_index: i32,
-    pub tick_spacing: u16,
-    pub fee_rate: u16,
-}
-
 /// Geyser vault / DLMM state for marginal quotes.
 #[derive(Debug, Clone)]
 pub struct QuoteVaultInput {
@@ -448,18 +503,15 @@ pub struct QuoteVaultInput {
     pub bin_step: Option<u16>,
     pub dlmm_sol_is_x: bool,
     pub dlmm_token_x_mint: Option<String>,
-    pub orca: Option<OrcaVaultQuoteFields>,
 }
 
 pub type DlmmBinArrays = HashMap<i64, Vec<BinData>>;
 
-pub use crate::solana::dex::orca_tick_walker::OrcaTickArrays;
-
-/// Build Orca whirlpool quote fields from SLAVE cache (sqrt_price/L/tick — not vault balances).
-pub fn orca_vault_fields_from_cached_state(
+/// Build Orca whirlpool quote input from SLAVE cache (sqrt_price/L/tick — not vault balances).
+pub fn orca_whirlpool_quote_input_from_cached_state(
     pool_address: &str,
     state: &CachedPoolState,
-) -> Option<OrcaVaultQuoteFields> {
+) -> Option<OrcaWhirlpoolQuoteInput> {
     let s = match state {
         CachedPoolState::Orca(s) => s,
         _ => return None,
@@ -468,7 +520,7 @@ pub fn orca_vault_fields_from_cached_state(
         return None;
     }
     let pool = Pubkey::from_str(pool_address).ok()?;
-    Some(OrcaVaultQuoteFields {
+    Some(OrcaWhirlpoolQuoteInput {
         pool,
         token_mint_a: s.token_mint_a,
         token_mint_b: s.token_mint_b,
@@ -478,19 +530,6 @@ pub fn orca_vault_fields_from_cached_state(
         tick_spacing: s.tick_spacing,
         fee_rate: s.fee_rate,
     })
-}
-
-fn orca_whirlpool_quote_input(fields: &OrcaVaultQuoteFields) -> OrcaWhirlpoolQuoteInput {
-    OrcaWhirlpoolQuoteInput {
-        pool: fields.pool,
-        token_mint_a: fields.token_mint_a,
-        token_mint_b: fields.token_mint_b,
-        sqrt_price: fields.sqrt_price,
-        liquidity: fields.liquidity,
-        tick_current_index: fields.tick_current_index,
-        tick_spacing: fields.tick_spacing,
-        fee_rate: fields.fee_rate,
-    }
 }
 
 /// True iff both quotes may be paired for cross-DEX round-trip screening.
@@ -798,7 +837,7 @@ fn executable_marginal_quote(
     pool: &QuotePoolInput,
     vault: &QuoteVaultInput,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
+    orca: OrcaExecCtx<'_>,
     side: QuoteSide,
     amount_in: u64,
     now: Instant,
@@ -808,7 +847,7 @@ fn executable_marginal_quote(
         return None;
     }
 
-    let fingerprint = state_fingerprint_with_bins(vault, dlmm_bins, orca_ticks);
+    let fingerprint = state_fingerprint_for_executable(vault, dlmm_bins, orca);
 
     if pool.dex == "meteora_dlmm" {
         let active_id = vault.active_id?;
@@ -870,14 +909,13 @@ fn executable_marginal_quote(
     }
 
     if pool.dex == "orca" {
-        let orca_fields = vault.orca.as_ref()?;
-        let ticks = orca_ticks?;
+        let whirlpool = orca.whirlpool?;
+        let ticks = orca.ticks?;
         let (mint_in, mint_out) = match side {
             QuoteSide::Buy => (NATIVE_SOL_MINT, pool.token_mint.as_str()),
             QuoteSide::Sell => (pool.token_mint.as_str(), NATIVE_SOL_MINT),
         };
-        let whirlpool = orca_whirlpool_quote_input(orca_fields);
-        let amount_out = orca_quote_exact_in(&whirlpool, ticks, mint_in, mint_out, amount_in)?;
+        let amount_out = orca_quote_exact_in(whirlpool, ticks, mint_in, mint_out, amount_in)?;
         let marginal_price = match side {
             QuoteSide::Buy => {
                 trade_implied_sol_per_token(amount_in, amount_out, pool.token_decimals)
@@ -1171,7 +1209,6 @@ fn cached_pool_inputs(
         bin_step: seed.bin_step,
         dlmm_sol_is_x: seed.dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT),
         dlmm_token_x_mint: seed.dlmm_token_x_mint.clone(),
-        orca: orca_vault_fields_from_cached_state(pool_address, state),
     };
     (pool_input, vault_input)
 }
@@ -1304,7 +1341,6 @@ pub fn quote_from_cached_pool(
     mint_out: &str,
     amount_in: u64,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
     slot: u64,
     updated_at: Instant,
     token_decimals: u8,
@@ -1324,7 +1360,6 @@ pub fn quote_from_cached_pool(
             &pool_input,
             Some(&vault_input),
             dlmm_bins,
-            orca_ticks,
             mint_in,
             mint_out,
             amount_in,
@@ -1372,7 +1407,6 @@ pub fn quote_exact_in(
     pool: &QuotePoolInput,
     vault: Option<&QuoteVaultInput>,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
     mint_in: &str,
     mint_out: &str,
     amount_in: u64,
@@ -1381,7 +1415,6 @@ pub fn quote_exact_in(
         pool,
         vault,
         dlmm_bins,
-        orca_ticks,
         mint_in,
         mint_out,
         amount_in,
@@ -1390,12 +1423,34 @@ pub fn quote_exact_in(
 }
 
 /// Exact-in quote with configurable freshness TTLs.
-#[allow(clippy::too_many_arguments)]
 pub fn quote_exact_in_with_freshness(
     pool: &QuotePoolInput,
     vault: Option<&QuoteVaultInput>,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
+    mint_in: &str,
+    mint_out: &str,
+    amount_in: u64,
+    freshness: &QuoteFreshnessConfig,
+) -> Option<PoolQuote> {
+    quote_exact_in_with_orca(
+        pool,
+        vault,
+        dlmm_bins,
+        OrcaExecCtx::NONE,
+        mint_in,
+        mint_out,
+        amount_in,
+        freshness,
+    )
+}
+
+/// Arb V2: exact-in with optional Orca whirlpool + tick window (A.54).
+#[allow(clippy::too_many_arguments)]
+pub fn quote_exact_in_with_orca(
+    pool: &QuotePoolInput,
+    vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    orca: OrcaExecCtx<'_>,
     mint_in: &str,
     mint_out: &str,
     amount_in: u64,
@@ -1409,7 +1464,7 @@ pub fn quote_exact_in_with_freshness(
 
     if let Some(vault) = vault {
         return executable_marginal_quote(
-            pool, vault, dlmm_bins, orca_ticks, side, amount_in, now, freshness,
+            pool, vault, dlmm_bins, orca, side, amount_in, now, freshness,
         );
     }
 
@@ -1421,7 +1476,6 @@ pub fn quote_sol_per_token_for_screening(
     pool: &QuotePoolInput,
     vault: Option<&QuoteVaultInput>,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
     side: QuoteSide,
 ) -> Option<Decimal> {
     let probe = match side {
@@ -1431,7 +1485,6 @@ pub fn quote_sol_per_token_for_screening(
                 pool,
                 vault,
                 dlmm_bins,
-                orca_ticks,
                 NATIVE_SOL_MINT,
                 &pool.token_mint,
                 DLMM_PROBE_SOL_LAMPORTS,
@@ -1444,7 +1497,6 @@ pub fn quote_sol_per_token_for_screening(
         pool,
         vault,
         dlmm_bins,
-        orca_ticks,
         if side == QuoteSide::Buy {
             NATIVE_SOL_MINT
         } else {
@@ -1478,7 +1530,6 @@ pub struct RoundTripLeg<'a> {
     pub pool: &'a QuotePoolInput,
     pub vault: Option<&'a QuoteVaultInput>,
     pub dlmm_bins: Option<&'a DlmmBinArrays>,
-    pub orca_ticks: Option<&'a OrcaTickArrays>,
 }
 
 /// Round-trip profit in lamports for a buy+sell pair (same QuoteKind required).
@@ -1510,40 +1561,24 @@ pub fn round_trip_profit_lamports_with_freshness(
         buy.pool,
         buy.vault,
         buy.dlmm_bins,
-        buy.orca_ticks,
         NATIVE_SOL_MINT,
         &buy.pool.token_mint,
         probe_sol_lamports,
         freshness,
     )?;
-    if !is_quote_fresh_with_bins(
-        &buy_quote,
-        freshness,
-        buy.vault,
-        buy.dlmm_bins,
-        buy.orca_ticks,
-        now,
-    ) {
+    if !is_quote_fresh_with_bins(&buy_quote, freshness, buy.vault, buy.dlmm_bins, now) {
         return None;
     }
     let sell_quote = quote_exact_in_with_freshness(
         sell.pool,
         sell.vault,
         sell.dlmm_bins,
-        sell.orca_ticks,
         &sell.pool.token_mint,
         NATIVE_SOL_MINT,
         buy_quote.amount_out,
         freshness,
     )?;
-    if !is_quote_fresh_with_bins(
-        &sell_quote,
-        freshness,
-        sell.vault,
-        sell.dlmm_bins,
-        sell.orca_ticks,
-        now,
-    ) {
+    if !is_quote_fresh_with_bins(&sell_quote, freshness, sell.vault, sell.dlmm_bins, now) {
         return None;
     }
     if !quotes_pairable(&buy_quote, &sell_quote) {
@@ -1558,7 +1593,6 @@ pub struct RoundTripPoolCandidate<'a> {
     pub pool: &'a QuotePoolInput,
     pub vault: Option<&'a QuoteVaultInput>,
     pub dlmm_bins: Option<&'a DlmmBinArrays>,
-    pub orca_ticks: Option<&'a OrcaTickArrays>,
     pub dex: &'a str,
 }
 
@@ -1645,7 +1679,7 @@ fn diagnose_executable_marginal_none(
     pool: &QuotePoolInput,
     vault: &QuoteVaultInput,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
+    orca: OrcaExecCtx<'_>,
     amount_in: u64,
     now: Instant,
     freshness: &QuoteFreshnessConfig,
@@ -1687,17 +1721,16 @@ fn diagnose_executable_marginal_none(
     }
 
     if pool.dex == "orca" {
-        if vault.orca.is_none() {
+        if orca.whirlpool.is_none() {
             return Some(SellQuoteNoneDetailReason::UnsupportedDex);
         }
-        if orca_ticks.is_none() {
+        if orca.ticks.is_none() {
             return Some(SellQuoteNoneDetailReason::OrcaTicksMissing);
         }
-        let orca_fields = vault.orca.as_ref()?;
-        let ticks = orca_ticks?;
-        let whirlpool = orca_whirlpool_quote_input(orca_fields);
+        let whirlpool = orca.whirlpool?;
+        let ticks = orca.ticks?;
         let out = orca_quote_exact_in(
-            &whirlpool,
+            whirlpool,
             ticks,
             &pool.token_mint,
             NATIVE_SOL_MINT,
@@ -1733,7 +1766,26 @@ pub fn diagnose_sell_quote_none(
     pool: &QuotePoolInput,
     vault: Option<&QuoteVaultInput>,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
+    token_amount_in: u64,
+    freshness: &QuoteFreshnessConfig,
+    now: Instant,
+) -> SellQuoteNoneDetailReason {
+    diagnose_sell_quote_none_with_orca(
+        pool,
+        vault,
+        dlmm_bins,
+        OrcaExecCtx::NONE,
+        token_amount_in,
+        freshness,
+        now,
+    )
+}
+
+pub(crate) fn diagnose_sell_quote_none_with_orca(
+    pool: &QuotePoolInput,
+    vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    orca: OrcaExecCtx<'_>,
     token_amount_in: u64,
     freshness: &QuoteFreshnessConfig,
     now: Instant,
@@ -1750,7 +1802,7 @@ pub fn diagnose_sell_quote_none(
             pool,
             vault,
             dlmm_bins,
-            orca_ticks,
+            orca,
             token_amount_in,
             now,
             freshness,
@@ -1815,7 +1867,6 @@ fn cap_sell_token_in(
     pool: &QuotePoolInput,
     vault: &QuoteVaultInput,
     dlmm_bins: Option<&DlmmBinArrays>,
-    _orca_ticks: Option<&OrcaTickArrays>,
     token_amount_in: u64,
 ) -> u64 {
     if pool.dex == "meteora_dlmm" {
@@ -1861,7 +1912,6 @@ pub fn quote_sell_round_trip(
     pool: &QuotePoolInput,
     vault: &QuoteVaultInput,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
     token_amount_in: u64,
     freshness: &QuoteFreshnessConfig,
 ) -> Option<PoolQuote> {
@@ -1869,26 +1919,37 @@ pub fn quote_sell_round_trip(
         pool,
         vault,
         dlmm_bins,
-        orca_ticks,
+        OrcaExecCtx::NONE,
         token_amount_in,
         freshness,
     )
+}
+
+pub fn quote_sell_round_trip_with_orca(
+    pool: &QuotePoolInput,
+    vault: &QuoteVaultInput,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    orca: OrcaExecCtx<'_>,
+    token_amount_in: u64,
+    freshness: &QuoteFreshnessConfig,
+) -> Option<PoolQuote> {
+    quote_sell_exact_in_with_cap(pool, vault, dlmm_bins, orca, token_amount_in, freshness)
 }
 
 fn quote_sell_exact_in_with_cap(
     pool: &QuotePoolInput,
     vault: &QuoteVaultInput,
     dlmm_bins: Option<&DlmmBinArrays>,
-    orca_ticks: Option<&OrcaTickArrays>,
+    orca: OrcaExecCtx<'_>,
     token_amount_in: u64,
     freshness: &QuoteFreshnessConfig,
 ) -> Option<PoolQuote> {
-    let capped = cap_sell_token_in(pool, vault, dlmm_bins, orca_ticks, token_amount_in);
-    quote_exact_in_with_freshness(
+    let capped = cap_sell_token_in(pool, vault, dlmm_bins, token_amount_in);
+    quote_exact_in_with_orca(
         pool,
         Some(vault),
         dlmm_bins,
-        orca_ticks,
+        orca,
         &pool.token_mint,
         NATIVE_SOL_MINT,
         capped,
@@ -1985,10 +2046,28 @@ pub fn classify_cross_dex_sell_failure(
     now: Instant,
     token_decimals: u8,
 ) -> Option<CrossDexSellFailure> {
+    classify_cross_dex_sell_failure_with_orca(
+        candidate,
+        OrcaExecCtx::NONE,
+        token_amount_in,
+        freshness,
+        now,
+        token_decimals,
+    )
+}
+
+pub fn classify_cross_dex_sell_failure_with_orca(
+    candidate: &RoundTripPoolCandidate<'_>,
+    orca: OrcaExecCtx<'_>,
+    token_amount_in: u64,
+    freshness: &QuoteFreshnessConfig,
+    now: Instant,
+    token_decimals: u8,
+) -> Option<CrossDexSellFailure> {
     if is_meteora_dlmm_dex(candidate.dex) && candidate.dlmm_bins.is_none() {
         return Some(CrossDexSellFailure::MissingDlmmBins);
     }
-    if is_orca_dex(candidate.dex) && candidate.orca_ticks.is_none() {
+    if is_orca_dex(candidate.dex) && orca.ticks.is_none() {
         return Some(CrossDexSellFailure::MissingOrcaTicks);
     }
     if candidate.vault.is_none() {
@@ -1998,28 +2077,28 @@ pub fn classify_cross_dex_sell_failure(
         candidate.pool,
         candidate.vault.expect("vault checked"),
         candidate.dlmm_bins,
-        candidate.orca_ticks,
+        orca,
         token_amount_in,
         freshness,
     );
     let Some(sell_quote) = sell_quote else {
-        let sub = diagnose_sell_quote_none(
+        let sub = diagnose_sell_quote_none_with_orca(
             candidate.pool,
             candidate.vault,
             candidate.dlmm_bins,
-            candidate.orca_ticks,
+            orca,
             token_amount_in,
             freshness,
             now,
         );
         return Some(CrossDexSellFailure::QuoteNone(sub));
     };
-    if let Some(diagnosis) = diagnose_quote_not_fresh_with_bins(
+    if let Some(diagnosis) = diagnose_quote_not_fresh_with_orca(
         &sell_quote,
         freshness,
         candidate.vault,
         candidate.dlmm_bins,
-        candidate.orca_ticks,
+        orca,
         now,
     ) {
         return Some(CrossDexSellFailure::NotFresh(diagnosis));
@@ -2047,6 +2126,17 @@ pub fn select_round_trip_pools(
     probe_lamports: u64,
     freshness: &QuoteFreshnessConfig,
 ) -> Result<RoundTripPoolSelection, RoundTripSelectFailure> {
+    select_round_trip_pools_with_orca(candidates, &HashMap::new(), probe_lamports, freshness)
+}
+
+/// Arb V2: round-trip selection with per-pool Orca whirlpool + tick window (A.54).
+#[allow(clippy::result_large_err)]
+pub fn select_round_trip_pools_with_orca(
+    candidates: &[RoundTripPoolCandidate<'_>],
+    orca_by_pool_address: &HashMap<&str, OrcaExecCtx<'_>>,
+    probe_lamports: u64,
+    freshness: &QuoteFreshnessConfig,
+) -> Result<RoundTripPoolSelection, RoundTripSelectFailure> {
     if candidates.len() < 2 {
         return Err(RoundTripSelectFailure::InsufficientPools(
             RoundTripInsufficient::new(RoundTripInsufficientSubreason::CandidatesLt2),
@@ -2058,6 +2148,12 @@ pub fn select_round_trip_pools(
         .first()
         .map(|c| c.pool.token_decimals)
         .unwrap_or(6);
+    let orca_for = |pool_address: &str| {
+        orca_by_pool_address
+            .get(pool_address)
+            .copied()
+            .unwrap_or(OrcaExecCtx::NONE)
+    };
 
     struct BuyCandidate<'a> {
         candidate: &'a RoundTripPoolCandidate<'a>,
@@ -2072,11 +2168,12 @@ pub fn select_round_trip_pools(
 
     let mut valid_buys: Vec<BuyCandidate<'_>> = Vec::new();
     for candidate in candidates {
-        let buy_quote = quote_exact_in_with_freshness(
+        let orca = orca_for(&candidate.pool.pool_address);
+        let buy_quote = quote_exact_in_with_orca(
             candidate.pool,
             candidate.vault,
             candidate.dlmm_bins,
-            candidate.orca_ticks,
+            orca,
             NATIVE_SOL_MINT,
             &candidate.pool.token_mint,
             probe_lamports,
@@ -2085,12 +2182,12 @@ pub fn select_round_trip_pools(
         let Some(buy_quote) = buy_quote else {
             continue;
         };
-        if !is_quote_fresh_with_bins(
+        if !is_quote_fresh_with_orca(
             &buy_quote,
             freshness,
             candidate.vault,
             candidate.dlmm_bins,
-            candidate.orca_ticks,
+            orca,
             now,
         ) {
             continue;
@@ -2109,11 +2206,11 @@ pub fn select_round_trip_pools(
     if valid_buys.is_empty() {
         let mut buy_fail_counts: HashMap<NoFreshBuyQuoteSubreason, usize> = HashMap::new();
         for candidate in candidates {
-            let sub = diagnose_no_fresh_buy_quote(
+            let sub = diagnose_no_fresh_buy_quote_with_orca(
                 candidate.pool,
                 candidate.vault,
                 candidate.dlmm_bins,
-                candidate.orca_ticks,
+                orca_for(&candidate.pool.pool_address),
                 probe_lamports,
                 freshness,
                 now,
@@ -2166,7 +2263,8 @@ pub fn select_round_trip_pools(
                     .or_default() += 1;
                 continue;
             }
-            if is_orca_dex(sell_candidate.dex) && sell_candidate.orca_ticks.is_none() {
+            let sell_orca = orca_for(&sell_candidate.pool.pool_address);
+            if is_orca_dex(sell_candidate.dex) && sell_orca.ticks.is_none() {
                 *sell_fail_counts
                     .entry(NoCrossDexSellDetailReason::SellMissingOrcaTicks)
                     .or_default() += 1;
@@ -2183,16 +2281,16 @@ pub fn select_round_trip_pools(
                 sell_candidate.pool,
                 sell_vault,
                 sell_candidate.dlmm_bins,
-                sell_candidate.orca_ticks,
+                sell_orca,
                 buy.quote.amount_out,
                 freshness,
             );
             let Some(sell_quote) = sell_quote else {
-                let sub = diagnose_sell_quote_none(
+                let sub = diagnose_sell_quote_none_with_orca(
                     sell_candidate.pool,
                     sell_candidate.vault,
                     sell_candidate.dlmm_bins,
-                    sell_candidate.orca_ticks,
+                    sell_orca,
                     buy.quote.amount_out,
                     freshness,
                     now,
@@ -2218,12 +2316,12 @@ pub fn select_round_trip_pools(
                 *sell_fail_counts.entry(top).or_default() += 1;
                 continue;
             };
-            if let Some(diagnosis) = diagnose_quote_not_fresh_with_bins(
+            if let Some(diagnosis) = diagnose_quote_not_fresh_with_orca(
                 &sell_quote,
                 freshness,
                 sell_candidate.vault,
                 sell_candidate.dlmm_bins,
-                sell_candidate.orca_ticks,
+                sell_orca,
                 now,
             ) {
                 *sell_not_fresh_detail_counts.entry(diagnosis).or_default() += 1;
@@ -2318,8 +2416,23 @@ mod tests {
             bin_step: None,
             dlmm_sol_is_x: false,
             dlmm_token_x_mint: None,
-            orca: None,
         }
+    }
+
+    fn test_orca_exec_map<'a>(
+        pool_address: &'a str,
+        whirlpool: &'a OrcaWhirlpoolQuoteInput,
+        ticks: &'a OrcaTickArrays,
+    ) -> HashMap<&'a str, OrcaExecCtx<'a>> {
+        let mut map = HashMap::new();
+        map.insert(
+            pool_address,
+            OrcaExecCtx {
+                whirlpool: Some(whirlpool),
+                ticks: Some(ticks),
+            },
+        );
+        map
     }
 
     /// Orca leg with whirlpool fields + tick window so ExecutableMarginal works in round-trip tests.
@@ -2327,7 +2440,12 @@ mod tests {
         address: &str,
         token_reserve: u64,
         sol_reserve: u64,
-    ) -> (QuotePoolInput, QuoteVaultInput, OrcaTickArrays) {
+    ) -> (
+        QuotePoolInput,
+        QuoteVaultInput,
+        OrcaWhirlpoolQuoteInput,
+        OrcaTickArrays,
+    ) {
         use crate::solana::dex::orca_tick_array::{
             build_tick_array_account_bytes, parse_tick_array, swap_direction_tick_array_starts,
         };
@@ -2377,18 +2495,8 @@ mod tests {
             bin_step: None,
             dlmm_sol_is_x: false,
             dlmm_token_x_mint: None,
-            orca: Some(OrcaVaultQuoteFields {
-                pool: pool_pk,
-                token_mint_a: mint_a,
-                token_mint_b: mint_b,
-                sqrt_price: whirlpool.sqrt_price,
-                liquidity: whirlpool.liquidity,
-                tick_current_index: tick,
-                tick_spacing: whirlpool.tick_spacing,
-                fee_rate: whirlpool.fee_rate,
-            }),
         };
-        (pool, vault, ticks)
+        (pool, vault, whirlpool, ticks)
     }
 
     #[test]
@@ -2399,7 +2507,6 @@ mod tests {
         let quote = quote_exact_in(
             &pool,
             Some(&vault),
-            None,
             None,
             NATIVE_SOL_MINT,
             &pool.token_mint,
@@ -2444,7 +2551,6 @@ mod tests {
             &pool,
             None,
             None,
-            None,
             NATIVE_SOL_MINT,
             &pool.token_mint,
             DLMM_PROBE_SOL_LAMPORTS,
@@ -2460,7 +2566,6 @@ mod tests {
         pool.trade_updated_at = Instant::now();
         let quote = quote_exact_in(
             &pool,
-            None,
             None,
             None,
             NATIVE_SOL_MINT,
@@ -2497,18 +2602,12 @@ mod tests {
             bin_step: Some(bin_step),
             dlmm_sol_is_x: false,
             dlmm_token_x_mint: Some(pool.token_mint.clone()),
-            orca: None,
         };
         let reserve_mid =
             reserve_mid_sol_per_token(token_amount, sol_amount, pool.token_decimals).unwrap();
-        let marginal_buy = quote_sol_per_token_for_screening(
-            &pool,
-            Some(&vault),
-            Some(&bins),
-            None,
-            QuoteSide::Buy,
-        )
-        .expect("marginal buy");
+        let marginal_buy =
+            quote_sol_per_token_for_screening(&pool, Some(&vault), Some(&bins), QuoteSide::Buy)
+                .expect("marginal buy");
         let ratio = if marginal_buy > reserve_mid {
             marginal_buy / reserve_mid
         } else {
@@ -2615,7 +2714,6 @@ mod tests {
             &token_mint.to_string(),
             sol_in,
             Some(&bins),
-            None,
             1,
             Instant::now(),
             6,
@@ -2629,8 +2727,9 @@ mod tests {
 
     #[test]
     fn select_round_trip_pools_picks_cross_dex_pair() {
-        let (pool_a, vault_a, orca_ticks_a) =
+        let (pool_a, vault_a, wp_a, ticks_a) =
             sample_orca_executable_leg("poolA", 1_000_000_000_000, 900_000_000);
+        let orca_map = test_orca_exec_map("poolA", &wp_a, &ticks_a);
         let pool_b = sample_pool("pump_amm", "poolB");
         let vault_b = sample_vault(1_000_000_000_000, 1_100_000_000);
         let candidates = [
@@ -2638,19 +2737,18 @@ mod tests {
                 pool: &pool_a,
                 vault: Some(&vault_a),
                 dlmm_bins: None,
-                orca_ticks: Some(&orca_ticks_a),
                 dex: "orca",
             },
             RoundTripPoolCandidate {
                 pool: &pool_b,
                 vault: Some(&vault_b),
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "pump_amm",
             },
         ];
-        let selection = select_round_trip_pools(
+        let selection = select_round_trip_pools_with_orca(
             &candidates,
+            &orca_map,
             DLMM_PROBE_SOL_LAMPORTS,
             &QuoteFreshnessConfig::default(),
         )
@@ -2674,7 +2772,6 @@ mod tests {
             pool: &pool,
             vault: Some(&vault),
             dlmm_bins: None,
-            orca_ticks: None,
             dex: "orca",
         }];
         let err = select_round_trip_pools(
@@ -2693,28 +2790,35 @@ mod tests {
 
     #[test]
     fn select_round_trip_pools_same_dex_quotable_is_single_dex_candidates() {
-        let (pool_a, vault_a, orca_ticks_a) =
+        let (pool_a, vault_a, wp_a, ticks_a) =
             sample_orca_executable_leg("poolA", 1_000_000_000_000, 900_000_000);
-        let (pool_b, vault_b, orca_ticks_b) =
+        let (pool_b, vault_b, wp_b, ticks_b) =
             sample_orca_executable_leg("poolB", 1_000_000_000_000, 1_100_000_000);
+        let mut orca_map = test_orca_exec_map("poolA", &wp_a, &ticks_a);
+        orca_map.insert(
+            "poolB",
+            OrcaExecCtx {
+                whirlpool: Some(&wp_b),
+                ticks: Some(&ticks_b),
+            },
+        );
         let candidates = [
             RoundTripPoolCandidate {
                 pool: &pool_a,
                 vault: Some(&vault_a),
                 dlmm_bins: None,
-                orca_ticks: Some(&orca_ticks_a),
                 dex: "orca",
             },
             RoundTripPoolCandidate {
                 pool: &pool_b,
                 vault: Some(&vault_b),
                 dlmm_bins: None,
-                orca_ticks: Some(&orca_ticks_b),
                 dex: "orca",
             },
         ];
-        let err = select_round_trip_pools(
+        let err = select_round_trip_pools_with_orca(
             &candidates,
+            &orca_map,
             DLMM_PROBE_SOL_LAMPORTS,
             &QuoteFreshnessConfig::default(),
         )
@@ -2729,8 +2833,9 @@ mod tests {
 
     #[test]
     fn select_round_trip_pools_cross_dex_missing_sell_is_no_cross_dex_sell() {
-        let (pool_a, vault_a, orca_ticks_a) =
+        let (pool_a, vault_a, wp_a, ticks_a) =
             sample_orca_executable_leg("poolA", 1_000_000_000_000, 900_000_000);
+        let orca_map = test_orca_exec_map("poolA", &wp_a, &ticks_a);
         let pool_b = sample_pool("pump_amm", "poolB");
         let vault_b = sample_vault(0, 1_100_000_000);
         let candidates = [
@@ -2738,19 +2843,18 @@ mod tests {
                 pool: &pool_a,
                 vault: Some(&vault_a),
                 dlmm_bins: None,
-                orca_ticks: Some(&orca_ticks_a),
                 dex: "orca",
             },
             RoundTripPoolCandidate {
                 pool: &pool_b,
                 vault: Some(&vault_b),
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "pump_amm",
             },
         ];
-        let err = select_round_trip_pools(
+        let err = select_round_trip_pools_with_orca(
             &candidates,
+            &orca_map,
             DLMM_PROBE_SOL_LAMPORTS,
             &QuoteFreshnessConfig::default(),
         )
@@ -2776,8 +2880,9 @@ mod tests {
 
     #[test]
     fn select_round_trip_pools_pair_aware_matches_brute_force_best_round_trip() {
-        let (pool_a, vault_a, orca_ticks_a) =
+        let (pool_a, vault_a, wp_a, ticks_a) =
             sample_orca_executable_leg("poolA", 1_000_000_000_000, 900_000_000);
+        let orca_map = test_orca_exec_map("poolA", &wp_a, &ticks_a);
         let pool_b = sample_pool("pump_amm", "poolB");
         let vault_b = sample_vault(1_000, 1_100_000_000);
         let candidates = [
@@ -2785,41 +2890,46 @@ mod tests {
                 pool: &pool_a,
                 vault: Some(&vault_a),
                 dlmm_bins: None,
-                orca_ticks: Some(&orca_ticks_a),
                 dex: "orca",
             },
             RoundTripPoolCandidate {
                 pool: &pool_b,
                 vault: Some(&vault_b),
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "pump_amm",
             },
         ];
         let freshness = QuoteFreshnessConfig::default();
         let probe = DLMM_PROBE_SOL_LAMPORTS;
         let now = Instant::now();
+        let orca_for = |c: &RoundTripPoolCandidate| {
+            orca_map
+                .get(c.pool.pool_address.as_str())
+                .copied()
+                .unwrap_or(OrcaExecCtx::NONE)
+        };
 
         let mut brute_best_profit = i64::MIN;
         let mut brute_best: Option<(String, String)> = None;
         for buy in &candidates {
-            let buy_quote = quote_exact_in_with_freshness(
+            let buy_orca = orca_for(buy);
+            let buy_quote = quote_exact_in_with_orca(
                 buy.pool,
                 buy.vault,
                 buy.dlmm_bins,
-                buy.orca_ticks,
+                buy_orca,
                 NATIVE_SOL_MINT,
                 &buy.pool.token_mint,
                 probe,
                 &freshness,
             );
             let Some(buy_quote) = buy_quote else { continue };
-            if !is_quote_fresh_with_bins(
+            if !is_quote_fresh_with_orca(
                 &buy_quote,
                 &freshness,
                 buy.vault,
                 buy.dlmm_bins,
-                buy.orca_ticks,
+                buy_orca,
                 now,
             ) {
                 continue;
@@ -2828,11 +2938,12 @@ mod tests {
                 if sell.dex == buy.dex {
                     continue;
                 }
-                let sell_quote = quote_exact_in_with_freshness(
+                let sell_orca = orca_for(sell);
+                let sell_quote = quote_exact_in_with_orca(
                     sell.pool,
                     sell.vault,
                     sell.dlmm_bins,
-                    sell.orca_ticks,
+                    sell_orca,
                     &sell.pool.token_mint,
                     NATIVE_SOL_MINT,
                     buy_quote.amount_out,
@@ -2841,12 +2952,12 @@ mod tests {
                 let Some(sell_quote) = sell_quote else {
                     continue;
                 };
-                if !is_quote_fresh_with_bins(
+                if !is_quote_fresh_with_orca(
                     &sell_quote,
                     &freshness,
                     sell.vault,
                     sell.dlmm_bins,
-                    sell.orca_ticks,
+                    sell_orca,
                     now,
                 ) {
                     continue;
@@ -2866,7 +2977,8 @@ mod tests {
         }
 
         let selection =
-            select_round_trip_pools(&candidates, probe, &freshness).expect("pair-aware selection");
+            select_round_trip_pools_with_orca(&candidates, &orca_map, probe, &freshness)
+                .expect("pair-aware selection");
         let expected = brute_best.expect("brute-force must find a pair");
         assert_eq!(selection.buy_pool_address, expected.0);
         assert_eq!(selection.sell_pool_address, expected.1);
@@ -2878,27 +2990,27 @@ mod tests {
 
     #[test]
     fn select_round_trip_pools_cross_dex_missing_vault_records_detail() {
-        let (pool_a, vault_a, orca_ticks_a) =
+        let (pool_a, vault_a, wp_a, ticks_a) =
             sample_orca_executable_leg("poolA", 1_000_000_000_000, 900_000_000);
+        let orca_map = test_orca_exec_map("poolA", &wp_a, &ticks_a);
         let pool_b = sample_pool("pump_amm", "poolB");
         let candidates = [
             RoundTripPoolCandidate {
                 pool: &pool_a,
                 vault: Some(&vault_a),
                 dlmm_bins: None,
-                orca_ticks: Some(&orca_ticks_a),
                 dex: "orca",
             },
             RoundTripPoolCandidate {
                 pool: &pool_b,
                 vault: None,
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "pump_amm",
             },
         ];
-        let err = select_round_trip_pools(
+        let err = select_round_trip_pools_with_orca(
             &candidates,
+            &orca_map,
             DLMM_PROBE_SOL_LAMPORTS,
             &QuoteFreshnessConfig::default(),
         )
@@ -2927,14 +3039,12 @@ mod tests {
                 pool: &pool_a,
                 vault: Some(&vault_a),
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "pump_amm",
             },
             RoundTripPoolCandidate {
                 pool: &pool_b,
                 vault: Some(&vault_b),
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "meteora_dlmm",
             },
         ];
@@ -2964,7 +3074,6 @@ mod tests {
             pool: &pool,
             vault: None,
             dlmm_bins: None,
-            orca_ticks: None,
             dex: "pump_amm",
         };
         let reason = classify_cross_dex_sell_failure(
@@ -2982,8 +3091,9 @@ mod tests {
         use rust_decimal::Decimal;
         use std::str::FromStr;
 
-        let (pool_a, vault_a, orca_ticks_a) =
+        let (pool_a, vault_a, wp_a, ticks_a) =
             sample_orca_executable_leg("poolA", 1_000_000_000_000, 900_000_000);
+        let orca_map = test_orca_exec_map("poolA", &wp_a, &ticks_a);
         let mut pool_b = sample_pool("pump_amm", "poolB");
         let trade_price = Decimal::from_str("0.000001").unwrap();
         pool_b.trade_price_buy = Some(trade_price);
@@ -2994,19 +3104,18 @@ mod tests {
                 pool: &pool_a,
                 vault: Some(&vault_a),
                 dlmm_bins: None,
-                orca_ticks: Some(&orca_ticks_a),
                 dex: "orca",
             },
             RoundTripPoolCandidate {
                 pool: &pool_b,
                 vault: None,
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "pump_amm",
             },
         ];
-        let err = select_round_trip_pools(
+        let err = select_round_trip_pools_with_orca(
             &candidates,
+            &orca_map,
             DLMM_PROBE_SOL_LAMPORTS,
             &QuoteFreshnessConfig::default(),
         )
@@ -3026,14 +3135,18 @@ mod tests {
 
     #[test]
     fn diagnose_sell_quote_none_state_stale() {
-        let (pool, mut vault, ticks) =
+        let (pool, mut vault, wp, ticks) =
             sample_orca_executable_leg("stale", 1_000_000_000_000, 1_000_000_000);
         vault.updated_at = Instant::now() - Duration::from_secs(300);
-        let reason = diagnose_sell_quote_none(
+        let orca = OrcaExecCtx {
+            whirlpool: Some(&wp),
+            ticks: Some(&ticks),
+        };
+        let reason = diagnose_sell_quote_none_with_orca(
             &pool,
             Some(&vault),
             None,
-            Some(&ticks),
+            orca,
             1_000_000,
             &QuoteFreshnessConfig::default(),
             Instant::now(),
@@ -3049,7 +3162,6 @@ mod tests {
             &pool,
             Some(&vault),
             None,
-            None,
             1_000,
             &QuoteFreshnessConfig::default(),
             Instant::now(),
@@ -3062,7 +3174,6 @@ mod tests {
         let pool = sample_pool("orca", "noTrade");
         let reason = diagnose_sell_quote_none(
             &pool,
-            None,
             None,
             None,
             1_000,
@@ -3084,14 +3195,12 @@ mod tests {
             bin_step: Some(100),
             dlmm_sol_is_x: false,
             dlmm_token_x_mint: Some(pool.token_mint.clone()),
-            orca: None,
         };
         let bins: DlmmBinArrays = HashMap::new();
         let reason = diagnose_sell_quote_none(
             &pool,
             Some(&vault),
             Some(&bins),
-            None,
             1_000_000,
             &QuoteFreshnessConfig::default(),
             Instant::now(),
@@ -3101,17 +3210,21 @@ mod tests {
 
     #[test]
     fn classify_cross_dex_sell_failure_ok_returns_none() {
-        let (pool, vault, orca_ticks) =
+        let (pool, vault, wp, ticks) =
             sample_orca_executable_leg("poolO", 1_000_000_000_000, 1_000_000_000);
         let candidate = RoundTripPoolCandidate {
             pool: &pool,
             vault: Some(&vault),
             dlmm_bins: None,
-            orca_ticks: Some(&orca_ticks),
             dex: "orca",
         };
-        let failure = classify_cross_dex_sell_failure(
+        let orca = OrcaExecCtx {
+            whirlpool: Some(&wp),
+            ticks: Some(&ticks),
+        };
+        let failure = classify_cross_dex_sell_failure_with_orca(
             &candidate,
+            orca,
             1_000_000,
             &QuoteFreshnessConfig::default(),
             Instant::now(),
@@ -3153,14 +3266,12 @@ mod tests {
             bin_step: Some(bin_step),
             dlmm_sol_is_x: false,
             dlmm_token_x_mint: Some(pool.token_mint.clone()),
-            orca: None,
         };
         let failure = classify_cross_dex_sell_failure(
             &RoundTripPoolCandidate {
                 pool: &pool,
                 vault: Some(&vault),
                 dlmm_bins: Some(&bins),
-                orca_ticks: None,
                 dex: "meteora_dlmm",
             },
             1_000_000,
@@ -3206,13 +3317,11 @@ mod tests {
             bin_step: Some(bin_step),
             dlmm_sol_is_x: false,
             dlmm_token_x_mint: Some(pool.token_mint.clone()),
-            orca: None,
         };
         let buy_quote = quote_exact_in(
             &pool,
             Some(&vault),
             Some(&bins),
-            None,
             NATIVE_SOL_MINT,
             &pool.token_mint,
             DLMM_PROBE_SOL_LAMPORTS,
@@ -3222,7 +3331,6 @@ mod tests {
             &pool,
             Some(&vault),
             Some(&bins),
-            None,
             &pool.token_mint,
             NATIVE_SOL_MINT,
             buy_quote.amount_out,
@@ -3291,7 +3399,6 @@ mod tests {
             bin_step: Some(10),
             dlmm_sol_is_x: false,
             dlmm_token_x_mint: None,
-            orca: None,
         };
         let mut near_bins: DlmmBinArrays = HashMap::new();
         near_bins.insert(
@@ -3333,8 +3440,8 @@ mod tests {
         let mut bins_b = bins_a.clone();
         bins_b.get_mut(&0).unwrap()[0].amount_y = 201;
         assert_ne!(
-            state_fingerprint_with_bins(&vault, Some(&bins_a), None),
-            state_fingerprint_with_bins(&vault, Some(&bins_b), None)
+            state_fingerprint_with_bins(&vault, Some(&bins_a)),
+            state_fingerprint_with_bins(&vault, Some(&bins_b))
         );
     }
 
@@ -3364,14 +3471,12 @@ mod tests {
             bin_step: Some(bin_step),
             dlmm_sol_is_x: false,
             dlmm_token_x_mint: Some(pool.token_mint.clone()),
-            orca: None,
         };
         let freshness = QuoteFreshnessConfig::default();
         let quote = quote_exact_in_with_freshness(
             &pool,
             Some(&vault),
             Some(&bins),
-            None,
             NATIVE_SOL_MINT,
             &pool.token_mint,
             DLMM_PROBE_SOL_LAMPORTS,
@@ -3380,7 +3485,7 @@ mod tests {
         .expect("dlmm buy quote");
         let now = Instant::now();
         assert!(
-            is_quote_fresh_with_bins(&quote, &freshness, Some(&vault), Some(&bins), None, now),
+            is_quote_fresh_with_bins(&quote, &freshness, Some(&vault), Some(&bins), now),
             "DLMM re-check must include bin snapshot"
         );
         assert!(
@@ -3416,7 +3521,6 @@ mod tests {
             bin_step: Some(bin_step),
             dlmm_sol_is_x: false,
             dlmm_token_x_mint: Some(dlmm_pool.token_mint.clone()),
-            orca: None,
         };
         let pump_vault = sample_vault(1_000_000_000_000, 1_200_000_000);
         let freshness = QuoteFreshnessConfig::default();
@@ -3424,7 +3528,6 @@ mod tests {
             &dlmm_pool,
             Some(&dlmm_vault),
             Some(&dlmm_bins),
-            None,
             NATIVE_SOL_MINT,
             &dlmm_pool.token_mint,
             DLMM_PROBE_SOL_LAMPORTS,
@@ -3437,7 +3540,6 @@ mod tests {
                 &freshness,
                 Some(&dlmm_vault),
                 Some(&dlmm_bins),
-                None,
                 Instant::now(),
             ),
             "bin-aware freshness must accept DLMM executable buy"
@@ -3451,14 +3553,12 @@ mod tests {
                 pool: &dlmm_pool,
                 vault: Some(&dlmm_vault),
                 dlmm_bins: Some(&dlmm_bins),
-                orca_ticks: None,
                 dex: "meteora_dlmm",
             },
             RoundTripPoolCandidate {
                 pool: &pump_pool,
                 vault: Some(&pump_vault),
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "pump_amm",
             },
         ];
@@ -3481,14 +3581,18 @@ mod tests {
 
     #[test]
     fn diagnose_no_fresh_buy_quote_state_stale_vault() {
-        let (pool, mut vault, ticks) =
+        let (pool, mut vault, wp, ticks) =
             sample_orca_executable_leg("staleBuy", 1_000_000_000_000, 1_000_000_000);
         vault.updated_at = Instant::now() - Duration::from_secs(300);
-        let sub = diagnose_no_fresh_buy_quote(
+        let orca = OrcaExecCtx {
+            whirlpool: Some(&wp),
+            ticks: Some(&ticks),
+        };
+        let sub = diagnose_no_fresh_buy_quote_with_orca(
             &pool,
             Some(&vault),
             None,
-            Some(&ticks),
+            orca,
             DLMM_PROBE_SOL_LAMPORTS,
             &QuoteFreshnessConfig::default(),
             Instant::now(),
@@ -3498,8 +3602,9 @@ mod tests {
 
     #[test]
     fn select_round_trip_pools_no_fresh_buy_records_subreason() {
-        let (pool_a, mut vault_a, orca_ticks_a) =
+        let (pool_a, mut vault_a, wp_a, ticks_a) =
             sample_orca_executable_leg("poolA", 1_000_000_000_000, 900_000_000);
+        let orca_map = test_orca_exec_map("poolA", &wp_a, &ticks_a);
         let pool_b = sample_pool("pump_amm", "poolB");
         vault_a.updated_at = Instant::now() - Duration::from_secs(300);
         let mut vault_b = sample_vault(1_000_000_000_000, 1_100_000_000);
@@ -3509,19 +3614,18 @@ mod tests {
                 pool: &pool_a,
                 vault: Some(&vault_a),
                 dlmm_bins: None,
-                orca_ticks: Some(&orca_ticks_a),
                 dex: "orca",
             },
             RoundTripPoolCandidate {
                 pool: &pool_b,
                 vault: Some(&vault_b),
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "pump_amm",
             },
         ];
-        let err = select_round_trip_pools(
+        let err = select_round_trip_pools_with_orca(
             &candidates,
+            &orca_map,
             DLMM_PROBE_SOL_LAMPORTS,
             &QuoteFreshnessConfig::default(),
         )
@@ -3542,8 +3646,9 @@ mod tests {
 
     #[test]
     fn select_round_trip_pools_cross_dex_sell_with_capped_token_amount() {
-        let (pool_a, vault_a, orca_ticks_a) =
+        let (pool_a, vault_a, wp_a, ticks_a) =
             sample_orca_executable_leg("poolA", 1_000_000_000_000, 900_000_000);
+        let orca_map = test_orca_exec_map("poolA", &wp_a, &ticks_a);
         let pool_b = sample_pool("pump_amm", "poolB");
         let vault_b = sample_vault(1_000, 1_100_000_000);
         let candidates = [
@@ -3551,19 +3656,18 @@ mod tests {
                 pool: &pool_a,
                 vault: Some(&vault_a),
                 dlmm_bins: None,
-                orca_ticks: Some(&orca_ticks_a),
                 dex: "orca",
             },
             RoundTripPoolCandidate {
                 pool: &pool_b,
                 vault: Some(&vault_b),
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "pump_amm",
             },
         ];
-        let selection = select_round_trip_pools(
+        let selection = select_round_trip_pools_with_orca(
             &candidates,
+            &orca_map,
             DLMM_PROBE_SOL_LAMPORTS,
             &QuoteFreshnessConfig::default(),
         )
@@ -3575,8 +3679,9 @@ mod tests {
 
     #[test]
     fn select_round_trip_pools_state_stale_sell_records_not_fresh_detail() {
-        let (pool_a, vault_a, orca_ticks_a) =
+        let (pool_a, vault_a, wp_a, ticks_a) =
             sample_orca_executable_leg("poolA", 1_000_000_000_000, 900_000_000);
+        let orca_map = test_orca_exec_map("poolA", &wp_a, &ticks_a);
         let pool_b = sample_pool("pump_amm", "poolB");
         let mut vault_b = sample_vault(1_000_000_000_000, 1_100_000_000);
         vault_b.updated_at = Instant::now() - Duration::from_secs(300);
@@ -3585,19 +3690,18 @@ mod tests {
                 pool: &pool_a,
                 vault: Some(&vault_a),
                 dlmm_bins: None,
-                orca_ticks: Some(&orca_ticks_a),
                 dex: "orca",
             },
             RoundTripPoolCandidate {
                 pool: &pool_b,
                 vault: Some(&vault_b),
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "pump_amm",
             },
         ];
-        let err = select_round_trip_pools(
+        let err = select_round_trip_pools_with_orca(
             &candidates,
+            &orca_map,
             DLMM_PROBE_SOL_LAMPORTS,
             &QuoteFreshnessConfig::default(),
         )
@@ -3701,7 +3805,6 @@ mod tests {
                 &pool,
                 Some(&vault),
                 None,
-                None,
                 NATIVE_SOL_MINT,
                 &pool.token_mint,
                 sol_in,
@@ -3777,34 +3880,30 @@ mod tests {
             has_reserve_data: true,
             token_decimals: 6,
         };
-        let vault = QuoteVaultInput {
-            reserve_base: token_reserve,
-            reserve_quote: sol_reserve,
-            update_slot: 1,
-            updated_at: Instant::now(),
-            active_id: None,
-            bin_step: None,
-            dlmm_sol_is_x: false,
-            dlmm_token_x_mint: None,
-            orca: Some(OrcaVaultQuoteFields {
-                pool: pool_pk,
-                token_mint_a: mint_a,
-                token_mint_b: mint_b,
-                sqrt_price: sqrt,
-                liquidity: liq,
-                tick_current_index: tick,
-                tick_spacing: 64,
-                fee_rate: 300,
-            }),
+        let vault = sample_vault(token_reserve, sol_reserve);
+        let whirlpool = OrcaWhirlpoolQuoteInput {
+            pool: pool_pk,
+            token_mint_a: mint_a,
+            token_mint_b: mint_b,
+            sqrt_price: sqrt,
+            liquidity: liq,
+            tick_current_index: tick,
+            tick_spacing: 64,
+            fee_rate: 300,
         };
-        let quote = quote_exact_in(
+        let orca = OrcaExecCtx {
+            whirlpool: Some(&whirlpool),
+            ticks: Some(&ticks),
+        };
+        let quote = quote_exact_in_with_orca(
             &pool,
             Some(&vault),
             None,
-            Some(&ticks),
+            orca,
             NATIVE_SOL_MINT,
             &pool.token_mint,
             sol_in,
+            &QuoteFreshnessConfig::default(),
         )
         .expect("orca executable marginal");
         assert_eq!(quote.amount_out, walk_out);
@@ -3846,13 +3945,21 @@ mod tests {
             ticks_a.insert(start, parse_tick_array(&bytes_a).expect("a"));
             ticks_b.insert(start, parse_tick_array(&bytes_b).expect("b"));
         }
+        let ctx_a = OrcaExecCtx {
+            whirlpool: Some(&whirlpool),
+            ticks: Some(&ticks_a),
+        };
+        let ctx_b = OrcaExecCtx {
+            whirlpool: Some(&whirlpool),
+            ticks: Some(&ticks_b),
+        };
         assert_eq!(
-            state_fingerprint_with_bins(&vault, None, Some(&ticks_a)),
-            state_fingerprint_with_bins(&vault, None, Some(&ticks_a)),
+            state_fingerprint_for_executable(&vault, None, ctx_a),
+            state_fingerprint_for_executable(&vault, None, ctx_a),
         );
         assert_ne!(
-            state_fingerprint_with_bins(&vault, None, Some(&ticks_a)),
-            state_fingerprint_with_bins(&vault, None, Some(&ticks_b)),
+            state_fingerprint_for_executable(&vault, None, ctx_a),
+            state_fingerprint_for_executable(&vault, None, ctx_b),
         );
     }
 
@@ -3867,14 +3974,12 @@ mod tests {
                 pool: &pool_a,
                 vault: Some(&vault_a),
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "orca",
             },
             RoundTripPoolCandidate {
                 pool: &pool_b,
                 vault: Some(&vault_b),
                 dlmm_bins: None,
-                orca_ticks: None,
                 dex: "pump_amm",
             },
         ];

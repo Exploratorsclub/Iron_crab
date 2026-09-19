@@ -36,16 +36,20 @@ use ironcrab::arb_quality::{
 use ironcrab::arbitrage::in_flight::{
     in_flight_key_from_intent_metadata, InFlightArbKey, InFlightArbRegistry,
 };
+use ironcrab::arbitrage::pool_quote::{
+    classify_cross_dex_sell_failure_with_orca, is_quote_fresh_with_orca, quote_exact_in_with_orca,
+    select_round_trip_pools_with_orca, OrcaExecCtx,
+};
 use ironcrab::arbitrage::{
     arb_track_removal_reason, classify_cross_dex_sell_failure, dlmm_marginal_price_plausible,
     dlmm_quote_window_bins_fingerprint, dlmm_sol_output_from_bins, dlmm_token_output_from_bins,
     freshness_age_bucket, is_arb_route_executable, is_expected_token_output_plausible,
-    is_quote_fresh_with_bins, orca_vault_fields_from_cached_state,
+    is_quote_fresh_with_bins, orca_whirlpool_quote_input_from_cached_state,
     populate_arb_slave_from_live_pool_cache, price_based_token_output_raw, quote_exact_in,
-    quote_exact_in_with_freshness, quote_sell_round_trip, quotes_pairable,
-    round_trip_profit_lamports, select_arb_track_pools, select_round_trip_pools, state_fingerprint,
-    sync_arb_slave_from_pool_cache_update, MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch,
-    NoCrossDexSellDetailReason, OrcaTickArrays, PoolQuote, QuoteFreshnessConfig, QuoteKind,
+    quote_exact_in_with_freshness, quotes_pairable, round_trip_profit_lamports,
+    select_arb_track_pools, state_fingerprint, sync_arb_slave_from_pool_cache_update,
+    MultiHopArbitrage, MultiHopConfig, MultiHopIntentBatch, NoCrossDexSellDetailReason,
+    OrcaTickArrays, OrcaWhirlpoolQuoteInput, PoolQuote, QuoteFreshnessConfig, QuoteKind,
     QuotePoolInput, QuoteVaultInput, RoundTripInsufficient, RoundTripInsufficientSubreason,
     RoundTripLeg, RoundTripPoolCandidate, RoundTripSelectFailure, SellQuoteNoneDetailReason,
     TrackCandidateCounts, TrackMintInput, TrackPoolInput, TrackPoolReadiness, TrackSelectionConfig,
@@ -646,7 +650,6 @@ fn vault_fingerprint_quote_input(vault: &VaultBalanceCache) -> QuoteVaultInput {
         bin_step: vault.bin_step,
         dlmm_sol_is_x: vault.dlmm_sol_is_x,
         dlmm_token_x_mint: vault.dlmm_token_x_mint.clone(),
-        orca: None,
     }
 }
 
@@ -2436,9 +2439,33 @@ type OwnedRoundTripCandidate = (
     QuotePoolInput,
     Option<QuoteVaultInput>,
     Option<HashMap<i64, Vec<BinData>>>,
+    Option<OrcaWhirlpoolQuoteInput>,
     Option<OrcaTickArrays>,
     String,
 );
+
+fn orca_exec_ctx_for_pool<'a>(
+    orca_pool: Option<&'a OrcaWhirlpoolQuoteInput>,
+    orca_ticks: Option<&'a OrcaTickArrays>,
+) -> OrcaExecCtx<'a> {
+    OrcaExecCtx {
+        whirlpool: orca_pool,
+        ticks: orca_ticks,
+    }
+}
+
+fn orca_exec_map_from_owned_candidates(
+    owned: &[OwnedRoundTripCandidate],
+) -> HashMap<&str, OrcaExecCtx<'_>> {
+    let mut map = HashMap::new();
+    for (pool, _, _, orca_pool, orca_ticks, _) in owned {
+        let ctx = orca_exec_ctx_for_pool(orca_pool.as_ref(), orca_ticks.as_ref());
+        if ctx.whirlpool.is_some() || ctx.ticks.is_some() {
+            map.insert(pool.pool_address.as_str(), ctx);
+        }
+    }
+    map
+}
 
 /// Tracks same token across multiple DEXes
 #[derive(Debug, Clone)]
@@ -3154,7 +3181,6 @@ fn log_v2_cross_dex_pair_failures_debug_sample(
             buy.pool,
             buy.vault,
             buy.dlmm_bins,
-            buy.orca_ticks,
             NATIVE_SOL_MINT,
             &buy.pool.token_mint,
             probe,
@@ -3162,14 +3188,7 @@ fn log_v2_cross_dex_pair_failures_debug_sample(
         ) else {
             continue;
         };
-        if !is_quote_fresh_with_bins(
-            &buy_quote,
-            freshness,
-            buy.vault,
-            buy.dlmm_bins,
-            buy.orca_ticks,
-            now,
-        ) {
+        if !is_quote_fresh_with_bins(&buy_quote, freshness, buy.vault, buy.dlmm_bins, now) {
             continue;
         }
         for sell in candidates {
@@ -3393,11 +3412,11 @@ fn pool_state_to_quote_input(
 }
 
 fn vault_cache_to_quote_input(
-    pool_address: &str,
+    _pool_address: &str,
     vault: &VaultBalanceCache,
-    live_pool_cache: &LivePoolCache,
+    _live_pool_cache: &LivePoolCache,
 ) -> QuoteVaultInput {
-    let mut q = QuoteVaultInput {
+    QuoteVaultInput {
         reserve_base: vault.reserve_base,
         reserve_quote: vault.reserve_quote,
         update_slot: vault.update_slot,
@@ -3406,14 +3425,7 @@ fn vault_cache_to_quote_input(
         bin_step: vault.bin_step,
         dlmm_sol_is_x: vault.dlmm_sol_is_x,
         dlmm_token_x_mint: vault.dlmm_token_x_mint.clone(),
-        orca: None,
-    };
-    if let Ok(pool_pk) = Pubkey::from_str(pool_address) {
-        if let Some(state) = live_pool_cache.get(&pool_pk) {
-            q.orca = orca_vault_fields_from_cached_state(pool_address, &state);
-        }
     }
-    q
 }
 
 impl TokenArbTracker {
@@ -3608,13 +3620,11 @@ impl TokenArbTracker {
                         pool: &buy_input,
                         vault: buy_vault_q.as_ref(),
                         dlmm_bins: buy_bins.as_ref(),
-                        orca_ticks: None,
                     },
                     &RoundTripLeg {
                         pool: &sell_input,
                         vault: sell_vault_q.as_ref(),
                         dlmm_bins: sell_bins.as_ref(),
-                        orca_ticks: None,
                     },
                     probe_sol,
                     config.est_tx_cost_lamports,
@@ -3627,7 +3637,6 @@ impl TokenArbTracker {
                     &buy_input,
                     buy_vault_q.as_ref(),
                     buy_bins.as_ref(),
-                    None,
                     NATIVE_SOL_MINT,
                     &self.base_mint,
                     probe_sol,
@@ -3638,7 +3647,6 @@ impl TokenArbTracker {
                     &sell_input,
                     sell_vault_q.as_ref(),
                     sell_bins.as_ref(),
-                    None,
                     &self.base_mint,
                     NATIVE_SOL_MINT,
                     buy_quote.amount_out,
@@ -3704,10 +3712,17 @@ impl TokenArbTracker {
                 let orca_ticks = orca_tick_arrays
                     .get(&pool.pool_address)
                     .and_then(|arrays| flatten_orca_tick_array_cache(&pool.pool_address, arrays));
+                let orca_pool = Pubkey::from_str(&pool.pool_address)
+                    .ok()
+                    .and_then(|pk| live_pool_cache.get(&pk))
+                    .and_then(|state| {
+                        orca_whirlpool_quote_input_from_cached_state(&pool.pool_address, &state)
+                    });
                 (
                     pool_state_to_quote_input(pool, &self.base_mint, token_decimals),
                     vault,
                     bins,
+                    orca_pool,
                     orca_ticks,
                     pool.dex.clone(),
                 )
@@ -3738,14 +3753,14 @@ impl TokenArbTracker {
             token_decimals,
             pinned_pools,
         );
+        let orca_map = orca_exec_map_from_owned_candidates(&owned_candidates);
         let candidates: Vec<RoundTripPoolCandidate<'_>> = owned_candidates
             .iter()
             .map(
-                |(pool, vault, bins, orca_ticks, dex)| RoundTripPoolCandidate {
+                |(pool, vault, bins, _orca_pool, _orca_ticks, dex)| RoundTripPoolCandidate {
                     pool,
                     vault: vault.as_ref(),
                     dlmm_bins: bins.as_ref(),
-                    orca_ticks: orca_ticks.as_ref(),
                     dex,
                 },
             )
@@ -3753,15 +3768,22 @@ impl TokenArbTracker {
 
         let distinct_dexes: HashSet<&str> = candidates.iter().map(|c| c.dex).collect();
         let now = Instant::now();
+        let orca_for = |pool_address: &str| {
+            orca_map
+                .get(pool_address)
+                .copied()
+                .unwrap_or(OrcaExecCtx::NONE)
+        };
 
         let mut pairing_token_amount: Option<u64> = None;
         let mut pairing_buy_quote: Option<PoolQuote> = None;
         for candidate in &candidates {
-            let buy_quote = quote_exact_in_with_freshness(
+            let orca = orca_for(&candidate.pool.pool_address);
+            let buy_quote = quote_exact_in_with_orca(
                 candidate.pool,
                 candidate.vault,
                 candidate.dlmm_bins,
-                candidate.orca_ticks,
+                orca,
                 NATIVE_SOL_MINT,
                 &candidate.pool.token_mint,
                 probe,
@@ -3770,12 +3792,12 @@ impl TokenArbTracker {
             let Some(buy_quote) = buy_quote else {
                 continue;
             };
-            if !is_quote_fresh_with_bins(
+            if !is_quote_fresh_with_orca(
                 &buy_quote,
                 freshness,
                 candidate.vault,
                 candidate.dlmm_bins,
-                candidate.orca_ticks,
+                orca,
                 now,
             ) {
                 continue;
@@ -3793,11 +3815,12 @@ impl TokenArbTracker {
         let mut pool_rows =
             Vec::with_capacity(candidates.len().min(ELIGIBILITY_SNAPSHOT_POOL_ROWS));
         for candidate in candidates.iter().take(ELIGIBILITY_SNAPSHOT_POOL_ROWS) {
-            let buy_quote = quote_exact_in_with_freshness(
+            let orca = orca_for(&candidate.pool.pool_address);
+            let buy_quote = quote_exact_in_with_orca(
                 candidate.pool,
                 candidate.vault,
                 candidate.dlmm_bins,
-                candidate.orca_ticks,
+                orca,
                 NATIVE_SOL_MINT,
                 &candidate.pool.token_mint,
                 probe,
@@ -3805,12 +3828,12 @@ impl TokenArbTracker {
             );
             let buy_quote_ok = buy_quote.is_some();
             let buy_quote_fresh = buy_quote.as_ref().is_some_and(|q| {
-                is_quote_fresh_with_bins(
+                is_quote_fresh_with_orca(
                     q,
                     freshness,
                     candidate.vault,
                     candidate.dlmm_bins,
-                    candidate.orca_ticks,
+                    orca,
                     now,
                 )
             });
@@ -3826,11 +3849,11 @@ impl TokenArbTracker {
                 (token_amount_in, pairing_buy_quote.as_ref())
             {
                 let sell_quote = if let Some(vault) = candidate.vault {
-                    quote_sell_round_trip(
+                    ironcrab::arbitrage::pool_quote::quote_sell_round_trip_with_orca(
                         candidate.pool,
                         vault,
                         candidate.dlmm_bins,
-                        candidate.orca_ticks,
+                        orca,
                         token_amount,
                         freshness,
                     )
@@ -3839,20 +3862,21 @@ impl TokenArbTracker {
                 };
                 let ok = sell_quote.is_some();
                 let fresh = sell_quote.as_ref().is_some_and(|q| {
-                    is_quote_fresh_with_bins(
+                    is_quote_fresh_with_orca(
                         q,
                         freshness,
                         candidate.vault,
                         candidate.dlmm_bins,
-                        candidate.orca_ticks,
+                        orca,
                         now,
                     ) && quotes_pairable(buy_q, q)
                 });
                 let failure = if ok {
                     None
                 } else {
-                    classify_cross_dex_sell_failure(
+                    classify_cross_dex_sell_failure_with_orca(
                         candidate,
+                        orca,
                         token_amount,
                         freshness,
                         now,
@@ -3949,59 +3973,60 @@ impl TokenArbTracker {
             token_decimals,
             check_ctx.pinned_pools,
         );
+        let orca_map = orca_exec_map_from_owned_candidates(&owned_candidates);
         let candidates: Vec<RoundTripPoolCandidate<'_>> = owned_candidates
             .iter()
             .map(
-                |(pool, vault, bins, orca_ticks, dex)| RoundTripPoolCandidate {
+                |(pool, vault, bins, _orca_pool, _orca_ticks, dex)| RoundTripPoolCandidate {
                     pool,
                     vault: vault.as_ref(),
                     dlmm_bins: bins.as_ref(),
-                    orca_ticks: orca_ticks.as_ref(),
                     dex,
                 },
             )
             .collect();
 
-        let selection = match select_round_trip_pools(&candidates, probe, &freshness) {
-            Ok(selection) => selection,
-            Err(RoundTripSelectFailure::InsufficientPools(insufficient)) => {
-                record_v2_insufficient_subreason(&insufficient);
-                log_v2_round_trip_insufficient_pools(
-                    &self.base_mint,
-                    &insufficient,
-                    &candidates,
-                    probe,
-                    &freshness,
-                    token_decimals,
-                );
-                arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::InsufficientPools);
-                if let Some(collector) = v2_forensics {
-                    let breakdown = self.build_v2_eligibility_breakdown(
-                        known_pools,
-                        vault_balances,
-                        bin_arrays,
-                        check_ctx.orca_tick_arrays,
-                        check_ctx.live_pool_cache,
-                        token_decimals,
+        let selection =
+            match select_round_trip_pools_with_orca(&candidates, &orca_map, probe, &freshness) {
+                Ok(selection) => selection,
+                Err(RoundTripSelectFailure::InsufficientPools(insufficient)) => {
+                    record_v2_insufficient_subreason(&insufficient);
+                    log_v2_round_trip_insufficient_pools(
+                        &self.base_mint,
+                        &insufficient,
+                        &candidates,
                         probe,
                         &freshness,
-                        insufficient.subreason,
-                        check_ctx.pinned_pools,
+                        token_decimals,
                     );
-                    collector.record(breakdown);
+                    arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::InsufficientPools);
+                    if let Some(collector) = v2_forensics {
+                        let breakdown = self.build_v2_eligibility_breakdown(
+                            known_pools,
+                            vault_balances,
+                            bin_arrays,
+                            check_ctx.orca_tick_arrays,
+                            check_ctx.live_pool_cache,
+                            token_decimals,
+                            probe,
+                            &freshness,
+                            insufficient.subreason,
+                            check_ctx.pinned_pools,
+                        );
+                        collector.record(breakdown);
+                    }
+                    return None;
                 }
-                return None;
-            }
-            Err(RoundTripSelectFailure::QuoteStale) => {
-                arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::QuoteStale);
-                return None;
-            }
-            Err(RoundTripSelectFailure::IncompatibleQuoteKind) => {
-                arb_two_hop_v2_incompatible_kind_inc();
-                arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::IncompatibleQuoteKind);
-                return None;
-            }
-        };
+                Err(RoundTripSelectFailure::QuoteStale) => {
+                    arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::QuoteStale);
+                    return None;
+                }
+                Err(RoundTripSelectFailure::IncompatibleQuoteKind) => {
+                    arb_two_hop_v2_incompatible_kind_inc();
+                    arb_two_hop_v2_rejected_inc(ArbTwoHopV2RejectReason::IncompatibleQuoteKind);
+                    return None;
+                }
+            };
 
         arb_two_hop_v2_round_trip_formable_inc();
         record_arb_round_trip_by_dex_pair(&selection.buy_dex, &selection.sell_dex, "formable");
@@ -7390,9 +7415,8 @@ impl ArbContext {
             token_decimals,
             None,
         );
-        let buy = owned_candidates
-            .iter()
-            .find_map(|(pool, vault, bins, orca_ticks, dex)| {
+        let buy = owned_candidates.iter().find_map(
+            |(pool, vault, bins, _orca_pool, _orca_ticks, dex)| {
                 if pool.pool_address != pending.buy_pool {
                     return None;
                 }
@@ -7400,13 +7424,12 @@ impl ArbContext {
                     pool,
                     vault: vault.as_ref(),
                     dlmm_bins: bins.as_ref(),
-                    orca_ticks: orca_ticks.as_ref(),
                     dex,
                 })
-            });
-        let sell = owned_candidates
-            .iter()
-            .find_map(|(pool, vault, bins, orca_ticks, dex)| {
+            },
+        );
+        let sell = owned_candidates.iter().find_map(
+            |(pool, vault, bins, _orca_pool, _orca_ticks, dex)| {
                 if pool.pool_address != pending.sell_pool {
                     return None;
                 }
@@ -7414,19 +7437,28 @@ impl ArbContext {
                     pool,
                     vault: vault.as_ref(),
                     dlmm_bins: bins.as_ref(),
-                    orca_ticks: orca_ticks.as_ref(),
                     dex,
                 })
-            });
+            },
+        );
         let (buy, sell) = match (buy, sell) {
             (Some(b), Some(s)) if b.dex != s.dex => (b, s),
             _ => return false,
         };
-        let buy_quote = match quote_exact_in_with_freshness(
+        let orca_map = orca_exec_map_from_owned_candidates(&owned_candidates);
+        let buy_orca = orca_map
+            .get(buy.pool.pool_address.as_str())
+            .copied()
+            .unwrap_or(OrcaExecCtx::NONE);
+        let sell_orca = orca_map
+            .get(sell.pool.pool_address.as_str())
+            .copied()
+            .unwrap_or(OrcaExecCtx::NONE);
+        let buy_quote = match quote_exact_in_with_orca(
             buy.pool,
             buy.vault,
             buy.dlmm_bins,
-            buy.orca_ticks,
+            buy_orca,
             NATIVE_SOL_MINT,
             &buy.pool.token_mint,
             probe,
@@ -7435,18 +7467,19 @@ impl ArbContext {
             Some(q) => q,
             None => return false,
         };
-        if !is_quote_fresh_with_bins(
+        if !is_quote_fresh_with_orca(
             &buy_quote,
             &freshness,
             buy.vault,
             buy.dlmm_bins,
-            buy.orca_ticks,
+            buy_orca,
             now,
         ) {
             return false;
         }
-        classify_cross_dex_sell_failure(
+        classify_cross_dex_sell_failure_with_orca(
             &sell,
+            sell_orca,
             buy_quote.amount_out,
             &freshness,
             now,
@@ -7624,17 +7657,17 @@ impl ArbContext {
         let candidates: Vec<RoundTripPoolCandidate<'_>> = owned_candidates
             .iter()
             .map(
-                |(pool, vault, bins, orca_ticks, dex)| RoundTripPoolCandidate {
+                |(pool, vault, bins, _orca_pool, _orca_ticks, dex)| RoundTripPoolCandidate {
                     pool,
                     vault: vault.as_ref(),
                     dlmm_bins: bins.as_ref(),
-                    orca_ticks: orca_ticks.as_ref(),
                     dex,
                 },
             )
             .collect();
+        let orca_map = orca_exec_map_from_owned_candidates(&owned_candidates);
         let Err(RoundTripSelectFailure::InsufficientPools(insufficient)) =
-            select_round_trip_pools(&candidates, probe, &freshness)
+            select_round_trip_pools_with_orca(&candidates, &orca_map, probe, &freshness)
         else {
             return;
         };
@@ -7663,11 +7696,15 @@ impl ArbContext {
             if buy_checks >= V2_SELL_STALE_RECOVERY_MAX_BUY_CANDIDATES {
                 break;
             }
-            let Some(buy_quote) = quote_exact_in_with_freshness(
+            let buy_orca = orca_map
+                .get(buy.pool.pool_address.as_str())
+                .copied()
+                .unwrap_or(OrcaExecCtx::NONE);
+            let Some(buy_quote) = quote_exact_in_with_orca(
                 buy.pool,
                 buy.vault,
                 buy.dlmm_bins,
-                buy.orca_ticks,
+                buy_orca,
                 NATIVE_SOL_MINT,
                 &buy.pool.token_mint,
                 probe,
@@ -7675,12 +7712,12 @@ impl ArbContext {
             ) else {
                 continue;
             };
-            if !is_quote_fresh_with_bins(
+            if !is_quote_fresh_with_orca(
                 &buy_quote,
                 &freshness,
                 buy.vault,
                 buy.dlmm_bins,
-                buy.orca_ticks,
+                buy_orca,
                 now,
             ) {
                 continue;
@@ -7690,8 +7727,13 @@ impl ArbContext {
                 if sell.dex == buy.dex {
                     continue;
                 }
-                if classify_cross_dex_sell_failure(
+                let sell_orca = orca_map
+                    .get(sell.pool.pool_address.as_str())
+                    .copied()
+                    .unwrap_or(OrcaExecCtx::NONE);
+                if classify_cross_dex_sell_failure_with_orca(
                     sell,
+                    sell_orca,
                     buy_quote.amount_out,
                     &freshness,
                     now,
@@ -12730,7 +12772,8 @@ mod two_hop_price_tests {
     #[test]
     fn orca_v2_fixture_enables_executable_buy_quote() {
         use ironcrab::arbitrage::pool_quote::{
-            quote_exact_in, DLMM_PROBE_SOL_LAMPORTS, NATIVE_SOL_MINT,
+            quote_exact_in_with_orca, DLMM_PROBE_SOL_LAMPORTS, NATIVE_SOL_MINT, OrcaExecCtx,
+            QuoteFreshnessConfig,
         };
 
         let cache = create_shared_cache();
@@ -12765,21 +12808,29 @@ mod two_hop_price_tests {
         let pool = tracker.pools.get(&pool_a.to_string()).unwrap();
         let vault = vault_balances.get(&pool_a.to_string()).unwrap();
         let vault_q = vault_cache_to_quote_input(&pool_a.to_string(), vault, &cache);
-        assert!(vault_q.orca.is_some(), "orca whirlpool fields required");
+        let pool_state = cache.get(&pool_a).expect("orca pool in cache");
+        let whirlpool =
+            orca_whirlpool_quote_input_from_cached_state(&pool_a.to_string(), &pool_state);
+        assert!(whirlpool.is_some(), "orca whirlpool fields required");
         let ticks = orca_tick_arrays
             .get(&pool_a.to_string())
             .and_then(|m| flatten_orca_tick_array_cache(&pool_a.to_string(), m));
         assert!(ticks.is_some(), "orca tick flatten required");
         let pool_q = pool_state_to_quote_input(pool, &mint_str, 6);
+        let orca = OrcaExecCtx {
+            whirlpool: whirlpool.as_ref(),
+            ticks: ticks.as_ref(),
+        };
         assert!(
-            quote_exact_in(
+            quote_exact_in_with_orca(
                 &pool_q,
                 Some(&vault_q),
                 None,
-                ticks.as_ref(),
+                orca,
                 NATIVE_SOL_MINT,
                 &mint_str,
                 DLMM_PROBE_SOL_LAMPORTS,
+                &QuoteFreshnessConfig::default(),
             )
             .is_some(),
             "orca executable buy quote"
@@ -12864,18 +12915,18 @@ mod two_hop_price_tests {
         );
         let candidates: Vec<ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate<'_>> = owned
             .iter()
-            .map(|(pool, vault, bins, orca_ticks, dex)| {
+            .map(|(pool, vault, bins, _orca_pool, _orca_ticks, dex)| {
                 ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate {
                     pool,
                     vault: vault.as_ref(),
                     dlmm_bins: bins.as_ref(),
-                    orca_ticks: orca_ticks.as_ref(),
                     dex,
                 }
             })
             .collect();
-        let selection = ironcrab::arbitrage::pool_quote::select_round_trip_pools(
+        let selection = ironcrab::arbitrage::pool_quote::select_round_trip_pools_with_orca(
             &candidates,
+            &orca_exec_map_from_owned_candidates(&owned),
             config.arb_probe_lamports,
             &freshness,
         )
@@ -12968,18 +13019,18 @@ mod two_hop_price_tests {
         );
         let candidates: Vec<ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate<'_>> = owned
             .iter()
-            .map(|(pool, vault, bins, orca_ticks, dex)| {
+            .map(|(pool, vault, bins, _orca_pool, _orca_ticks, dex)| {
                 ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate {
                     pool,
                     vault: vault.as_ref(),
                     dlmm_bins: bins.as_ref(),
-                    orca_ticks: orca_ticks.as_ref(),
                     dex,
                 }
             })
             .collect();
-        ironcrab::arbitrage::pool_quote::select_round_trip_pools(
+        ironcrab::arbitrage::pool_quote::select_round_trip_pools_with_orca(
             &candidates,
+            &orca_exec_map_from_owned_candidates(&owned),
             config.arb_probe_lamports,
             &freshness,
         )
@@ -13092,19 +13143,20 @@ mod two_hop_price_tests {
         );
         let candidates: Vec<ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate<'_>> = owned
             .iter()
-            .map(|(pool, vault, bins, orca_ticks, dex)| {
+            .map(|(pool, vault, bins, _orca_pool, _orca_ticks, dex)| {
                 ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate {
                     pool,
                     vault: vault.as_ref(),
                     dlmm_bins: bins.as_ref(),
-                    orca_ticks: orca_ticks.as_ref(),
                     dex,
                 }
             })
             .collect();
+        let orca_map = orca_exec_map_from_owned_candidates(&owned);
         assert!(
-            ironcrab::arbitrage::pool_quote::select_round_trip_pools(
+            ironcrab::arbitrage::pool_quote::select_round_trip_pools_with_orca(
                 &candidates,
+                &orca_map,
                 config.arb_probe_lamports,
                 &freshness,
             )
@@ -13251,19 +13303,20 @@ mod two_hop_price_tests {
         );
         let candidates: Vec<ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate<'_>> = owned
             .iter()
-            .map(|(pool, vault, bins, orca_ticks, dex)| {
+            .map(|(pool, vault, bins, _orca_pool, _orca_ticks, dex)| {
                 ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate {
                     pool,
                     vault: vault.as_ref(),
                     dlmm_bins: bins.as_ref(),
-                    orca_ticks: orca_ticks.as_ref(),
                     dex,
                 }
             })
             .collect();
+        let orca_map = orca_exec_map_from_owned_candidates(&owned);
         assert!(
-            ironcrab::arbitrage::pool_quote::select_round_trip_pools(
+            ironcrab::arbitrage::pool_quote::select_round_trip_pools_with_orca(
                 &candidates,
+                &orca_map,
                 config.arb_probe_lamports,
                 &freshness,
             )
@@ -13381,19 +13434,20 @@ mod two_hop_price_tests {
         );
         let candidates: Vec<ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate<'_>> = owned
             .iter()
-            .map(|(pool, vault, bins, orca_ticks, dex)| {
+            .map(|(pool, vault, bins, _orca_pool, _orca_ticks, dex)| {
                 ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate {
                     pool,
                     vault: vault.as_ref(),
                     dlmm_bins: bins.as_ref(),
-                    orca_ticks: orca_ticks.as_ref(),
                     dex,
                 }
             })
             .collect();
+        let orca_map = orca_exec_map_from_owned_candidates(&owned);
         assert!(
-            ironcrab::arbitrage::pool_quote::select_round_trip_pools(
+            ironcrab::arbitrage::pool_quote::select_round_trip_pools_with_orca(
                 &candidates,
+                &orca_map,
                 config.arb_probe_lamports,
                 &freshness,
             )
@@ -13523,18 +13577,18 @@ mod two_hop_price_tests {
         );
         let candidates: Vec<ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate<'_>> = owned
             .iter()
-            .map(|(pool, vault, bins, orca_ticks, dex)| {
+            .map(|(pool, vault, bins, _orca_pool, _orca_ticks, dex)| {
                 ironcrab::arbitrage::pool_quote::RoundTripPoolCandidate {
                     pool,
                     vault: vault.as_ref(),
                     dlmm_bins: bins.as_ref(),
-                    orca_ticks: orca_ticks.as_ref(),
                     dex,
                 }
             })
             .collect();
-        let selection = ironcrab::arbitrage::pool_quote::select_round_trip_pools(
+        let selection = ironcrab::arbitrage::pool_quote::select_round_trip_pools_with_orca(
             &candidates,
+            &orca_exec_map_from_owned_candidates(&owned),
             config.arb_probe_lamports,
             &freshness,
         )
@@ -15654,7 +15708,6 @@ mod two_hop_price_tests {
                         token_decimals: 6,
                     },
                     vault: Some(QuoteVaultInput {
-                        orca: None,
                         reserve_base: 1_000_000_000_000,
                         reserve_quote: 1_000_000_000,
                         update_slot: 1,
@@ -15684,7 +15737,6 @@ mod two_hop_price_tests {
                         token_decimals: 6,
                     },
                     vault: Some(QuoteVaultInput {
-                        orca: None,
                         reserve_base: 1_000_000_000_000,
                         reserve_quote: 2_000_000_000,
                         update_slot: 1,
@@ -16236,7 +16288,6 @@ mod two_hop_price_tests {
                                 token_decimals: 6,
                             },
                             vault: Some(QuoteVaultInput {
-                                orca: None,
                                 reserve_base: 1_000_000_000,
                                 reserve_quote: 2_000_000_000,
                                 update_slot: 1,
@@ -16266,7 +16317,6 @@ mod two_hop_price_tests {
                                 token_decimals: 6,
                             },
                             vault: Some(QuoteVaultInput {
-                                orca: None,
                                 reserve_base: 1_000_000_000,
                                 reserve_quote: 2_000_000_000,
                                 update_slot: 1,

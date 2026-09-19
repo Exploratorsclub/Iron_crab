@@ -337,7 +337,6 @@ fn bundle_from_round_trip(
             pool: &p.quote_pool,
             vault: p.vault.as_ref(),
             dlmm_bins: p.dlmm_bins.as_ref(),
-            orca_ticks: p.orca_ticks.as_ref(),
             dex: &p.dex,
         })
         .collect();
@@ -588,7 +587,6 @@ fn can_fresh_sell_quote(
         &pool.quote_pool,
         pool.vault.as_ref(),
         pool.dlmm_bins.as_ref(),
-        pool.orca_ticks.as_ref(),
         &pool.quote_pool.token_mint,
         NATIVE_SOL_MINT,
         probe_tokens,
@@ -601,7 +599,6 @@ fn can_fresh_sell_quote(
         &config.freshness,
         pool.vault.as_ref(),
         pool.dlmm_bins.as_ref(),
-        pool.orca_ticks.as_ref(),
         now,
     )
 }
@@ -622,7 +619,6 @@ fn can_fresh_buy_quote(pool: &TrackPoolInput, config: &TrackSelectionConfig, now
         &pool.quote_pool,
         pool.vault.as_ref(),
         pool.dlmm_bins.as_ref(),
-        pool.orca_ticks.as_ref(),
         NATIVE_SOL_MINT,
         &pool.quote_pool.token_mint,
         config.probe_lamports,
@@ -635,7 +631,6 @@ fn can_fresh_buy_quote(pool: &TrackPoolInput, config: &TrackSelectionConfig, now
         &config.freshness,
         pool.vault.as_ref(),
         pool.dlmm_bins.as_ref(),
-        pool.orca_ticks.as_ref(),
         now,
     )
 }
@@ -695,7 +690,6 @@ mod tests {
 
     fn vault(reserve_base: u64, reserve_quote: u64) -> QuoteVaultInput {
         QuoteVaultInput {
-            orca: None,
             reserve_base,
             reserve_quote,
             update_slot: 1,
