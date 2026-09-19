@@ -304,6 +304,10 @@ mod tests {
             false
         }
 
+        fn ingest_membership_orca_tick_array_contains(&self, _pubkey: &Pubkey) -> bool {
+            false
+        }
+
         fn ingest_exec_hot_vault_contains(&self, pubkey: &Pubkey) -> bool {
             self.exec_hot_vaults.contains(pubkey)
         }

@@ -15,6 +15,7 @@ use super::dlmm_bin_publish::filter_dlmm_bins_for_publish;
 use crate::ipc::{MarketEvent, MarketEventKind, NATIVE_SOL_MINT};
 use crate::market_data::ingest::AccountUpdateClass;
 use crate::market_data::md_state::MdStateSender;
+use crate::market_data::orca_tick_publish::publish_orca_tick_array_from_geyser;
 use crate::market_data::publish::{
     account_path_enqueue_core_market_event, account_path_enqueue_jetstream, AccountPublishSender,
 };
@@ -33,6 +34,7 @@ use crate::metrics::{
 use crate::nats::wallet_snapshot_subject;
 use crate::solana::dex::meteora_bin_array_layout::BinArray;
 use crate::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM;
+use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
 use crate::solana::dex_parser::{parse_account_update, ParsedDexEvent};
 use crate::solana::geyser_listener::GeyserAccountUpdate;
 use solana_sdk::pubkey::Pubkey;
@@ -473,6 +475,28 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
                     update_class: sidefx_class,
                 },
             );
+            return;
+        }
+    }
+
+    let orca_program =
+        Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).expect("Invalid ORCA_WHIRLPOOL_PROGRAM constant");
+    if account_update.owner == orca_program {
+        if let Some(tick_info) =
+            host.account_membership_orca_tick_array_info(&account_update.pubkey)
+        {
+            publish_orca_tick_array_from_geyser(
+                host,
+                run_id,
+                account_geyser_recv_at,
+                &account_update,
+                tick_info,
+                publish_tx,
+                Some(md_sidefx),
+                sidefx_class,
+                update_class,
+            )
+            .await;
             return;
         }
     }

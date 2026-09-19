@@ -47,6 +47,7 @@ pub fn market_event_is_momentum_nats_relevant(kind: &MarketEventKind) -> bool {
 
         MarketEventKind::LatestBlockhash { .. }
         | MarketEventKind::BinArrayUpdate { .. }
+        | MarketEventKind::OrcaTickArrayUpdate { .. }
         | MarketEventKind::SlotUpdate { .. }
         | MarketEventKind::WalletBalanceSnapshot { .. }
         | MarketEventKind::PriceUpdate { .. }

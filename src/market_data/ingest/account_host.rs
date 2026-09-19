@@ -21,6 +21,13 @@ pub struct AccountBinArrayView {
     pub bin_step: u16,
 }
 
+/// Orca Whirlpool tick-array membership view for account ingest.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountOrcaTickArrayView {
+    pub pool_address: Pubkey,
+    pub start_tick_index: i32,
+}
+
 /// Context surface for Geyser account ingest (`handle_geyser_account_update`).
 pub trait AccountIngestHost: IngestHost + Send + Sync {
     fn account_build_version(&self) -> &'static str;
@@ -39,6 +46,10 @@ pub trait AccountIngestHost: IngestHost + Send + Sync {
 
     fn account_membership_mint_contains(&self, pubkey: &Pubkey) -> bool;
     fn account_membership_bin_array_info(&self, pubkey: &Pubkey) -> Option<AccountBinArrayView>;
+    fn account_membership_orca_tick_array_info(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<AccountOrcaTickArrayView>;
 }
 
 impl<T: AccountIngestHost + ?Sized> AccountIngestHost for std::sync::Arc<T> {
@@ -96,5 +107,12 @@ impl<T: AccountIngestHost + ?Sized> AccountIngestHost for std::sync::Arc<T> {
 
     fn account_membership_bin_array_info(&self, pubkey: &Pubkey) -> Option<AccountBinArrayView> {
         (**self).account_membership_bin_array_info(pubkey)
+    }
+
+    fn account_membership_orca_tick_array_info(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<AccountOrcaTickArrayView> {
+        (**self).account_membership_orca_tick_array_info(pubkey)
     }
 }

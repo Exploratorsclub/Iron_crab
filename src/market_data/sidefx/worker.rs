@@ -1002,6 +1002,10 @@ mod tests {
         fn maybe_refresh_arb_dlmm_bin_window(&self, _pool: Pubkey, _new_active_id: i32) -> bool {
             false
         }
+
+        fn maybe_refresh_arb_orca_tick_window(&self, _pool: Pubkey, _new_tick: i32) -> bool {
+            false
+        }
         fn maybe_retry_deferred_hot_pool_reserves_on_cache_fill(&self, _pool: &Pubkey) {}
         fn maybe_spawn_raydium_serum_cold_backfill(
             &self,
@@ -1195,6 +1199,10 @@ mod tests {
             false
         }
         fn maybe_refresh_arb_dlmm_bin_window(&self, _pool: Pubkey, _new_active_id: i32) -> bool {
+            false
+        }
+
+        fn maybe_refresh_arb_orca_tick_window(&self, _pool: Pubkey, _new_tick: i32) -> bool {
             false
         }
         fn maybe_retry_deferred_hot_pool_reserves_on_cache_fill(&self, _pool: &Pubkey) {}

@@ -487,6 +487,24 @@ pub static MARKET_DATA_DLMM_BIN_PARSE_FAIL_TOTAL: Lazy<AtomicU64> = Lazy::new(||
 /// DLMM bin-array emit skipped: parsed but no non-zero liquidity bins.
 pub static MARKET_DATA_DLMM_BIN_EMIT_SKIPPED_EMPTY_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Rows in `tracked_orca_tick_arrays` (all pins).
+pub static MARKET_DATA_TRACKED_ORCA_TICK_ARRAYS_GAUGE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Successful Orca tick-array window registrations.
+pub static MARKET_DATA_ORCA_TICK_ARRAY_ADMIT_OK_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Orca tick-array registration rejected (explicit-set cap / admission).
+pub static MARKET_DATA_ORCA_TICK_ARRAY_ADMIT_REJECT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Orca tick-array handler: membership snapshot hit.
+pub static MARKET_DATA_ORCA_TICK_ARRAY_MEMBERSHIP_HIT_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Orca tick-array parse failures at publish gate.
+pub static MARKET_DATA_ORCA_TICK_ARRAY_PARSE_FAIL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// OrcaTickArrayUpdate published to Core NATS.
+pub static MARKET_DATA_ORCA_TICK_ARRAY_PUBLISH_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// DLMM bin-array publish: zero-liquidity active bin retained for quote walker (C1g).
 pub static MARKET_DATA_DLMM_BIN_EMIT_ACTIVE_ZERO_TOUCH_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1015,6 +1033,36 @@ pub fn set_market_data_tracked_bin_arrays_momentum_gauge(n: usize) {
 #[inline]
 pub fn inc_market_data_dlmm_bin_register_ok_total() {
     MARKET_DATA_DLMM_BIN_REGISTER_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn set_market_data_tracked_orca_tick_arrays_gauge(n: usize) {
+    MARKET_DATA_TRACKED_ORCA_TICK_ARRAYS_GAUGE.store(n as u64, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_orca_tick_array_admit_ok_total() {
+    MARKET_DATA_ORCA_TICK_ARRAY_ADMIT_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_orca_tick_array_admit_reject_total() {
+    MARKET_DATA_ORCA_TICK_ARRAY_ADMIT_REJECT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_orca_tick_array_membership_hit_total() {
+    MARKET_DATA_ORCA_TICK_ARRAY_MEMBERSHIP_HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_orca_tick_array_parse_fail_total() {
+    MARKET_DATA_ORCA_TICK_ARRAY_PARSE_FAIL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_orca_tick_array_publish_total() {
+    MARKET_DATA_ORCA_TICK_ARRAY_PUBLISH_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -9700,6 +9748,30 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_dlmm_bin_register_ok_total",
         MARKET_DATA_DLMM_BIN_REGISTER_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_tracked_orca_tick_arrays",
+        MARKET_DATA_TRACKED_ORCA_TICK_ARRAYS_GAUGE.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_orca_tick_array_admit_ok_total",
+        MARKET_DATA_ORCA_TICK_ARRAY_ADMIT_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_orca_tick_array_admit_reject_total",
+        MARKET_DATA_ORCA_TICK_ARRAY_ADMIT_REJECT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_orca_tick_array_membership_hit_total",
+        MARKET_DATA_ORCA_TICK_ARRAY_MEMBERSHIP_HIT_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_orca_tick_array_parse_fail_total",
+        MARKET_DATA_ORCA_TICK_ARRAY_PARSE_FAIL_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_orca_tick_array_publish_total",
+        MARKET_DATA_ORCA_TICK_ARRAY_PUBLISH_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_dlmm_bin_owner_update_total",

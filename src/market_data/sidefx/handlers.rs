@@ -1569,6 +1569,13 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                 None
             }
         });
+        let prev_orca_tick = prev_state.as_ref().and_then(|s| {
+            if let CachedPoolState::Orca(o) = s {
+                Some(o.tick_current_index)
+            } else {
+                None
+            }
+        });
         // P2#7: Enrich PumpFun token_mint from pool_mint_map when parse returns default
         if let CachedPoolState::PumpFun(ref mut s) = &mut cached_state {
             if s.token_mint == Pubkey::default() {
@@ -1630,6 +1637,19 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                 };
                 if should_refresh {
                     let _ = host.maybe_refresh_arb_dlmm_bin_window(*pool_pubkey, s.active_id);
+                }
+            }
+        }
+
+        if let CachedPoolState::Orca(ref s) = merged_state {
+            if host.is_hot_pool(pool_pubkey) && s.tick_spacing > 0 {
+                let should_refresh = match prev_orca_tick {
+                    None => true,
+                    Some(prev_tick) => prev_tick != s.tick_current_index,
+                };
+                if should_refresh {
+                    let _ =
+                        host.maybe_refresh_arb_orca_tick_window(*pool_pubkey, s.tick_current_index);
                 }
             }
         }

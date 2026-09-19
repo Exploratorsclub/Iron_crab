@@ -19,6 +19,8 @@ pub trait IngestHost: Send + Sync {
 
     fn ingest_membership_bin_array_contains(&self, pubkey: &Pubkey) -> bool;
 
+    fn ingest_membership_orca_tick_array_contains(&self, pubkey: &Pubkey) -> bool;
+
     /// EXEC_HOT vault membership: vault pubkeys for hot-pool legs only (not full explicit set).
     fn ingest_exec_hot_vault_contains(&self, pubkey: &Pubkey) -> bool;
 

@@ -59,8 +59,8 @@ use ironcrab::execution::pool_cache_sync::bootstrap_pool_cache_from_jetstream;
 use ironcrab::ipc::ExecutionResult;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
-    IntentTier, MarketEvent, MarketEventKind, PoolCacheUpdate, PoolCacheUpdateType, TradeIntent,
-    TradeResources, TradeSide, TradingRegime,
+    IntentTier, MarketEvent, MarketEventKind, OrcaTickSnapshot, PoolCacheUpdate,
+    PoolCacheUpdateType, TradeIntent, TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
     arb_heartbeat_finished, arb_pool_cache_apply_batches_inc, arb_pool_cache_sync_fetch_empty_inc,
@@ -648,6 +648,18 @@ fn bin_array_material_fingerprint(bins: &[BinData]) -> u64 {
         bin.offset.hash(&mut hasher);
         bin.amount_x.hash(&mut hasher);
         bin.amount_y.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn orca_tick_array_material_fingerprint(ticks: &[OrcaTickSnapshot]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for t in ticks {
+        t.tick_index.hash(&mut hasher);
+        t.initialized.hash(&mut hasher);
+        t.liquidity_net.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -4500,6 +4512,11 @@ fn market_event_pool_key(event: &MarketEvent) -> Option<String> {
             bin_array_index,
             ..
         } => Some(format!("{pool_address}:bin:{bin_array_index}")),
+        MarketEventKind::OrcaTickArrayUpdate {
+            pool_address,
+            start_tick_index,
+            ..
+        } => Some(format!("{pool_address}:orca_tick:{start_tick_index}")),
         MarketEventKind::Trade { pool_address, .. } => Some(format!("{pool_address}:trade")),
         _ => None,
     }
@@ -4513,7 +4530,8 @@ fn classify_market_event_priority(
     match &event.kind {
         MarketEventKind::Trade { .. } => ArbEventPriority::High,
         MarketEventKind::PoolStateUpdate { pool_address, .. }
-        | MarketEventKind::BinArrayUpdate { pool_address, .. } => {
+        | MarketEventKind::BinArrayUpdate { pool_address, .. }
+        | MarketEventKind::OrcaTickArrayUpdate { pool_address, .. } => {
             if known_pools.contains(pool_address) || pinned_pools.contains(pool_address) {
                 ArbEventPriority::High
             } else {
@@ -4568,6 +4586,7 @@ fn is_arb_handled_market_event(kind: &MarketEventKind) -> bool {
             | MarketEventKind::DexPoolAccounts { .. }
             | MarketEventKind::PoolStateUpdate { .. }
             | MarketEventKind::BinArrayUpdate { .. }
+            | MarketEventKind::OrcaTickArrayUpdate { .. }
             | MarketEventKind::TokenMintInfo { .. }
     )
 }
@@ -5376,6 +5395,9 @@ struct ArbContext {
     /// Updated from BinArrayUpdate events (via market-data Geyser subscription)
     bin_arrays: RwLock<HashMap<String, HashMap<i64, BinArrayCache>>>,
 
+    /// Orca Whirlpool tick arrays: pool_address → start_tick_index → ticks (Job 2 cache only).
+    orca_tick_arrays: RwLock<HashMap<String, HashMap<i32, OrcaTickArrayCache>>>,
+
     // =========================================================================
     // SLAVE Cache: Known Pools from market-data MASTER (Single Source of Truth)
     // =========================================================================
@@ -5454,6 +5476,12 @@ struct VaultBalanceCache {
 #[derive(Debug, Clone)]
 struct BinArrayCache {
     bins: Vec<BinData>,
+    update_slot: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OrcaTickArrayCache {
+    ticks: Vec<OrcaTickSnapshot>,
     update_slot: u64,
 }
 
@@ -6691,6 +6719,46 @@ impl ArbContext {
             }
             v.updated_at = now;
         }
+    }
+
+    fn handle_orca_tick_array_update(
+        &self,
+        pool_address: &str,
+        start_tick_index: i32,
+        ticks: Vec<OrcaTickSnapshot>,
+        geyser_slot: u64,
+    ) {
+        let new_fp = orca_tick_array_material_fingerprint(&ticks);
+        {
+            let cache = self.orca_tick_arrays.read();
+            if let Some(pool_cache) = cache.get(pool_address) {
+                if let Some(existing) = pool_cache.get(&start_tick_index) {
+                    if orca_tick_array_material_fingerprint(&existing.ticks) == new_fp {
+                        return;
+                    }
+                    if geyser_slot < existing.update_slot {
+                        return;
+                    }
+                }
+            }
+        }
+        let mut cache = self.orca_tick_arrays.write();
+        let pool_cache = cache.entry(pool_address.to_string()).or_default();
+        if let Some(existing) = pool_cache.get(&start_tick_index) {
+            if geyser_slot < existing.update_slot {
+                return;
+            }
+            if orca_tick_array_material_fingerprint(&existing.ticks) == new_fp {
+                return;
+            }
+        }
+        pool_cache.insert(
+            start_tick_index,
+            OrcaTickArrayCache {
+                ticks,
+                update_slot: geyser_slot,
+            },
+        );
     }
 
     /// Get cached vault balances for a pool (returns None if not cached)
@@ -9208,6 +9276,7 @@ async fn main() -> Result<()> {
         chain_head_slot: AtomicU64::new(0),
         vault_balances: RwLock::new(HashMap::new()),
         bin_arrays: RwLock::new(HashMap::new()),
+        orca_tick_arrays: RwLock::new(HashMap::new()),
         live_pool_cache,
         known_pools: RwLock::new(HashSet::new()),
         multi_hop,
@@ -9851,6 +9920,21 @@ async fn handle_market_event(ctx: &ArbContext, event: &MarketEvent) -> Option<Tr
             None
         }
 
+        MarketEventKind::OrcaTickArrayUpdate {
+            pool_address,
+            start_tick_index,
+            ticks,
+            update_slot,
+        } => {
+            ctx.handle_orca_tick_array_update(
+                pool_address,
+                *start_tick_index,
+                ticks.clone(),
+                *update_slot,
+            );
+            None
+        }
+
         // Handle TokenMintInfo - cache token program (SPL Token vs Token-2022) for ATA creation
         MarketEventKind::TokenMintInfo {
             mint,
@@ -10435,6 +10519,7 @@ mod event_pipeline_tests {
             chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
+            orca_tick_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
             known_pools: RwLock::new(HashSet::new()),
             multi_hop: Arc::new(MultiHopArbitrage::new(
@@ -10555,6 +10640,7 @@ mod event_pipeline_tests {
             chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
+            orca_tick_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
             known_pools: RwLock::new(HashSet::new()),
             multi_hop: Arc::new(MultiHopArbitrage::new(
@@ -10670,6 +10756,7 @@ mod event_pipeline_tests {
             chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
+            orca_tick_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
             known_pools: RwLock::new(HashSet::new()),
             multi_hop: Arc::new(MultiHopArbitrage::new(
@@ -10852,6 +10939,7 @@ mod event_pipeline_tests {
             chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
+            orca_tick_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
             known_pools: RwLock::new(known_pools),
             multi_hop: Arc::new(MultiHopArbitrage::new(
@@ -11064,6 +11152,7 @@ mod event_pipeline_tests {
             chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(vault_balances),
             bin_arrays: RwLock::new(HashMap::new()),
+            orca_tick_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
             known_pools: RwLock::new(HashSet::new()),
             multi_hop: Arc::new(MultiHopArbitrage::new(
@@ -11180,6 +11269,7 @@ mod event_pipeline_tests {
             chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
+            orca_tick_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
             known_pools: RwLock::new(HashSet::new()),
             multi_hop: Arc::new(MultiHopArbitrage::new(
@@ -11297,6 +11387,7 @@ mod event_pipeline_tests {
             chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
+            orca_tick_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
             known_pools: RwLock::new(HashSet::new()),
             multi_hop: Arc::new(MultiHopArbitrage::new(
@@ -11385,6 +11476,7 @@ mod event_pipeline_tests {
             chain_head_slot: AtomicU64::new(0),
             vault_balances: RwLock::new(HashMap::new()),
             bin_arrays: RwLock::new(HashMap::new()),
+            orca_tick_arrays: RwLock::new(HashMap::new()),
             live_pool_cache,
             known_pools: RwLock::new(HashSet::new()),
             multi_hop: Arc::new(MultiHopArbitrage::new(
@@ -11479,6 +11571,7 @@ fn test_arb_context(live_pool_cache: SharedLivePoolCache) -> ArbContext {
         chain_head_slot: AtomicU64::new(0),
         vault_balances: RwLock::new(HashMap::new()),
         bin_arrays: RwLock::new(HashMap::new()),
+        orca_tick_arrays: RwLock::new(HashMap::new()),
         live_pool_cache: live_pool_cache.clone(),
         known_pools: RwLock::new(HashSet::new()),
         multi_hop: Arc::new(MultiHopArbitrage::new(
@@ -12208,6 +12301,32 @@ mod two_hop_price_tests {
                 > before_hit,
             "pinned Meteora sell must see dlmm_bins from live cache at screen time"
         );
+    }
+
+    #[test]
+    fn orca_tick_array_update_ignores_older_slot() {
+        let ctx = test_arb_context(create_shared_cache());
+        let pool = "orca_pool_tick_cache";
+        let ticks = vec![OrcaTickSnapshot {
+            tick_index: 0,
+            initialized: true,
+            liquidity_net: "100".into(),
+        }];
+        ctx.handle_orca_tick_array_update(pool, -128, ticks, 20);
+        ctx.handle_orca_tick_array_update(
+            pool,
+            -128,
+            vec![OrcaTickSnapshot {
+                tick_index: 0,
+                initialized: true,
+                liquidity_net: "999".into(),
+            }],
+            5,
+        );
+        let cache = ctx.orca_tick_arrays.read();
+        let row = cache.get(pool).unwrap().get(&-128).unwrap();
+        assert_eq!(row.update_slot, 20);
+        assert_eq!(row.ticks[0].liquidity_net, "100");
     }
 
     #[test]

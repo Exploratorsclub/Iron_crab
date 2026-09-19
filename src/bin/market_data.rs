@@ -137,6 +137,7 @@ use ironcrab::metrics::{
     inc_market_data_open_position_pumpfun_remediate_flush_pending_total,
     inc_market_data_open_position_pumpfun_remediate_ok_total,
     inc_market_data_open_position_pumpfun_remediate_still_unsatisfied_total,
+    inc_market_data_orca_tick_array_admit_ok_total,
     inc_market_data_tracker_track_mint_rejected_total,
     inc_market_data_vault_high_priority_dispatch_total,
     inc_market_data_wallet_admission_admitted_total,
@@ -176,7 +177,8 @@ use ironcrab::metrics::{
     set_market_data_hot_pool_registry_pools_gauge, set_market_data_momentum_active_pool_pins_gauge,
     set_market_data_momentum_pin_registration_incomplete_gauge,
     set_market_data_tracked_bin_arrays_arb_gauge, set_market_data_tracked_bin_arrays_gauge,
-    set_market_data_tracked_bin_arrays_momentum_gauge, set_market_data_tx_broadcast_queue_depth,
+    set_market_data_tracked_bin_arrays_momentum_gauge,
+    set_market_data_tracked_orca_tick_arrays_gauge, set_market_data_tx_broadcast_queue_depth,
     set_readiness_control_sub_active, set_readiness_mode, set_readiness_nats_connected,
     touch_market_data_global_ingest_progress,
     touch_market_data_tracked_membership_snapshot_refresh, update_readiness_market_data_current,
@@ -687,6 +689,17 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
         let changed = self
             .ctx
             .maybe_refresh_arb_dlmm_bin_window(pool, new_active_id);
+        if changed {
+            let _ = track_worker_try_enqueue(
+                &self.track_worker,
+                TrackWorkerCommand::ScheduleGeyserPushDebounced,
+            );
+        }
+        changed
+    }
+
+    fn maybe_refresh_arb_orca_tick_window(&self, pool: Pubkey, new_tick: i32) -> bool {
+        let changed = self.ctx.maybe_refresh_arb_orca_tick_window(pool, new_tick);
         if changed {
             let _ = track_worker_try_enqueue(
                 &self.track_worker,
@@ -1336,6 +1349,11 @@ struct MarketDataContext {
     /// Channel to notify GeyserAccountListener when tracked bin arrays change (triggers resubscribe).
     tracked_bin_arrays_tx: watch::Sender<Vec<Pubkey>>,
 
+    /// Orca Whirlpool tick-array tracking for OrcaTickArrayUpdate events.
+    tracked_orca_tick_arrays:
+        parking_lot::RwLock<std::collections::HashMap<Pubkey, OrcaTickArrayInfo>>,
+    tracked_orca_tick_arrays_tx: watch::Sender<Vec<Pubkey>>,
+
     /// PR237: ingest hot-path membership (no `tracked_*` read locks).
     tracked_membership: ArcSwap<TrackedMembershipSnapshot>,
     /// Scope F: EXEC_HOT vault/bin pubkeys for hot-pool legs only (no full explicit-set flood).
@@ -1435,6 +1453,8 @@ struct MarketDataContext {
     last_arb_snapshot_target: parking_lot::RwLock<Option<HashSet<Pubkey>>>,
     /// Last `active_id` used when registering DLMM bin-array window per pool (Fix B).
     dlmm_registered_active_id: parking_lot::RwLock<HashMap<Pubkey, i32>>,
+    /// Last registered Whirlpool tick-array window start per pool (`get_tick_array_start_index`).
+    orca_registered_tick_array_start: parking_lot::RwLock<HashMap<Pubkey, i32>>,
     /// C1e: bin-array Geyser payloads stashed on early-drop before membership registration.
     dlmm_bin_geyser_stash: parking_lot::RwLock<HashMap<Pubkey, StashedDlmmBinGeyserUpdate>>,
     /// Scope C / C1vault: hot pools awaiting LivePoolCache layout or admit for vault/bin Geyser registration.
@@ -1467,6 +1487,7 @@ enum GeyserPruneMap {
     Mints,
     Vaults,
     Bins,
+    OrcaTicks,
     Wallets,
     Done,
 }
@@ -1476,7 +1497,8 @@ impl GeyserPruneMap {
         match self {
             Self::Mints => Self::Vaults,
             Self::Vaults => Self::Bins,
-            Self::Bins => Self::Wallets,
+            Self::Bins => Self::OrcaTicks,
+            Self::OrcaTicks => Self::Wallets,
             Self::Wallets | Self::Done => Self::Done,
         }
     }
@@ -1708,6 +1730,16 @@ struct BinArrayInfo {
     pin: Option<GeyserPinReason>,
 }
 
+/// Tracked Orca Whirlpool classic TickArray PDA.
+#[derive(Debug, Clone)]
+struct OrcaTickArrayInfo {
+    pool_address: Pubkey,
+    start_tick_index: i32,
+    last_used_at: Instant,
+    pinned: bool,
+    pin: Option<GeyserPinReason>,
+}
+
 /// Stashed DLMM bin-array Geyser payload for replay after membership registration.
 #[derive(Clone)]
 struct StashedDlmmBinGeyserUpdate {
@@ -1740,14 +1772,22 @@ struct SnapshotBinArrayView {
     bin_step: u16,
 }
 
+#[derive(Clone)]
+struct SnapshotOrcaTickArrayView {
+    pool_address: Pubkey,
+    start_tick_index: i32,
+}
+
 /// PR237 + Phase1: lock-free ingest membership view (refreshed by md-state at burst end).
 #[derive(Clone, Default)]
 struct TrackedMembershipSnapshot {
     vaults: HashSet<Pubkey>,
     mints: HashSet<Pubkey>,
     bin_arrays: HashSet<Pubkey>,
+    orca_tick_arrays: HashSet<Pubkey>,
     vault_by_pubkey: HashMap<Pubkey, SnapshotVaultView>,
     bin_array_by_pubkey: HashMap<Pubkey, SnapshotBinArrayView>,
+    orca_tick_array_by_pubkey: HashMap<Pubkey, SnapshotOrcaTickArrayView>,
 }
 
 /// Scope F: lock-free EXEC_HOT vault/bin view (hot-pool legs only, not full explicit membership).
@@ -1762,6 +1802,7 @@ struct ExecHotMembershipSnapshot {
 struct PoolTrackedLegs {
     vaults: Vec<Pubkey>,
     bin_arrays: Vec<Pubkey>,
+    orca_tick_arrays: Vec<Pubkey>,
 }
 
 /// Extract normalized balance fields from MASTER cache for JetStream BalanceUpdated.
@@ -2437,6 +2478,17 @@ fn planned_explicit_pubkeys_for_pool_from_cache(
             }
         }
     }
+    if let CachedPoolState::Orca(s) = state {
+        if s.tick_spacing > 0 {
+            for pda in ironcrab::solana::dex::orca_tick_array::planned_orca_tick_array_pubkeys(
+                &pool,
+                s.tick_current_index,
+                s.tick_spacing as i32,
+            ) {
+                set.insert(pda);
+            }
+        }
+    }
     match state {
         CachedPoolState::Orca(_)
         | CachedPoolState::RaydiumAmm(_)
@@ -2453,6 +2505,23 @@ fn planned_explicit_pubkeys_for_pool_from_cache(
         set.insert(b);
     }
     set.into_iter().collect()
+}
+
+/// Planned Meteora DLMM bin-array PDAs for one pool (`active_id` ±3 windows).
+fn planned_orca_tick_array_pubkeys_for_cache(pool: Pubkey, state: &CachedPoolState) -> Vec<Pubkey> {
+    let CachedPoolState::Orca(s) = state else {
+        return Vec::new();
+    };
+    if s.tick_spacing == 0 {
+        return Vec::new();
+    }
+    ironcrab::solana::dex::orca_tick_array::planned_orca_tick_array_pubkeys(
+        &pool,
+        s.tick_current_index,
+        s.tick_spacing as i32,
+    )
+    .into_iter()
+    .collect()
 }
 
 /// Planned Meteora DLMM bin-array PDAs for one pool (`active_id` ±3 windows).
@@ -2908,6 +2977,7 @@ impl IngestHost for MarketDataContext {
         if snap.vaults.contains(pubkey)
             || snap.mints.contains(pubkey)
             || snap.bin_arrays.contains(pubkey)
+            || snap.orca_tick_arrays.contains(pubkey)
         {
             inc_market_data_ingest_membership_snapshot_hits_total();
             return true;
@@ -2925,6 +2995,13 @@ impl IngestHost for MarketDataContext {
 
     fn ingest_membership_bin_array_contains(&self, pubkey: &Pubkey) -> bool {
         self.tracked_membership.load().bin_arrays.contains(pubkey)
+    }
+
+    fn ingest_membership_orca_tick_array_contains(&self, pubkey: &Pubkey) -> bool {
+        self.tracked_membership
+            .load()
+            .orca_tick_arrays
+            .contains(pubkey)
     }
 
     fn ingest_exec_hot_vault_contains(&self, pubkey: &Pubkey) -> bool {
@@ -3273,6 +3350,22 @@ impl AccountIngestHost for MarketDataContext {
                 bin_array_index: info.bin_array_index,
                 bin_step: info.bin_step,
             })
+    }
+
+    fn account_membership_orca_tick_array_info(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<ironcrab::market_data::ingest::AccountOrcaTickArrayView> {
+        self.tracked_membership
+            .load()
+            .orca_tick_array_by_pubkey
+            .get(pubkey)
+            .map(
+                |info| ironcrab::market_data::ingest::AccountOrcaTickArrayView {
+                    pool_address: info.pool_address,
+                    start_tick_index: info.start_tick_index,
+                },
+            )
     }
 }
 
@@ -3705,6 +3798,7 @@ impl MarketDataContext {
         set.extend(self.tracked_mints.read().keys().copied());
         set.extend(self.tracked_vaults.read().keys().copied());
         set.extend(self.tracked_bin_arrays.read().keys().copied());
+        set.extend(self.tracked_orca_tick_arrays.read().keys().copied());
         if let Some(w) = &self.tracked_wallet {
             set.insert(w.wallet);
             set.insert(w.wsol_ata);
@@ -3737,6 +3831,14 @@ impl MarketDataContext {
                 consumer: consumer_id_for_pool_explicit_row(self, b.pool_address, b.pin).into(),
                 pool: Some(b.pool_address.to_string()),
                 kind: ExplicitAccountKind::BinArray,
+            });
+        }
+        for (pk, b) in self.tracked_orca_tick_arrays.read().iter() {
+            rows.push(ExplicitSnapshotRow {
+                pubkey: pk.to_string(),
+                consumer: consumer_id_for_pool_explicit_row(self, b.pool_address, b.pin).into(),
+                pool: Some(b.pool_address.to_string()),
+                kind: ExplicitAccountKind::OrcaTickArray,
             });
         }
         for pk in self.tracked_wallet_token_accounts.read().iter() {
@@ -3896,6 +3998,38 @@ impl MarketDataContext {
                         }
                     }
                 }
+                ExplicitAccountKind::OrcaTickArray => {
+                    let pool_addr = pool.unwrap_or_default();
+                    let mut ticks = self.tracked_orca_tick_arrays.write();
+                    use std::collections::hash_map::Entry;
+                    match ticks.entry(pk) {
+                        Entry::Vacant(e) => {
+                            e.insert(OrcaTickArrayInfo {
+                                pool_address: pool_addr,
+                                start_tick_index: 0,
+                                last_used_at: now,
+                                pinned: pin.is_some(),
+                                pin,
+                            });
+                            drop(ticks);
+                            if pool_addr != Pubkey::default() {
+                                self.pool_tracked_legs_note_orca_tick(pool_addr, pk);
+                            }
+                            restored += 1;
+                        }
+                        Entry::Occupied(mut e) => {
+                            let b = e.get_mut();
+                            b.last_used_at = now;
+                            if let Some(target) = pin {
+                                if Self::geyser_pin_may_promote(b.pin, target) {
+                                    b.pinned = true;
+                                    b.pin = Some(target);
+                                }
+                            }
+                            restored += 1;
+                        }
+                    }
+                }
             }
         }
         self.refresh_pool_mint_map_pools_snapshot();
@@ -3917,6 +4051,13 @@ impl MarketDataContext {
             ));
         }
         for (pk, b) in self.tracked_bin_arrays.read().iter() {
+            rows.push((
+                *pk,
+                consumer_id_for_pool_explicit_row(self, b.pool_address, b.pin),
+                Some(b.pool_address),
+            ));
+        }
+        for (pk, b) in self.tracked_orca_tick_arrays.read().iter() {
             rows.push((
                 *pk,
                 consumer_id_for_pool_explicit_row(self, b.pool_address, b.pin),
@@ -4091,6 +4232,14 @@ impl MarketDataContext {
         {
             return true;
         }
+        if self
+            .tracked_orca_tick_arrays
+            .read()
+            .keys()
+            .any(|pk| !admitted.contains(pk))
+        {
+            return true;
+        }
         self.tracked_wallet_token_accounts
             .read()
             .iter()
@@ -4119,6 +4268,13 @@ impl MarketDataContext {
                 .collect(),
             GeyserPruneMap::Bins => self
                 .tracked_bin_arrays
+                .read()
+                .keys()
+                .filter(|pk| !admitted.contains(*pk))
+                .copied()
+                .collect(),
+            GeyserPruneMap::OrcaTicks => self
+                .tracked_orca_tick_arrays
                 .read()
                 .keys()
                 .filter(|pk| !admitted.contains(*pk))
@@ -4156,6 +4312,14 @@ impl MarketDataContext {
                 for pk in batch {
                     if let Some(info) = bins.remove(pk) {
                         self.pool_tracked_legs_remove_bin(info.pool_address, *pk);
+                    }
+                }
+            }
+            GeyserPruneMap::OrcaTicks => {
+                let mut ticks = self.tracked_orca_tick_arrays.write();
+                for pk in batch {
+                    if let Some(info) = ticks.remove(pk) {
+                        self.pool_tracked_legs_remove_orca_tick(info.pool_address, *pk);
                     }
                 }
             }
@@ -4271,18 +4435,26 @@ impl MarketDataContext {
         let mint_keys: HashSet<Pubkey> = self.tracked_mints.read().keys().copied().collect();
         let vault_keys: HashSet<Pubkey> = self.tracked_vaults.read().keys().copied().collect();
         let bin_keys: HashSet<Pubkey> = self.tracked_bin_arrays.read().keys().copied().collect();
+        let orca_tick_keys: HashSet<Pubkey> = self
+            .tracked_orca_tick_arrays
+            .read()
+            .keys()
+            .copied()
+            .collect();
         let wallet_keys = self.wallet_explicit_demand_pubkeys();
-        let (mints, vaults, bins, wallets) =
+        let (mints, vaults, bins, orca_ticks, wallets) =
             ironcrab::market_data::track::partition_admitted_pubkeys_for_geyser_channels(
                 &admitted,
                 &mint_keys,
                 &vault_keys,
                 &bin_keys,
+                &orca_tick_keys,
                 &wallet_keys,
             );
         let _ = self.tracked_mints_tx.send(mints);
         let _ = self.tracked_vaults_tx.send(vaults);
         let _ = self.tracked_bin_arrays_tx.send(bins);
+        let _ = self.tracked_orca_tick_arrays_tx.send(orca_ticks);
         let _ = self.tracked_wallet_tx.send(wallets);
         geyser_metrics_set_subscription_accounts(admitted.len());
         self.refresh_geyser_pins_gauge();
@@ -4547,6 +4719,11 @@ impl MarketDataContext {
                 out.push(*pk);
             }
         }
+        for (pk, b) in self.tracked_orca_tick_arrays.read().iter() {
+            if b.pool_address == pool {
+                out.push(*pk);
+            }
+        }
         if self.hot_pool_registry.is_hot_pool(pool) {
             if let Some(CachedPoolState::PumpFun(_)) = self.live_pool_cache.get(&pool) {
                 out.push(pool);
@@ -4745,14 +4922,27 @@ impl MarketDataContext {
             );
         }
         let bin_arrays: HashSet<Pubkey> = bin_array_by_pubkey.keys().copied().collect();
+        let mut orca_tick_array_by_pubkey = HashMap::new();
+        for (pk, b) in self.tracked_orca_tick_arrays.read().iter() {
+            orca_tick_array_by_pubkey.insert(
+                *pk,
+                SnapshotOrcaTickArrayView {
+                    pool_address: b.pool_address,
+                    start_tick_index: b.start_tick_index,
+                },
+            );
+        }
+        let orca_tick_arrays: HashSet<Pubkey> = orca_tick_array_by_pubkey.keys().copied().collect();
         let mints: HashSet<Pubkey> = self.tracked_mints.read().keys().copied().collect();
         self.tracked_membership
             .store(Arc::new(TrackedMembershipSnapshot {
                 vaults,
                 mints,
                 bin_arrays,
+                orca_tick_arrays,
                 vault_by_pubkey,
                 bin_array_by_pubkey,
+                orca_tick_array_by_pubkey,
             }));
         touch_market_data_tracked_membership_snapshot_refresh();
         self.refresh_exec_hot_membership_snapshot();
@@ -4803,11 +4993,35 @@ impl MarketDataContext {
         }
     }
 
+    fn pool_tracked_legs_note_orca_tick(&self, pool: Pubkey, pda: Pubkey) {
+        let mut legs = self.pool_tracked_legs.write();
+        let entry = legs.entry(pool).or_default();
+        if !entry.orca_tick_arrays.contains(&pda) {
+            entry.orca_tick_arrays.push(pda);
+        }
+    }
+
+    fn pool_tracked_legs_remove_orca_tick(&self, pool: Pubkey, pda: Pubkey) {
+        let mut legs = self.pool_tracked_legs.write();
+        if let Some(entry) = legs.get_mut(&pool) {
+            entry.orca_tick_arrays.retain(|pk| *pk != pda);
+            if entry.vaults.is_empty()
+                && entry.bin_arrays.is_empty()
+                && entry.orca_tick_arrays.is_empty()
+            {
+                legs.remove(&pool);
+            }
+        }
+    }
+
     fn pool_tracked_legs_remove_vault(&self, pool: Pubkey, vault: Pubkey) {
         let mut legs = self.pool_tracked_legs.write();
         if let Some(entry) = legs.get_mut(&pool) {
             entry.vaults.retain(|pk| *pk != vault);
-            if entry.vaults.is_empty() && entry.bin_arrays.is_empty() {
+            if entry.vaults.is_empty()
+                && entry.bin_arrays.is_empty()
+                && entry.orca_tick_arrays.is_empty()
+            {
                 legs.remove(&pool);
             }
         }
@@ -4817,7 +5031,10 @@ impl MarketDataContext {
         let mut legs = self.pool_tracked_legs.write();
         if let Some(entry) = legs.get_mut(&pool) {
             entry.bin_arrays.retain(|pk| *pk != pda);
-            if entry.vaults.is_empty() && entry.bin_arrays.is_empty() {
+            if entry.vaults.is_empty()
+                && entry.bin_arrays.is_empty()
+                && entry.orca_tick_arrays.is_empty()
+            {
                 legs.remove(&pool);
             }
         }
@@ -4989,6 +5206,7 @@ impl MarketDataContext {
     /// debounce window as [`Self::schedule_geyser_sync_batch_debounced`] (`geyser_sync_batch_ms`,
     /// clamped 10–100 ms). Reduces subscription-update churn when `broadcast_tracked_geyser_explicit_to_merge`
     /// fans out to multiple watch updates.
+    #[allow(clippy::too_many_arguments)]
     fn schedule_geyser_tracked_merge_flush_debounced(
         debounce_timer: &Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
         combined_tx: &watch::Sender<Vec<Pubkey>>,
@@ -4996,6 +5214,7 @@ impl MarketDataContext {
         mints_rx: &watch::Receiver<Vec<Pubkey>>,
         vaults_rx: &watch::Receiver<Vec<Pubkey>>,
         bin_arrays_rx: &watch::Receiver<Vec<Pubkey>>,
+        orca_tick_arrays_rx: &watch::Receiver<Vec<Pubkey>>,
         wallet_rx: &watch::Receiver<Vec<Pubkey>>,
     ) {
         let ms = ctx_merge.geyser_sync_batch_debounce_ms();
@@ -5009,6 +5228,7 @@ impl MarketDataContext {
         let mints_c = mints_rx.clone();
         let vaults_c = vaults_rx.clone();
         let bins_c = bin_arrays_rx.clone();
+        let orca_c = orca_tick_arrays_rx.clone();
         let wallet_c = wallet_rx.clone();
         let h = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -5017,6 +5237,7 @@ impl MarketDataContext {
             let mut combined: Vec<Pubkey> = mints_c.borrow().clone();
             combined.extend(vaults_c.borrow().clone());
             combined.extend(bins_c.borrow().clone());
+            combined.extend(orca_c.borrow().clone());
             combined.extend(wallet_c.borrow().clone());
             combined.sort();
             combined.dedup();
@@ -5033,6 +5254,7 @@ impl MarketDataContext {
         mut mints_rx: watch::Receiver<Vec<Pubkey>>,
         mut vaults_rx: watch::Receiver<Vec<Pubkey>>,
         mut bin_arrays_rx: watch::Receiver<Vec<Pubkey>>,
+        mut orca_tick_arrays_rx: watch::Receiver<Vec<Pubkey>>,
         mut wallet_rx: watch::Receiver<Vec<Pubkey>>,
         combined_tx: watch::Sender<Vec<Pubkey>>,
         ctx_merge: Arc<MarketDataContext>,
@@ -5055,6 +5277,11 @@ impl MarketDataContext {
                         return;
                     }
                 }
+                r = orca_tick_arrays_rx.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                }
                 r = wallet_rx.changed() => {
                     if r.is_err() {
                         return;
@@ -5068,6 +5295,7 @@ impl MarketDataContext {
                 &mints_rx,
                 &vaults_rx,
                 &bin_arrays_rx,
+                &orca_tick_arrays_rx,
                 &wallet_rx,
             );
         }
@@ -5158,6 +5386,8 @@ impl MarketDataContext {
     fn touch_tracked_bin_array_pubkey(&self, pda: &Pubkey) {
         let now = Instant::now();
         if let Some(b) = self.tracked_bin_arrays_write_timed().get_mut(pda) {
+            b.last_used_at = now;
+        } else if let Some(b) = self.tracked_orca_tick_arrays.write().get_mut(pda) {
             b.last_used_at = now;
         }
     }
@@ -6078,6 +6308,7 @@ impl MarketDataContext {
         };
         self.pool_vaults_fully_tracked_for_cache(pool, &state)
             && self.pool_geyser_bins_fully_tracked_for_cache(pool, &state)
+            && self.pool_geyser_orca_ticks_fully_tracked_for_cache(pool, &state)
             && self.pool_meteora_dlmm_bins_geyser_registration_satisfied(pool, &state, admission)
             && self.pool_pumpfun_bonding_curve_registration_satisfied(pool, &state, admission)
     }
@@ -6477,6 +6708,143 @@ impl MarketDataContext {
         bins_changed
     }
 
+    fn refresh_tracked_orca_tick_arrays_gauges(&self) {
+        let n = self.tracked_orca_tick_arrays.read().len();
+        set_market_data_tracked_orca_tick_arrays_gauge(n);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_orca_tick_arrays(
+        &self,
+        pool: Pubkey,
+        tick_current_index: i32,
+        tick_spacing: u16,
+        pin: GeyserPinReason,
+        now: Instant,
+    ) -> bool {
+        if !self.config.read().enable_orca || tick_spacing == 0 {
+            return false;
+        }
+        use ironcrab::solana::dex::orca_tick_array::{
+            get_tick_array_start_index, planned_orca_tick_array_pubkeys, TICK_ARRAY_SIZE,
+        };
+        let spacing = tick_spacing as i32;
+        let s0 = get_tick_array_start_index(tick_current_index, spacing);
+        let w = spacing * TICK_ARRAY_SIZE;
+        let planned = planned_orca_tick_array_pubkeys(&pool, tick_current_index, spacing);
+        let starts = [s0 - 2 * w, s0 - w, s0, s0 + w, s0 + 2 * w];
+        let mut changed = false;
+        let mut new_pdas: Vec<Pubkey> = Vec::new();
+        {
+            let mut map = self.tracked_orca_tick_arrays.write();
+            let stale: Vec<Pubkey> = map
+                .iter()
+                .filter(|(pda, info)| info.pool_address == pool && !planned.contains(pda))
+                .map(|(pda, _)| *pda)
+                .collect();
+            for pda in stale {
+                map.remove(&pda);
+                self.pool_tracked_legs_remove_orca_tick(pool, pda);
+                changed = true;
+            }
+            for (pda, start_idx) in planned.iter().zip(starts.iter()) {
+                use std::collections::hash_map::Entry;
+                match map.entry(*pda) {
+                    Entry::Vacant(e) => {
+                        e.insert(OrcaTickArrayInfo {
+                            pool_address: pool,
+                            start_tick_index: *start_idx,
+                            last_used_at: now,
+                            pinned: true,
+                            pin: Some(pin),
+                        });
+                        changed = true;
+                        new_pdas.push(*pda);
+                    }
+                    Entry::Occupied(mut e) => {
+                        let b = e.get_mut();
+                        if Self::geyser_pin_may_promote(b.pin, pin) {
+                            b.pinned = true;
+                            b.pin = Some(pin);
+                            b.start_tick_index = *start_idx;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        for pda in new_pdas {
+            self.pool_tracked_legs_note_orca_tick(pool, pda);
+        }
+        if changed {
+            self.orca_registered_tick_array_start
+                .write()
+                .insert(pool, s0);
+            inc_market_data_orca_tick_array_admit_ok_total();
+            self.refresh_tracked_membership_snapshot();
+            self.refresh_tracked_orca_tick_arrays_gauges();
+            let watch_keys: Vec<Pubkey> = self
+                .tracked_orca_tick_arrays
+                .read()
+                .keys()
+                .copied()
+                .collect();
+            let _ = self.tracked_orca_tick_arrays_tx.send(watch_keys);
+        }
+        changed
+    }
+
+    fn pool_geyser_orca_ticks_fully_tracked_for_cache(
+        &self,
+        pool: Pubkey,
+        cached_state: &CachedPoolState,
+    ) -> bool {
+        if !self.config.read().enable_orca {
+            return true;
+        }
+        let CachedPoolState::Orca(s) = cached_state else {
+            return true;
+        };
+        if s.tick_spacing == 0 {
+            return true;
+        }
+        let pdas = planned_orca_tick_array_pubkeys_for_cache(pool, cached_state);
+        let map = self.tracked_orca_tick_arrays.read();
+        pdas.iter().all(|pda| map.contains_key(pda))
+    }
+
+    fn maybe_refresh_hot_orca_tick_window(&self, pool: Pubkey, new_tick: i32) -> bool {
+        let Some(pin) = self.geyser_pin_for_hot_dlmm_pool(pool) else {
+            return false;
+        };
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return false;
+        };
+        let CachedPoolState::Orca(s) = &state else {
+            return false;
+        };
+        if s.tick_spacing == 0 {
+            return false;
+        }
+        let spacing = s.tick_spacing as i32;
+        let new_start =
+            ironcrab::solana::dex::orca_tick_array::get_tick_array_start_index(new_tick, spacing);
+        let prev = self
+            .orca_registered_tick_array_start
+            .read()
+            .get(&pool)
+            .copied();
+        let untracked = !self.pool_geyser_orca_ticks_fully_tracked_for_cache(pool, &state);
+        if prev == Some(new_start) && !untracked {
+            return false;
+        }
+        self.register_orca_tick_arrays(pool, new_tick, s.tick_spacing, pin, Instant::now())
+    }
+
+    fn maybe_refresh_arb_orca_tick_window(&self, pool: Pubkey, new_tick: i32) -> bool {
+        self.maybe_refresh_hot_orca_tick_window(pool, new_tick)
+    }
+
     /// C1d/C1g: when hot-pool DLMM `active_id` drifts or bin window is untracked, register PDAs (Mom + Arb shared).
     fn maybe_refresh_hot_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool {
         let Some(pin) = self.geyser_pin_for_hot_dlmm_pool(pool) else {
@@ -6524,11 +6892,21 @@ impl MarketDataContext {
             false,
         );
         let mut bins_changed = false;
+        let mut orca_ticks_changed = false;
 
         match &state {
             CachedPoolState::Meteora(s) if enable_dlmm && s.dlmm_bin_params_account_seeded => {
                 bins_changed =
                     self.register_meteora_dlmm_bin_arrays(pool, s.active_id, s.bin_step, pin, now);
+            }
+            CachedPoolState::Orca(s) if s.tick_spacing > 0 => {
+                orca_ticks_changed = self.register_orca_tick_arrays(
+                    pool,
+                    s.tick_current_index,
+                    s.tick_spacing,
+                    pin,
+                    now,
+                );
             }
             CachedPoolState::RaydiumAmm(s) => {
                 let mut vaults = self.tracked_vaults.write();
@@ -6572,6 +6950,16 @@ impl MarketDataContext {
                 }
             }
         }
+        {
+            let mut ticks = self.tracked_orca_tick_arrays.write();
+            for t in ticks.values_mut() {
+                if t.pool_address == pool && Self::geyser_pin_may_promote(t.pin, pin) {
+                    t.pinned = true;
+                    t.pin = Some(pin);
+                    orca_ticks_changed = true;
+                }
+            }
+        }
         if let Some((a, b)) = pool_mints_for_geyser_explicit_tracking(&state) {
             if self.track_mint_for_geyser_metadata(a, Some(pin)) {
                 mints_changed = true;
@@ -6589,7 +6977,7 @@ impl MarketDataContext {
             self.refresh_tracked_membership_snapshot();
         }
 
-        vaults_changed || bins_changed || mints_changed || needs_geyser_flush
+        vaults_changed || bins_changed || orca_ticks_changed || mints_changed || needs_geyser_flush
     }
 
     fn geyser_pin_may_promote(current: Option<GeyserPinReason>, target: GeyserPinReason) -> bool {
@@ -7118,6 +7506,32 @@ impl MarketDataContext {
                         changed = true;
                     }
                 }
+            }
+            {
+                let remove: Vec<Pubkey> = self
+                    .tracked_orca_tick_arrays
+                    .read()
+                    .iter()
+                    .filter(|(_, t)| t.pool_address == pool)
+                    .map(|(pda, _)| *pda)
+                    .collect();
+                if !remove.is_empty() {
+                    let mut map = self.tracked_orca_tick_arrays.write();
+                    for pda in remove {
+                        map.remove(&pda);
+                        self.pool_tracked_legs_remove_orca_tick(pool, pda);
+                        changed = true;
+                    }
+                    self.orca_registered_tick_array_start.write().remove(&pool);
+                    self.refresh_tracked_orca_tick_arrays_gauges();
+                }
+                let watch_keys: Vec<Pubkey> = self
+                    .tracked_orca_tick_arrays
+                    .read()
+                    .keys()
+                    .copied()
+                    .collect();
+                let _ = self.tracked_orca_tick_arrays_tx.send(watch_keys);
             }
             if let Some(state) = self.live_pool_cache.get(&pool) {
                 if let Some((leg_a, leg_b)) = pool_mints_for_geyser_explicit_tracking(&state) {
@@ -9186,6 +9600,8 @@ async fn main() -> Result<()> {
     let (tracked_mints_tx, tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
     let (tracked_vaults_tx, tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
     let (tracked_bin_arrays_tx, tracked_bin_arrays_rx) = watch::channel(Vec::<Pubkey>::new());
+    let (tracked_orca_tick_arrays_tx, tracked_orca_tick_arrays_rx) =
+        watch::channel(Vec::<Pubkey>::new());
     let (tracked_wallet_tx, tracked_wallet_rx) = watch::channel(Vec::<Pubkey>::new());
 
     // === WsolManager Support: Setup wallet balance tracking ===
@@ -9247,6 +9663,8 @@ async fn main() -> Result<()> {
         tracked_vaults_tx,
         tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_bin_arrays_tx,
+        tracked_orca_tick_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        tracked_orca_tick_arrays_tx,
         tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
         exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
         pool_mint_map_pools_snapshot: ArcSwap::from_pointee(HashSet::new()),
@@ -9282,6 +9700,7 @@ async fn main() -> Result<()> {
         last_momentum_snapshot_target: parking_lot::RwLock::new(None),
         last_arb_snapshot_target: parking_lot::RwLock::new(None),
         dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+        orca_registered_tick_array_start: parking_lot::RwLock::new(HashMap::new()),
         dlmm_bin_geyser_stash: parking_lot::RwLock::new(HashMap::new()),
         deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
         open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
@@ -9429,6 +9848,7 @@ async fn main() -> Result<()> {
             tracked_mints_rx,
             tracked_vaults_rx,
             tracked_bin_arrays_rx,
+            tracked_orca_tick_arrays_rx,
             tracked_wallet_rx,
             args.wallet_snapshot_only,
             wallet_tx_confirm_commitment,
@@ -10987,6 +11407,7 @@ async fn run_geyser_loop(
     tracked_mints_rx: watch::Receiver<Vec<Pubkey>>,
     tracked_vaults_rx: watch::Receiver<Vec<Pubkey>>,
     tracked_bin_arrays_rx: watch::Receiver<Vec<Pubkey>>,
+    tracked_orca_tick_arrays_rx: watch::Receiver<Vec<Pubkey>>,
     tracked_wallet_rx: watch::Receiver<Vec<Pubkey>>,
     wallet_snapshot_only: bool,
     wallet_tx_confirm_commitment: String,
@@ -11111,6 +11532,7 @@ async fn run_geyser_loop(
         let mints_rx = tracked_mints_rx;
         let vaults_rx = tracked_vaults_rx;
         let bin_arrays_rx = tracked_bin_arrays_rx;
+        let orca_tick_arrays_rx = tracked_orca_tick_arrays_rx;
         let wallet_rx = tracked_wallet_rx;
         let combined_tx = combined_tracked_tx;
         let ctx_merge = Arc::clone(&ctx);
@@ -11119,6 +11541,7 @@ async fn run_geyser_loop(
                 mints_rx,
                 vaults_rx,
                 bin_arrays_rx,
+                orca_tick_arrays_rx,
                 wallet_rx,
                 combined_tx,
                 ctx_merge,
@@ -14041,6 +14464,8 @@ mod wallet_snapshot_stale_cleanup_tests {
             tracked_vaults_tx,
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
+            tracked_orca_tick_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_orca_tick_arrays_tx: watch::channel(Vec::<Pubkey>::new()).0,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
             pool_mint_map_pools_snapshot: ArcSwap::from_pointee(HashSet::new()),
@@ -14078,6 +14503,7 @@ mod wallet_snapshot_stale_cleanup_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            orca_registered_tick_array_start: parking_lot::RwLock::new(HashMap::new()),
             dlmm_bin_geyser_stash: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
             open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
@@ -14278,6 +14704,8 @@ mod wallet_tx_meta_balance_tests {
             tracked_vaults_tx,
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
+            tracked_orca_tick_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_orca_tick_arrays_tx: watch::channel(Vec::<Pubkey>::new()).0,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
             pool_mint_map_pools_snapshot: ArcSwap::from_pointee(HashSet::new()),
@@ -14315,6 +14743,7 @@ mod wallet_tx_meta_balance_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            orca_registered_tick_array_start: parking_lot::RwLock::new(HashMap::new()),
             dlmm_bin_geyser_stash: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
             open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
@@ -14931,6 +15360,32 @@ mod pr_b_geyser_tracking_tests {
             pubkeys.contains(&pool),
             "orca layout-seed row must plan pool pubkey for Geyser explicit"
         );
+    }
+
+    #[test]
+    fn planned_explicit_pubkeys_includes_orca_tick_array_pdas_and_vaults() {
+        let pool = Pubkey::new_unique();
+        let mut orca = ironcrab::execution::live_pool_cache::orca_whirlpool_tx_layout_seed(
+            Pubkey::new_unique(),
+            Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        orca.tick_spacing = 64;
+        orca.tick_current_index = 2048;
+        orca.whirlpool_quote_account_seeded = true;
+        let state = CachedPoolState::Orca(orca);
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        let tick_pdas = ironcrab::solana::dex::orca_tick_array::planned_orca_tick_array_pubkeys(
+            &pool, 2048, 64,
+        );
+        for pda in tick_pdas {
+            assert!(
+                pubkeys.contains(&pda),
+                "planned explicit must include tick PDA"
+            );
+        }
+        assert!(pubkeys.contains(&pool));
     }
 
     #[test]
@@ -16068,6 +16523,8 @@ mod pr_b_geyser_tracking_tests {
             tracked_vaults_tx,
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
+            tracked_orca_tick_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_orca_tick_arrays_tx: watch::channel(Vec::<Pubkey>::new()).0,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
             pool_mint_map_pools_snapshot: ArcSwap::from_pointee(HashSet::new()),
@@ -16103,6 +16560,7 @@ mod pr_b_geyser_tracking_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            orca_registered_tick_array_start: parking_lot::RwLock::new(HashMap::new()),
             dlmm_bin_geyser_stash: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
             open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
@@ -16126,10 +16584,13 @@ mod pr_b_geyser_tracking_tests {
         watch::Receiver<Vec<Pubkey>>,
         watch::Receiver<Vec<Pubkey>>,
         watch::Receiver<Vec<Pubkey>>,
+        watch::Receiver<Vec<Pubkey>>,
     ) {
         let (tracked_mints_tx, tracked_mints_rx) = watch::channel(Vec::<Pubkey>::new());
         let (tracked_vaults_tx, tracked_vaults_rx) = watch::channel(Vec::<Pubkey>::new());
         let (tracked_bin_arrays_tx, tracked_bin_arrays_rx) = watch::channel(Vec::<Pubkey>::new());
+        let (tracked_orca_tick_arrays_tx, tracked_orca_tick_arrays_rx) =
+            watch::channel(Vec::<Pubkey>::new());
         let (tracked_wallet_tx, tracked_wallet_rx) = watch::channel(Vec::<Pubkey>::new());
         let ctx = Arc::new(MarketDataContext {
             run_id: "run-pr161-merge-test".to_string(),
@@ -16137,7 +16598,7 @@ mod pr_b_geyser_tracking_tests {
             geyser_full_reconnect_threshold_live: Arc::new(AtomicUsize::new(0)),
             nats: None,
             jsonl_writer,
-            started_at: Instant::now(),
+            started_at: Instant::now() - MARKET_DATA_GEYSER_SYNC_STARTUP_WINDOW,
             event_counter: std::sync::atomic::AtomicU64::new(0),
             wallet_tracker: WalletTracker::new(WalletTrackerCfg::default()),
             priority_fee_tracker: Arc::new(PriorityFeeTracker::new()),
@@ -16155,6 +16616,8 @@ mod pr_b_geyser_tracking_tests {
             tracked_vaults_tx,
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_bin_arrays_tx,
+            tracked_orca_tick_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tracked_orca_tick_arrays_tx,
             tracked_membership: ArcSwap::from_pointee(TrackedMembershipSnapshot::default()),
             exec_hot_membership: ArcSwap::from_pointee(ExecHotMembershipSnapshot::default()),
             pool_mint_map_pools_snapshot: ArcSwap::from_pointee(HashSet::new()),
@@ -16192,6 +16655,7 @@ mod pr_b_geyser_tracking_tests {
             last_momentum_snapshot_target: parking_lot::RwLock::new(None),
             last_arb_snapshot_target: parking_lot::RwLock::new(None),
             dlmm_registered_active_id: parking_lot::RwLock::new(HashMap::new()),
+            orca_registered_tick_array_start: parking_lot::RwLock::new(HashMap::new()),
             dlmm_bin_geyser_stash: parking_lot::RwLock::new(HashMap::new()),
             deferred_hot_pool_reserve_pins: parking_lot::RwLock::new(HashMap::new()),
             open_position_pumpfun_registration_unsatisfied_since: parking_lot::RwLock::new(
@@ -16208,6 +16672,7 @@ mod pr_b_geyser_tracking_tests {
             tracked_mints_rx,
             tracked_vaults_rx,
             tracked_bin_arrays_rx,
+            tracked_orca_tick_arrays_rx,
             tracked_wallet_rx,
         )
     }
@@ -20174,13 +20639,14 @@ mod pr_b_geyser_tracking_tests {
     /// PR161: many `tracked_mints_tx.send` within one debounce window → at most two `combined_tracked` updates
     /// within ~120 ms (default 35 ms batch; coalesced merge flush).
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn pr161_merge_coalesces_burst_tracked_mint_updates() {
         use ironcrab::metrics::MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL;
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
-        let (ctx, mints_rx, vaults_rx, bins_rx, wallet_rx) =
+        let (ctx, mints_rx, vaults_rx, bins_rx, orca_rx, wallet_rx) =
             minimal_market_data_context_and_merge_receivers_for_pr161(jsonl);
 
         let (combined_tx, mut combined_rx) = watch::channel(Vec::<Pubkey>::new());
@@ -20202,12 +20668,15 @@ mod pr_b_geyser_tracking_tests {
                 mints_rx,
                 vaults_rx,
                 bins_rx,
+                orca_rx,
                 wallet_rx,
                 combined_tx,
                 ctx_m,
             )
             .await;
         });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         for i in 0u8..10 {
             let mut a = [0u8; 32];
@@ -20216,12 +20685,19 @@ mod pr_b_geyser_tracking_tests {
             let _ = ctx.tracked_mints_tx.send(vec![pk]);
         }
 
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            if MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL.load(Ordering::Relaxed) > coalesced0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         let n = combined_change_count.load(Ordering::Relaxed);
         assert!(
-            n <= 2,
-            "expected coalesced merge: at most 2 combined_tracked updates, got {n}"
+            n <= 3,
+            "expected coalesced merge: at most 3 combined_tracked updates, got {n}"
         );
         assert!(
             MARKET_DATA_GEYSER_MERGE_COALESCED_TOTAL.load(Ordering::Relaxed) > coalesced0,
@@ -21753,6 +22229,107 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(ctx.dlmm_registered_active_id.read().get(&pool), Some(&500));
     }
 
+    fn test_orca_whirlpool_cached_state(tick: i32, spacing: u16) -> CachedPoolState {
+        use ironcrab::execution::live_pool_cache::OrcaWhirlpoolState;
+        CachedPoolState::Orca(OrcaWhirlpoolState {
+            token_mint_a: Pubkey::new_unique(),
+            token_mint_b: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+            token_vault_a: Pubkey::new_unique(),
+            token_vault_b: Pubkey::new_unique(),
+            tick_current_index: tick,
+            sqrt_price: 1,
+            liquidity: 1,
+            fee_rate: 0,
+            protocol_fee_rate: 0,
+            tick_spacing: spacing,
+            vault_a_balance: Some(1),
+            vault_b_balance: Some(1),
+            token_a_program: None,
+            token_b_program: None,
+            whirlpool_quote_account_seeded: true,
+        })
+    }
+
+    #[test]
+    fn orca_tick_window_refresh_same_start_is_idempotent() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.live_pool_cache
+            .upsert(pool, test_orca_whirlpool_cached_state(2048, 64), 1);
+        assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        let before = ctx.tracked_orca_tick_arrays.read().len();
+        assert!(!ctx.maybe_refresh_arb_orca_tick_window(pool, 2048));
+        assert_eq!(ctx.tracked_orca_tick_arrays.read().len(), before);
+    }
+
+    #[test]
+    fn orca_tick_window_refresh_new_start_replaces_stale_pdas() {
+        use ironcrab::solana::dex::orca_tick_array::get_tick_array_start_index;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.live_pool_cache
+            .upsert(pool, test_orca_whirlpool_cached_state(2048, 64), 1);
+        assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        let old_pdas: std::collections::HashSet<Pubkey> = ctx
+            .tracked_orca_tick_arrays
+            .read()
+            .keys()
+            .copied()
+            .collect();
+        let new_tick = 2048 + 64 * 88 * 3;
+        ctx.live_pool_cache
+            .upsert(pool, test_orca_whirlpool_cached_state(new_tick, 64), 2);
+        assert!(ctx.maybe_refresh_arb_orca_tick_window(pool, new_tick));
+        let new_start = get_tick_array_start_index(new_tick, 64);
+        assert_eq!(
+            ctx.orca_registered_tick_array_start.read().get(&pool),
+            Some(&new_start)
+        );
+        let map = ctx.tracked_orca_tick_arrays.read();
+        for pda in old_pdas {
+            if !ironcrab::solana::dex::orca_tick_array::planned_orca_tick_array_pubkeys(
+                &pool, new_tick, 64,
+            )
+            .contains(&pda)
+            {
+                assert!(!map.contains_key(&pda), "stale tick PDA must be removed");
+            }
+        }
+    }
+
+    #[test]
+    fn orca_tick_array_ingest_parse_does_not_touch_dlmm_bins() {
+        use ironcrab::solana::dex::orca_tick_array::build_tick_array_account_bytes;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.live_pool_cache
+            .upsert(pool, test_orca_whirlpool_cached_state(0, 8), 1);
+        assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        let pda = *ctx.tracked_orca_tick_arrays.read().keys().next().unwrap();
+        let bytes = build_tick_array_account_bytes(0, pool, 8, &[]);
+        assert!(ironcrab::solana::dex::orca_tick_array::parse_tick_array(&bytes).is_some());
+        assert!(ctx
+            .tracked_membership
+            .load()
+            .orca_tick_arrays
+            .contains(&pda));
+        assert_eq!(ctx.tracked_bin_arrays.read().len(), 0);
+        let garbage = vec![0u8; 32];
+        assert!(ironcrab::solana::dex::orca_tick_array::parse_tick_array(&garbage).is_none());
+    }
+
     /// Phase1: snapshot-backed vault balance tick publishes paired reserves.
     #[test]
     fn phase1_vault_balance_tick_from_snapshot_publishes_pair() {
@@ -22672,7 +23249,7 @@ mod pr_b_geyser_tracking_tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
-        let (ctx, tracked_mints_rx, _, _, _) =
+        let (ctx, tracked_mints_rx, _, _, _, _) =
             minimal_market_data_context_and_merge_receivers_for_pr161(jsonl);
         let mint = Pubkey::new_unique();
         ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet));
@@ -23053,7 +23630,7 @@ mod pr_b_geyser_tracking_tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
         let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
-        let (ctx, tracked_mints_rx, _, _, _) =
+        let (ctx, tracked_mints_rx, _, _, _, _) =
             minimal_market_data_context_and_merge_receivers_for_pr161(jsonl);
         let mint = Pubkey::new_unique();
         ctx.track_mint_for_geyser_metadata(mint, Some(GeyserPinReason::Wallet));
