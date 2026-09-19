@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ORCA-CLMM-WALKER-LIB: Orca Whirlpool tick-walking quote library (not wired)
+**Datum**: 2026-09-19  
+**Problem**: Hot-path Orca quotes still use reserve/CPMM approximations; accurate CLMM exact-in requires walking initialized ticks across the three swap-direction tick arrays with on-chain Whirlpool math.  
+**Fix**: Add `orca_tick_array` parse/PDA helpers and `orca_tick_walker::orca_quote_exact_in` (ported Orca `compute_swap` / tick math). **Not yet wired** into `Orca::quote_exact_in` or execution — library-only (Job 1).  
+**Invarianten**: I-7 no RPC in walker; simulation gate unchanged until integration.  
+**Dateien**: `src/solana/dex/orca_tick_array.rs`, `src/solana/dex/orca_tick_walker.rs`, `src/solana/dex/mod.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-SIDEFX-SELL-LAYOUT-LOG-STORM: md-account-sidefx-Hang durch `sell_layout_ready` / BalanceUpdated INFO-Journal (I-4b)
 **Datum**: 2026-09-18  
 **Problem**: Prod SHA `5025295` (Deploy #452, Units seit 22:17 CEST): Geyser-Listener/Head lebten; **TX-Handler + `md-account-sidefx` tot** ab ~23:18:44 CEST. Dutzende `pump_amm: Geyser SELL set sell_layout_ready` + `MASTER CACHE: PoolCacheUpdate::BalanceUpdated` **info!** in derselben ms (~110k / ~17k seit Deploy, ~30/s) → synchrones `tracing_subscriber::fmt()` → systemd-journald Rate-Limit → blockierendes `write` auf dem seriellen Sidefx-Task; Logger-Mutex → TX-Handler `stale` ohne Reconnect (PR165/166). Restart leert nur kurz das Journal-Limit — keine Dauerheilung. Mint `Cz7LGKdZPpAxonXx23ZYPW3RtDQvjcf17ZDCZEzFpump` / Arb-HIGH-Freeze Folge (keine Vault-Ticks).  
