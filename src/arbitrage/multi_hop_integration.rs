@@ -317,6 +317,7 @@ impl CachedQuoteProvider {
             &output_mint.to_string(),
             amount_in,
             dlmm_bins.as_ref(),
+            None,
             slot,
             updated_at,
             token_decimals,

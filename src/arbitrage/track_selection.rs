@@ -10,8 +10,8 @@ use crate::nats::{ArbTrackActiveReason, ArbTrackRemovedReason};
 
 use super::pool_quote::{
     is_quote_fresh_with_bins, quote_exact_in_with_freshness, select_round_trip_pools,
-    DlmmBinArrays, QuoteFreshnessConfig, QuotePoolInput, QuoteVaultInput, RoundTripPoolCandidate,
-    NATIVE_SOL_MINT,
+    DlmmBinArrays, OrcaTickArrays, QuoteFreshnessConfig, QuotePoolInput, QuoteVaultInput,
+    RoundTripPoolCandidate, NATIVE_SOL_MINT,
 };
 
 /// Readiness tier for a pool candidate (lowest ordinal = highest priority).
@@ -43,6 +43,7 @@ pub struct TrackPoolInput {
     pub quote_pool: QuotePoolInput,
     pub vault: Option<QuoteVaultInput>,
     pub dlmm_bins: Option<DlmmBinArrays>,
+    pub orca_ticks: Option<OrcaTickArrays>,
     pub token_decimals: u8,
     /// Latest activity from tracker/cache state (unix ms).
     pub last_activity_unix_ms: u64,
@@ -336,6 +337,7 @@ fn bundle_from_round_trip(
             pool: &p.quote_pool,
             vault: p.vault.as_ref(),
             dlmm_bins: p.dlmm_bins.as_ref(),
+            orca_ticks: p.orca_ticks.as_ref(),
             dex: &p.dex,
         })
         .collect();
@@ -586,6 +588,7 @@ fn can_fresh_sell_quote(
         &pool.quote_pool,
         pool.vault.as_ref(),
         pool.dlmm_bins.as_ref(),
+        pool.orca_ticks.as_ref(),
         &pool.quote_pool.token_mint,
         NATIVE_SOL_MINT,
         probe_tokens,
@@ -598,6 +601,7 @@ fn can_fresh_sell_quote(
         &config.freshness,
         pool.vault.as_ref(),
         pool.dlmm_bins.as_ref(),
+        pool.orca_ticks.as_ref(),
         now,
     )
 }
@@ -618,6 +622,7 @@ fn can_fresh_buy_quote(pool: &TrackPoolInput, config: &TrackSelectionConfig, now
         &pool.quote_pool,
         pool.vault.as_ref(),
         pool.dlmm_bins.as_ref(),
+        pool.orca_ticks.as_ref(),
         NATIVE_SOL_MINT,
         &pool.quote_pool.token_mint,
         config.probe_lamports,
@@ -630,6 +635,7 @@ fn can_fresh_buy_quote(pool: &TrackPoolInput, config: &TrackSelectionConfig, now
         &config.freshness,
         pool.vault.as_ref(),
         pool.dlmm_bins.as_ref(),
+        pool.orca_ticks.as_ref(),
         now,
     )
 }
@@ -689,6 +695,7 @@ mod tests {
 
     fn vault(reserve_base: u64, reserve_quote: u64) -> QuoteVaultInput {
         QuoteVaultInput {
+            orca: None,
             reserve_base,
             reserve_quote,
             update_slot: 1,
@@ -716,6 +723,7 @@ mod tests {
             quote_pool: quote_pool(dex, addr, mint, has_reserve),
             vault,
             dlmm_bins: None,
+            orca_ticks: None,
             token_decimals: 6,
             last_activity_unix_ms: activity_ms,
         }
