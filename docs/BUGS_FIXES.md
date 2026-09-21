@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MD-TX-PIN-SEED-LOG-STORM: md-tx-pin-seed-Hang durch First-Trade PoolCreated INFO-Journal (I-4b)
+**Datum**: 2026-09-21  
+**Problem**: Prod SHA `7481b3ed` (Deploy A.54, Units seit 20.09. 16:25 CEST): TX-Handler lockstep; **`md-tx-pin-seed` drain't nicht** — `tx_pin_seed_sidefx_jobs_processed_total` ≈9 bei Queue **4096** (Cap), ~75k pin-seed drops, ~0 weiterer Fortschritt; `arb_pin_vault_register_ok_total=0`, Arb ~99,7 % `no_fresh_buy_quote`. Serieller Pin-Seed-Task kehrte nach wenigen Jobs nicht zurück (gleiche Klasse wie #453 Account-Sidefx / #450 TX-Handler): synchrones **`info!`** `"pump_amm pool discovered via first trade - emitting PoolCreated + DexPoolAccounts"` auf Hot-Pin-Seed-Pfad → journald → blockierendes I/O.  
+**Fix**: First-Trade-Log in `md_sidefx_process_pump_amm_trade` → **debug!**; JSONL/NATS/`apply_tx_pool_accounts_for_hot_pool` unverändert. Source-Grep-Test ergänzt. Kommentar: `*_jobs_processed_total` = dequeued, nicht job-complete. Publish/JSONL weiter bounded `try_enqueue`.  
+**Invarianten**: I-4b non-blocking sidefx; I-7 kein RPC; I-MD-5 Pin-Seed nur hot/gepinnt; kein Cap-Bump (#19).  
+**Dateien**: `src/market_data/sidefx/handlers.rs`, `src/market_data/sidefx/worker.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-ORCA-CLMM-QUOTE-WIRE: Arb V2 ExecutableMarginal Orca = tick walk (A.54)
 **Datum**: 2026-09-19  
 **Problem**: Orca in `supports_cpmm` / `cpmm_amount_out` on vault reserves — Arb screening and I-19a `raw_expected` used vault-k, not on-chain Whirlpool tick walk (prod: Orca buy sim ok, Pump sell Tokenkeg `0x1`).  
