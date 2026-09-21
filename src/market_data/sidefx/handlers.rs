@@ -944,7 +944,7 @@ pub fn md_sidefx_process_pump_amm_trade(host: &dyn SidefxWorkerHost, job: &MdSid
     let is_first_trade = host.known_pump_amm_pools_insert(*pool_address);
 
     if is_first_trade {
-        info!(
+        debug!(
             pool = %pool_address,
             base_mint = %base_mint_pk,
             "pump_amm pool discovered via first trade - emitting PoolCreated + DexPoolAccounts"
@@ -2354,6 +2354,8 @@ mod sidefx_handlers_log_level_contract_tests {
         "pump_amm: Geyser SELL set sell_layout_ready (authoritative extended layout)";
     const BALANCE_UPDATED_ENQUEUED_MSG: &str =
         "MASTER CACHE: PoolCacheUpdate::BalanceUpdated enqueued for JetStream";
+    const PUMP_AMM_FIRST_TRADE_MSG: &str =
+        "pump_amm pool discovered via first trade - emitting PoolCreated + DexPoolAccounts";
 
     fn assert_literal_logged_at_debug_not_info(src: &str, literal: &str) {
         assert!(
@@ -2380,6 +2382,7 @@ mod sidefx_handlers_log_level_contract_tests {
         let src = include_str!("handlers.rs");
         assert_literal_logged_at_debug_not_info(src, SELL_LAYOUT_READY_MSG);
         assert_literal_logged_at_debug_not_info(src, BALANCE_UPDATED_ENQUEUED_MSG);
+        assert_literal_logged_at_debug_not_info(src, PUMP_AMM_FIRST_TRADE_MSG);
         assert!(src.contains("record_pump_amm_geyser_sell_layout_ready"));
         assert!(src.contains("set_pump_amm_sell_layout_authoritative"));
     }

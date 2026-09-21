@@ -764,6 +764,7 @@ fn md_sidefx_worker_loop(
             break;
         };
         md_sidefx_dec_queue_depth(&queue_depth, pipeline);
+        // `*_jobs_processed_total` counts dequeued jobs (burst recv), not handler completion.
         md_sidefx_inc_processed(pipeline);
         let mut jobs = vec![first];
         while jobs.len() < MARKET_DATA_MD_SIDEFX_BURST_MAX {
