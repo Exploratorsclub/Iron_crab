@@ -656,7 +656,7 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
     }
 
     fn note_trade_pool_lru_touches(&self, pool: Pubkey, scratch: &mut MdSidefxBurstScratch) {
-        note_trade_pool_lru_touches_from_cache(&self.ctx, pool, scratch);
+        note_trade_pool_lru_touches_from_cache(&self.ctx, &self.track_worker, pool, scratch);
     }
 
     fn is_hot_pool(&self, pool: &Pubkey) -> bool {
@@ -716,33 +716,12 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
         if self.ctx.live_pool_cache.get(pool).is_none() {
             return;
         }
-        if self.ctx.hot_pool_reserve_registration_satisfied(*pool) {
-            let _ = self
-                .ctx
-                .maybe_clear_deferred_hot_pool_reserve_if_satisfied(*pool);
-            return;
-        }
-        if !self
-            .ctx
-            .deferred_hot_pool_reserve_pins
-            .read()
-            .contains_key(pool)
-        {
-            let pin = if self.ctx.hot_pool_registry.pool_has_momentum(*pool) {
-                GeyserPinReason::MomentumActive
-            } else {
-                GeyserPinReason::ArbMultiDex
-            };
-            self.ctx.note_deferred_hot_pool_reserve_registration(
-                *pool,
-                pin,
-                "live_pool_cache_fill",
-            );
-        }
-        ironcrab::metrics::inc_market_data_deferred_retry_pool_state_fill_total();
-        let _ = track_worker_try_enqueue(
+        enqueue_deferred_hot_pool_reserve_retry(
+            &self.ctx,
             &self.track_worker,
-            TrackWorkerCommand::RetryDeferredHotPoolReserves,
+            *pool,
+            "live_pool_cache_fill",
+            true,
         );
     }
 
@@ -787,6 +766,7 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
     ) {
         apply_tx_pool_accounts_for_hot_pool(
             &self.ctx,
+            &self.track_worker,
             pool,
             dex,
             base_mint,
@@ -801,7 +781,13 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
     }
 
     fn register_geyser_reserves_after_hot_pool_cache_fill(&self, pool: Pubkey) {
-        register_geyser_reserves_for_hot_pool_with_completeness_metrics(&self.ctx, pool, false);
+        enqueue_deferred_hot_pool_reserve_retry(
+            &self.ctx,
+            &self.track_worker,
+            pool,
+            "account_hot_cache_fill",
+            false,
+        );
     }
 }
 
@@ -2022,51 +2008,40 @@ fn pool_needs_tracking_refresh_after_cache_upsert(
     true
 }
 
-/// Record vault-register completeness after a hot-pool cache row exists (TX or account path).
-fn register_geyser_reserves_for_hot_pool_with_completeness_metrics(
+/// I-4b: sidefx / pin-seed must not call `register_geyser_reserves_impl` — defer to md-track-worker.
+fn enqueue_deferred_hot_pool_reserve_retry(
     ctx: &MarketDataContext,
+    track_worker: &TrackWorkerSender,
     pool: Pubkey,
-    tx_hot_apply: bool,
+    reason: &'static str,
+    inc_pool_state_fill_metric: bool,
 ) {
     if !ctx.hot_pool_registry.is_hot_pool(pool) {
         return;
     }
-    let record_tx = |result: ironcrab::metrics::TxPoolAccountsHotApplyResult| {
-        if tx_hot_apply {
-            ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(result);
-        }
-    };
-    let record_account = |result: ironcrab::metrics::AccountPathHotVaultRegisterResult| {
-        if !tx_hot_apply {
-            ironcrab::metrics::inc_market_data_account_path_hot_vault_register_total(result);
-        }
-    };
-    let Some(_cached_state) = ctx.live_pool_cache.get(&pool) else {
-        record_tx(ironcrab::metrics::TxPoolAccountsHotApplyResult::CacheMiss);
-        return;
-    };
     if ctx.hot_pool_reserve_registration_satisfied(pool) {
-        record_tx(ironcrab::metrics::TxPoolAccountsHotApplyResult::RegisterAlreadyComplete);
-        record_account(
-            ironcrab::metrics::AccountPathHotVaultRegisterResult::RegisterAlreadyComplete,
-        );
+        let _ = ctx.maybe_clear_deferred_hot_pool_reserve_if_satisfied(pool);
         return;
     }
-    let had_new_keys = ctx.register_geyser_reserves_after_trade(pool);
-    if ctx.hot_pool_reserve_registration_satisfied(pool) {
-        if had_new_keys {
-            record_tx(ironcrab::metrics::TxPoolAccountsHotApplyResult::Register);
-            record_account(ironcrab::metrics::AccountPathHotVaultRegisterResult::Register);
+    if !ctx
+        .deferred_hot_pool_reserve_pins
+        .read()
+        .contains_key(&pool)
+    {
+        let pin = if ctx.hot_pool_registry.pool_has_momentum(pool) {
+            GeyserPinReason::MomentumActive
         } else {
-            record_tx(ironcrab::metrics::TxPoolAccountsHotApplyResult::RegisterAlreadyComplete);
-            record_account(
-                ironcrab::metrics::AccountPathHotVaultRegisterResult::RegisterAlreadyComplete,
-            );
-        }
-    } else {
-        record_tx(ironcrab::metrics::TxPoolAccountsHotApplyResult::RegisterIncomplete);
-        record_account(ironcrab::metrics::AccountPathHotVaultRegisterResult::RegisterIncomplete);
+            GeyserPinReason::ArbMultiDex
+        };
+        ctx.note_deferred_hot_pool_reserve_registration(pool, pin, reason);
     }
+    if inc_pool_state_fill_metric {
+        ironcrab::metrics::inc_market_data_deferred_retry_pool_state_fill_total();
+    }
+    let _ = track_worker_try_enqueue(
+        track_worker,
+        TrackWorkerCommand::RetryDeferredHotPoolReserves,
+    );
 }
 
 /// True when expected vault rows for a pool are already registered with sibling links.
@@ -2297,8 +2272,10 @@ fn address_book_now_ms() -> u64 {
 }
 
 /// Teil B: TX `pool_accounts` → unpinned address book or hot MASTER fill-missing + vault register.
+#[allow(clippy::too_many_arguments)]
 fn apply_tx_pool_accounts_for_hot_pool(
     ctx: &MarketDataContext,
+    track_worker: &TrackWorkerSender,
     pool: Pubkey,
     dex: DexType,
     base_mint: Pubkey,
@@ -2350,12 +2327,19 @@ fn apply_tx_pool_accounts_for_hot_pool(
     ironcrab::metrics::inc_market_data_tx_pool_accounts_hot_apply_total(
         ironcrab::metrics::TxPoolAccountsHotApplyResult::Upsert,
     );
-    register_geyser_reserves_for_hot_pool_with_completeness_metrics(ctx, pool, true);
+    enqueue_deferred_hot_pool_reserve_retry(
+        ctx,
+        track_worker,
+        pool,
+        "tx_pin_seed_hot_apply",
+        false,
+    );
 }
 
 /// PR237: cache-first vault/bin pubkeys for trade-path LRU touch (no full-map scan).
 fn note_trade_pool_lru_touches_from_cache(
     ctx: &MarketDataContext,
+    track_worker: &TrackWorkerSender,
     pool: Pubkey,
     scratch: &mut MdSidefxBurstScratch,
 ) {
@@ -2390,10 +2374,8 @@ fn note_trade_pool_lru_touches_from_cache(
         }
     }
 
-    // Sustained JetStream SLAVE refresh during WaitHotSet (I-MD-9): trade → cache-first publish.
-    if ctx.hot_pool_registry.is_hot_pool(pool) {
-        ctx.register_geyser_reserves_after_trade(pool);
-    }
+    // Vault/bin registration deferred to md-track-worker (I-4b); no tracked_* writes on sidefx thread.
+    enqueue_deferred_hot_pool_reserve_retry(ctx, track_worker, pool, "trade_lru_touch", false);
 }
 
 /// Phase1: pair reserve balances from snapshot vault views (no `tracked_vaults` map lock).
@@ -5985,6 +5967,8 @@ impl MarketDataContext {
     }
 
     /// PR-B: after a parsed swap trade — cache-first BalanceUpdated; vault/bin registration only for hot pools.
+    /// Sidefx/pin-seed must defer to md-track-worker; kept for unit tests and track-worker-adjacent helpers.
+    #[allow(dead_code)]
     fn register_geyser_reserves_after_trade(&self, pool: Pubkey) -> bool {
         let is_arb_only = self.hot_pool_registry.pool_has_arb(pool)
             && !self.hot_pool_registry.pool_has_momentum(pool);
@@ -15114,6 +15098,11 @@ mod pr_b_geyser_tracking_tests {
         spawn_noop_track_worker_sender(4096)
     }
 
+    fn drain_deferred_hot_pool_reserve_registrations(ctx: &MarketDataContext) {
+        let mut admission = test_admission_for(ctx);
+        ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
+    }
+
     fn test_inline_track_worker_sender(ctx: &Arc<MarketDataContext>) -> TrackWorkerSender {
         spawn_inline_track_worker_sender(Arc::clone(ctx), 4096)
     }
@@ -19619,15 +19608,17 @@ mod pr_b_geyser_tracking_tests {
         ctx.hot_pool_registry.pin_pool(base, pool);
         ctx.note_explicit_momentum_pool_admitted(pool);
 
+        let track_worker = test_noop_track_worker_sender();
         let mut scratch = MdSidefxBurstScratch::default();
-        note_trade_pool_lru_touches_from_cache(&ctx, pool, &mut scratch);
+        note_trade_pool_lru_touches_from_cache(&ctx, &track_worker, pool, &mut scratch);
+        drain_deferred_hot_pool_reserve_registrations(&ctx);
         assert!(
             !ctx.balance_updated_from_cache_skipped_for_live_feed(pool),
             "momentum-hot trade path must reach cache-first publish (not live-feed skip)"
         );
         assert!(
             ctx.tracked_vaults.read().contains_key(&coin),
-            "trade path must wire register_geyser_reserves_after_trade for momentum-hot pool"
+            "trade path must register vaults for momentum-hot pool after track-worker retry"
         );
     }
 
@@ -19661,8 +19652,10 @@ mod pr_b_geyser_tracking_tests {
         ctx.hot_pool_registry.pin_arb_pool(pool);
         ctx.note_explicit_arb_pool_admitted(pool);
 
+        let track_worker = test_noop_track_worker_sender();
         let mut scratch = MdSidefxBurstScratch::default();
-        note_trade_pool_lru_touches_from_cache(&ctx, pool, &mut scratch);
+        note_trade_pool_lru_touches_from_cache(&ctx, &track_worker, pool, &mut scratch);
+        drain_deferred_hot_pool_reserve_registrations(&ctx);
         assert!(
             ctx.tracked_vaults.read().contains_key(&coin),
             "arb-only hot pool must register vaults from trade path"
@@ -19848,7 +19841,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[test]
-    fn trade_path_source_wires_register_geyser_reserves_after_trade() {
+    fn trade_path_source_defers_reserve_registration_to_track_worker() {
         let src = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/bin/market_data.rs"
@@ -19862,12 +19855,44 @@ mod pr_b_geyser_tracking_tests {
             .unwrap_or(start + 4000);
         let block = &src[start..end];
         assert!(
-            block.contains("register_geyser_reserves_after_trade"),
-            "trade LRU touch must wire register_geyser_reserves_after_trade for hot pools"
+            !block.contains("register_geyser_reserves_impl"),
+            "trade LRU touch must not call register_geyser_reserves_impl on sidefx thread"
         );
         assert!(
-            block.contains("is_hot_pool"),
-            "trade register must be gated to hot pools (arb or momentum)"
+            !block.contains("tracked_vaults.write"),
+            "trade LRU touch must not write tracked_vaults on sidefx thread"
+        );
+        assert!(
+            block.contains("enqueue_deferred_hot_pool_reserve_retry"),
+            "trade LRU touch must defer reserve registration to track worker"
+        );
+    }
+
+    #[test]
+    fn tx_pin_seed_hot_apply_source_defers_reserve_registration_to_track_worker() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/market_data.rs"
+        ));
+        let start = src
+            .find("#[allow(clippy::too_many_arguments)]\nfn apply_tx_pool_accounts_for_hot_pool")
+            .expect("apply_tx_pool_accounts_for_hot_pool");
+        let end = src[start..]
+            .find("\n/// PR237: cache-first vault/bin pubkeys")
+            .map(|off| start + off)
+            .unwrap_or(start + 4000);
+        let block = &src[start..end];
+        assert!(
+            !block.contains("register_geyser_reserves_impl"),
+            "tx pin-seed hot apply must not call register_geyser_reserves_impl on sidefx thread"
+        );
+        assert!(
+            !block.contains("tracked_vaults.write"),
+            "tx pin-seed hot apply must not write tracked_vaults on sidefx thread"
+        );
+        assert!(
+            block.contains("enqueue_deferred_hot_pool_reserve_retry"),
+            "tx pin-seed hot apply must defer reserve registration to track worker"
         );
     }
 
@@ -19983,6 +20008,7 @@ mod pr_b_geyser_tracking_tests {
 
         apply_tx_pool_accounts_for_hot_pool(
             &ctx,
+            &test_noop_track_worker_sender(),
             pool,
             DexType::PumpFunAmm,
             base,
@@ -20016,6 +20042,7 @@ mod pr_b_geyser_tracking_tests {
 
         apply_tx_pool_accounts_for_hot_pool(
             &ctx,
+            &test_noop_track_worker_sender(),
             pool,
             DexType::PumpFunAmm,
             base,
@@ -20023,6 +20050,7 @@ mod pr_b_geyser_tracking_tests {
             &accounts,
             1,
         );
+        drain_deferred_hot_pool_reserve_registrations(&ctx);
 
         let state = ctx
             .live_pool_cache
@@ -20058,6 +20086,7 @@ mod pr_b_geyser_tracking_tests {
 
         apply_tx_pool_accounts_for_hot_pool(
             &ctx,
+            &test_noop_track_worker_sender(),
             pool,
             DexType::PumpFunAmm,
             base,
@@ -20065,6 +20094,7 @@ mod pr_b_geyser_tracking_tests {
             &accounts,
             1,
         );
+        drain_deferred_hot_pool_reserve_registrations(&ctx);
 
         assert!(ctx.live_pool_cache.get(&pool).is_some());
         assert!(ctx.tracked_vaults.read().contains_key(&base_vault));
@@ -20093,6 +20123,7 @@ mod pr_b_geyser_tracking_tests {
 
         apply_tx_pool_accounts_for_hot_pool(
             &ctx,
+            &test_noop_track_worker_sender(),
             pool,
             DexType::PumpFunAmm,
             base,
@@ -20100,6 +20131,7 @@ mod pr_b_geyser_tracking_tests {
             &accounts,
             1,
         );
+        drain_deferred_hot_pool_reserve_registrations(&ctx);
 
         assert_eq!(
             ctx.tracked_vaults.read()[&base_vault].pin,
@@ -20127,6 +20159,7 @@ mod pr_b_geyser_tracking_tests {
 
         apply_tx_pool_accounts_for_hot_pool(
             &ctx,
+            &test_noop_track_worker_sender(),
             pool,
             DexType::OrcaWhirlpool,
             base,
@@ -20134,6 +20167,7 @@ mod pr_b_geyser_tracking_tests {
             &accounts,
             1,
         );
+        drain_deferred_hot_pool_reserve_registrations(&ctx);
 
         let demand = ctx.snapshot_explicit_demand_pubkeys();
         assert!(demand.contains(&vault_a), "orca vault A must be explicit");
@@ -20190,6 +20224,7 @@ mod pr_b_geyser_tracking_tests {
         );
 
         host.register_geyser_reserves_after_hot_pool_cache_fill(pool);
+        drain_deferred_hot_pool_reserve_registrations(ctx.as_ref());
 
         let demand = ctx.snapshot_explicit_demand_pubkeys();
         assert!(demand.contains(&coin_vault));
@@ -20345,6 +20380,7 @@ mod pr_b_geyser_tracking_tests {
             tx_geyser_recv_at: Instant::now(),
         };
         md_sidefx_process_generic_dex_first_trade(&host, &job);
+        drain_deferred_hot_pool_reserve_registrations(ctx.as_ref());
 
         let vs = ctx.tracked_vaults.read();
         assert!(
@@ -20416,6 +20452,7 @@ mod pr_b_geyser_tracking_tests {
         let accounts = test_orca_whirlpool_tx_pool_accounts(pool, base, quote);
         apply_tx_pool_accounts_for_hot_pool(
             &ctx,
+            &test_noop_track_worker_sender(),
             pool,
             DexType::OrcaWhirlpool,
             base,
@@ -20454,6 +20491,7 @@ mod pr_b_geyser_tracking_tests {
 
         apply_tx_pool_accounts_for_hot_pool(
             &ctx,
+            &test_noop_track_worker_sender(),
             pool,
             DexType::OrcaWhirlpool,
             base,
@@ -20496,6 +20534,7 @@ mod pr_b_geyser_tracking_tests {
 
         apply_tx_pool_accounts_for_hot_pool(
             &ctx,
+            &test_noop_track_worker_sender(),
             pool,
             DexType::MeteoraDlmm,
             base,
@@ -20503,6 +20542,7 @@ mod pr_b_geyser_tracking_tests {
             &accounts,
             1,
         );
+        drain_deferred_hot_pool_reserve_registrations(&ctx);
 
         let state = ctx.live_pool_cache.get(&pool).expect("meteora layout seed");
         let CachedPoolState::Meteora(s) = state else {
@@ -20554,6 +20594,7 @@ mod pr_b_geyser_tracking_tests {
         let accounts = test_meteora_dlmm_tx_pool_accounts(pool);
         apply_tx_pool_accounts_for_hot_pool(
             &ctx,
+            &test_noop_track_worker_sender(),
             pool,
             DexType::MeteoraDlmm,
             base,

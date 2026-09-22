@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MD-TX-PIN-SEED-TRACKED-LOCK: md-tx-pin-seed drain stall durch synchrones `register_geyser_reserves_impl` auf Sidefx-Thread (I-4b)
+**Datum**: 2026-09-22  
+**Problem**: Prod SHA `fbe53b6` (post-#458): `md-tx-pin-seed` und `md-track-worker` kleben an `tracked_vaults`/`tracked_bin_arrays` RwLock — Pin-Seed-Queue 4096 Cap, `tx_pin_seed_sidefx_jobs_processed_total` frozen, `arb_pin_vault_register_ok_total=0`. #458 (First-Trade `debug!`) hielt, Root Cause war Lock-Order: `apply_tx_pool_accounts_for_hot_pool` und Trade-LRU riefen `register_geyser_reserves_after_trade` → `tracked_*.write()` auf dem Pin-Seed-/Account-Sidefx-OS-Thread.  
+**Fix**: Nach hot MASTER-Upsert nur `note_deferred_hot_pool_reserve_registration` + bounded `track_worker_try_enqueue(RetryDeferredHotPoolReserves)` (gleiches Pattern wie Cache-Fill-Defer). LRU-Touch und Account-Hot-Fill-Hook ebenfalls defer; Vault-Register nur noch auf `md-track-worker`. Source-Grep-Tests; Unit-Tests drainen RetryDeferred. Kein Cap-Bump (#19).  
+**Invarianten**: I-4b non-blocking sidefx; I-7 kein RPC; I-MD-5 hot/gepinnt only; kein neues TrackWorkerCommand.  
+**Dateien**: `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-TX-PIN-SEED-LOG-STORM: md-tx-pin-seed-Hang durch First-Trade PoolCreated INFO-Journal (I-4b)
 **Datum**: 2026-09-21  
 **Problem**: Prod SHA `7481b3ed` (Deploy A.54, Units seit 20.09. 16:25 CEST): TX-Handler lockstep; **`md-tx-pin-seed` drain't nicht** — `tx_pin_seed_sidefx_jobs_processed_total` ≈9 bei Queue **4096** (Cap), ~75k pin-seed drops, ~0 weiterer Fortschritt; `arb_pin_vault_register_ok_total=0`, Arb ~99,7 % `no_fresh_buy_quote`. Serieller Pin-Seed-Task kehrte nach wenigen Jobs nicht zurück (gleiche Klasse wie #453 Account-Sidefx / #450 TX-Handler): synchrones **`info!`** `"pump_amm pool discovered via first trade - emitting PoolCreated + DexPoolAccounts"` auf Hot-Pin-Seed-Pfad → journald → blockierendes I/O.  
