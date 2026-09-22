@@ -2019,10 +2019,6 @@ fn enqueue_deferred_hot_pool_reserve_retry(
     if !ctx.hot_pool_registry.is_hot_pool(pool) {
         return;
     }
-    if ctx.hot_pool_reserve_registration_satisfied(pool) {
-        let _ = ctx.maybe_clear_deferred_hot_pool_reserve_if_satisfied(pool);
-        return;
-    }
     if !ctx
         .deferred_hot_pool_reserve_pins
         .read()
@@ -5439,28 +5435,26 @@ impl MarketDataContext {
             .get_with_metadata(&pool)
             .map(|(_, slot, _)| slot)
             .unwrap_or(0);
-        let mut base_vault: Option<Pubkey> = None;
-        let mut quote_vault: Option<Pubkey> = None;
-        let mut base_balance = 0u64;
-        let mut quote_balance = 0u64;
-        {
-            let vaults = self.tracked_vaults.read();
-            for (vault_pk, info) in vaults.iter() {
-                if info.pool_address != pool {
-                    continue;
-                }
-                let balance = info.last_balance.load(std::sync::atomic::Ordering::Relaxed);
-                if info.is_base_vault {
-                    base_vault = Some(*vault_pk);
-                    base_balance = balance;
-                } else {
-                    quote_vault = Some(*vault_pk);
-                    quote_balance = balance;
-                }
-            }
-        }
-        let (Some(base_vault), Some(quote_vault)) = (base_vault, quote_vault) else {
+        let enable_dlmm = self.config.read().enable_meteora_dlmm;
+        let enable_meteora_cpmm = self.config.read().enable_meteora_cpmm;
+        let Some((base_vault, quote_vault)) =
+            expected_pool_vault_pubkeys_from_cache(&state, enable_meteora_cpmm, enable_dlmm)
+        else {
             return false;
+        };
+        let (base_balance, quote_balance) = {
+            let vaults = self.tracked_vaults.read();
+            let base_balance = vaults
+                .get(&base_vault)
+                .filter(|v| v.pool_address == pool)
+                .map(|v| v.last_balance.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(0);
+            let quote_balance = vaults
+                .get(&quote_vault)
+                .filter(|v| v.pool_address == pool)
+                .map(|v| v.last_balance.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(0);
+            (base_balance, quote_balance)
         };
         if base_balance == 0 && quote_balance == 0 {
             return false;
@@ -6914,33 +6908,52 @@ impl MarketDataContext {
         }
 
         let mut mints_changed = false;
+        let mut vault_pubkeys: Vec<Pubkey> = Vec::new();
+        if let Some((base_vault, quote_vault)) =
+            expected_pool_vault_pubkeys_from_cache(&state, enable_meteora_cpmm, enable_dlmm)
         {
+            vault_pubkeys.push(base_vault);
+            vault_pubkeys.push(quote_vault);
+        }
+        if let CachedPoolState::RaydiumAmm(s) = &state {
+            vault_pubkeys.push(s.coin_vault);
+            vault_pubkeys.push(s.pc_vault);
+        }
+        if !vault_pubkeys.is_empty() {
             let mut vaults = self.tracked_vaults.write();
-            for v in vaults.values_mut() {
-                if v.pool_address == pool && Self::geyser_pin_may_promote(v.pin, pin) {
-                    v.pinned = true;
-                    v.pin = Some(pin);
-                    vaults_changed = true;
+            for pk in vault_pubkeys {
+                if let Some(v) = vaults.get_mut(&pk) {
+                    if v.pool_address == pool && Self::geyser_pin_may_promote(v.pin, pin) {
+                        v.pinned = true;
+                        v.pin = Some(pin);
+                        vaults_changed = true;
+                    }
                 }
             }
         }
-        {
+        let bin_pubkeys = planned_meteora_dlmm_bin_pubkeys_for_cache(pool, &state);
+        if !bin_pubkeys.is_empty() {
             let mut bins = self.tracked_bin_arrays.write();
-            for b in bins.values_mut() {
-                if b.pool_address == pool && Self::geyser_pin_may_promote(b.pin, pin) {
-                    b.pinned = true;
-                    b.pin = Some(pin);
-                    bins_changed = true;
+            for pk in bin_pubkeys {
+                if let Some(b) = bins.get_mut(&pk) {
+                    if b.pool_address == pool && Self::geyser_pin_may_promote(b.pin, pin) {
+                        b.pinned = true;
+                        b.pin = Some(pin);
+                        bins_changed = true;
+                    }
                 }
             }
         }
-        {
+        let tick_pubkeys = planned_orca_tick_array_pubkeys_for_cache(pool, &state);
+        if !tick_pubkeys.is_empty() {
             let mut ticks = self.tracked_orca_tick_arrays.write();
-            for t in ticks.values_mut() {
-                if t.pool_address == pool && Self::geyser_pin_may_promote(t.pin, pin) {
-                    t.pinned = true;
-                    t.pin = Some(pin);
-                    orca_ticks_changed = true;
+            for pk in tick_pubkeys {
+                if let Some(t) = ticks.get_mut(&pk) {
+                    if t.pool_address == pool && Self::geyser_pin_may_promote(t.pin, pin) {
+                        t.pinned = true;
+                        t.pin = Some(pin);
+                        orca_ticks_changed = true;
+                    }
                 }
             }
         }
@@ -6956,10 +6969,6 @@ impl MarketDataContext {
         let needs_geyser_flush = matches!(&state, CachedPoolState::Meteora(_))
             && self.hot_pool_registry.is_hot_pool(pool)
             && !self.pool_meteora_dlmm_bins_geyser_registration_satisfied(pool, &state, None);
-
-        if self.hot_pool_registry.is_hot_pool(pool) {
-            self.refresh_tracked_membership_snapshot();
-        }
 
         vaults_changed || bins_changed || orca_ticks_changed || mints_changed || needs_geyser_flush
     }
@@ -17962,9 +17971,10 @@ mod pr_b_geyser_tracking_tests {
         );
         ctx.hot_pool_registry.pin_arb_pool(pool);
         assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        ctx.refresh_tracked_membership_snapshot();
         assert!(
             ctx.ingest_exec_hot_vault_contains(&coin),
-            "coin vault must be ExecHot immediately after arb pin register"
+            "coin vault must be ExecHot after arb pin register + membership refresh (track-worker push)"
         );
         assert!(
             ctx.ingest_exec_hot_vault_contains(&pc),
@@ -18030,9 +18040,10 @@ mod pr_b_geyser_tracking_tests {
         assert!(ctx.tracked_vaults.read().contains_key(&pc));
         ctx.hot_pool_registry.pin_arb_pool(pool);
         let _ = ctx.register_geyser_reserves_for_arb_active_pool(pool);
+        ctx.refresh_tracked_membership_snapshot();
         assert!(
             ctx.ingest_exec_hot_vault_contains(&coin),
-            "already-complete register after arb pin must still refresh ExecHot"
+            "already-complete register after arb pin must refresh ExecHot via coalesced membership snapshot"
         );
         assert!(ctx.ingest_exec_hot_vault_contains(&pc));
     }
@@ -18104,6 +18115,7 @@ mod pr_b_geyser_tracking_tests {
         );
         ctx.hot_pool_registry.pin_pool(base, pool);
         assert!(ctx.register_geyser_reserves_for_momentum_active_pool(pool));
+        ctx.refresh_tracked_membership_snapshot();
         assert!(ctx.ingest_exec_hot_vault_contains(&coin));
         assert!(ctx.ingest_exec_hot_vault_contains(&pc));
     }
@@ -19893,6 +19905,68 @@ mod pr_b_geyser_tracking_tests {
         assert!(
             block.contains("enqueue_deferred_hot_pool_reserve_retry"),
             "tx pin-seed hot apply must defer reserve registration to track worker"
+        );
+    }
+
+    #[test]
+    fn enqueue_deferred_hot_pool_reserve_retry_source_has_no_tracked_reads() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/market_data.rs"
+        ));
+        let start = src
+            .find("fn enqueue_deferred_hot_pool_reserve_retry")
+            .expect("enqueue_deferred_hot_pool_reserve_retry");
+        let end = src[start..]
+            .find("\n/// True when expected vault rows")
+            .map(|off| start + off)
+            .expect("enqueue_deferred_hot_pool_reserve_retry body end");
+        let block = &src[start..end];
+        for forbidden in [
+            "hot_pool_reserve_registration_satisfied",
+            "maybe_clear_deferred",
+            "tracked_vaults",
+            "tracked_bin_arrays",
+            "tracked_orca_tick_arrays",
+            "publish_hot_pool",
+            "try_touch_live_pool_reserve_basis",
+        ] {
+            assert!(
+                !block.contains(forbidden),
+                "enqueue_deferred_hot_pool_reserve_retry must not reference {forbidden} (I-4b sidefx)"
+            );
+        }
+        assert!(
+            block.contains("note_deferred_hot_pool_reserve_registration"),
+            "enqueue_deferred must note deferred registration"
+        );
+        assert!(
+            block.contains("RetryDeferredHotPoolReserves"),
+            "enqueue_deferred must enqueue RetryDeferredHotPoolReserves"
+        );
+    }
+
+    #[test]
+    fn register_geyser_reserves_impl_source_no_snapshot_or_full_map_scan() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/market_data.rs"
+        ));
+        let start = src
+            .find("fn register_geyser_reserves_impl")
+            .expect("register_geyser_reserves_impl");
+        let end = src[start..]
+            .find("\n    fn geyser_pin_may_promote")
+            .map(|off| start + off)
+            .expect("register_geyser_reserves_impl body end");
+        let block = &src[start..end];
+        assert!(
+            !block.contains("refresh_tracked_membership_snapshot"),
+            "register_geyser_reserves_impl must not refresh membership snapshot"
+        );
+        assert!(
+            !block.contains("values_mut()"),
+            "register_geyser_reserves_impl must not scan entire tracked maps via values_mut"
         );
     }
 
