@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MD-SIDEFX-TRACKED-READ: Sidefx `tracked_*`.read + `register_impl` Full-Map-Lock nach #459 (I-4b)
+**Datum**: 2026-09-22  
+**Problem**: Prod SHA `e00f044` (post-#459): Pin-Seed/Track-Worker/md-state/Account-Sidefx im Futex auf `tracked_vaults`/`tracked_bin_arrays`/`tracked_orca_tick_arrays`; Snapshot-Age eingefroren, `vault_register_ok=0`. #459 entfernte nur Sidefx-**Writes**; `enqueue_deferred_hot_pool_reserve_retry` las weiter `tracked_*` (Satisfied/Touch) und `register_geyser_reserves_impl` scannte alle Maps unter `write()` plus `refresh_tracked_membership_snapshot`.  
+**Fix**: Sidefx-Defer nur `note_deferred` + `RetryDeferredHotPoolReserves`; Satisfied/Clear/Publish nur auf `md-track-worker`. `register_geyser_reserves_impl`: Pin-Promote per Cache-PDAs/`get_mut`, kein `values_mut()`-Scan, kein Snapshot-Refresh in `register_impl`. `try_touch_live_pool_reserve_basis_for_hot_pool`: zwei Vault-Pubkeys aus Cache, kein Map-Iter. Source-Grep-Tests.  
+**Invarianten**: I-4b; I-7 kein RPC; #459-Pattern erweitert (kein `tracked_*` auf Sidefx).  
+**Dateien**: `src/bin/market_data.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-TX-PIN-SEED-TRACKED-LOCK: md-tx-pin-seed drain stall durch synchrones `register_geyser_reserves_impl` auf Sidefx-Thread (I-4b)
 **Datum**: 2026-09-22  
 **Problem**: Prod SHA `fbe53b6` (post-#458): `md-tx-pin-seed` und `md-track-worker` kleben an `tracked_vaults`/`tracked_bin_arrays` RwLock — Pin-Seed-Queue 4096 Cap, `tx_pin_seed_sidefx_jobs_processed_total` frozen, `arb_pin_vault_register_ok_total=0`. #458 (First-Trade `debug!`) hielt, Root Cause war Lock-Order: `apply_tx_pool_accounts_for_hot_pool` und Trade-LRU riefen `register_geyser_reserves_after_trade` → `tracked_*.write()` auf dem Pin-Seed-/Account-Sidefx-OS-Thread.  
