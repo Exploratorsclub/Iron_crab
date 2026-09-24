@@ -7664,8 +7664,8 @@ impl MarketDataContext {
                     }
                 }
             }
+            let mut removed_ticks = false;
             {
-                let mut removed_ticks = false;
                 let mut map = self.tracked_orca_tick_arrays.write();
                 for pda in &tick_keys {
                     if map.remove(pda).is_some() {
@@ -7673,15 +7673,20 @@ impl MarketDataContext {
                         changed = true;
                     }
                 }
-                if removed_ticks {
-                    self.orca_registered_tick_array_start.write().remove(&pool);
-                    self.refresh_tracked_orca_tick_arrays_gauges();
-                }
-                let watch_keys: Vec<Pubkey> = map.keys().copied().collect();
-                let _ = self.tracked_orca_tick_arrays_tx.send(watch_keys);
             }
-            for pda in &tick_keys {
-                self.pool_tracked_legs_remove_orca_tick(pool, *pda);
+            if removed_ticks {
+                self.orca_registered_tick_array_start.write().remove(&pool);
+                self.refresh_tracked_orca_tick_arrays_gauges();
+                let watch_keys: Vec<Pubkey> = self
+                    .tracked_orca_tick_arrays
+                    .read()
+                    .keys()
+                    .copied()
+                    .collect();
+                let _ = self.tracked_orca_tick_arrays_tx.send(watch_keys);
+                for pda in &tick_keys {
+                    self.pool_tracked_legs_remove_orca_tick(pool, *pda);
+                }
             }
             if let Some(state) = self.live_pool_cache.get(&pool) {
                 if let Some((leg_a, leg_b)) = pool_mints_for_geyser_explicit_tracking(&state) {
@@ -20217,6 +20222,34 @@ mod pr_b_geyser_tracking_tests {
             assert!(
                 !block.contains("values_mut()"),
                 "{fn_name} must not full-scan tracked maps via values_mut (I-4b)"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_arb_geyser_reserves_source_drops_orca_tick_write_guard_before_gauge_legs() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/market_data.rs"
+        ));
+        let block = source_fn_body(src, "fn clear_arb_geyser_reserves_for_pool");
+        let guard_line = "let mut map = self.tracked_orca_tick_arrays.write();";
+        let guard_pos = block
+            .find(guard_line)
+            .unwrap_or_else(|| panic!("missing {guard_line}"));
+        let after_guard = &block[guard_pos..];
+        let scope_end = after_guard
+            .find("\n            if removed_ticks")
+            .unwrap_or_else(|| panic!("missing orca tick write scope close"));
+        let between = &after_guard[..scope_end];
+        for forbidden in [
+            "refresh_tracked_orca_tick_arrays_gauges",
+            "pool_tracked_legs_remove",
+            ".keys()",
+        ] {
+            assert!(
+                !between.contains(forbidden),
+                "clear_arb must not call {forbidden} while holding tracked_orca_tick_arrays.write()"
             );
         }
     }
