@@ -692,6 +692,10 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
         if changed {
             let _ = track_worker_try_enqueue(
                 &self.track_worker,
+                TrackWorkerCommand::RetryDeferredHotPoolReserves,
+            );
+            let _ = track_worker_try_enqueue(
+                &self.track_worker,
                 TrackWorkerCommand::ScheduleGeyserPushDebounced,
             );
         }
@@ -701,6 +705,10 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
     fn maybe_refresh_arb_orca_tick_window(&self, pool: Pubkey, new_tick: i32) -> bool {
         let changed = self.ctx.maybe_refresh_arb_orca_tick_window(pool, new_tick);
         if changed {
+            let _ = track_worker_try_enqueue(
+                &self.track_worker,
+                TrackWorkerCommand::RetryDeferredHotPoolReserves,
+            );
             let _ = track_worker_try_enqueue(
                 &self.track_worker,
                 TrackWorkerCommand::ScheduleGeyserPushDebounced,
@@ -4278,27 +4286,48 @@ impl MarketDataContext {
                 }
             }
             GeyserPruneMap::Vaults => {
-                let mut vaults = self.tracked_vaults.write();
-                for pk in batch {
-                    if let Some(info) = vaults.remove(pk) {
-                        self.pool_tracked_legs_remove_vault(info.pool_address, *pk);
+                let removed: Vec<(Pubkey, Pubkey)> = {
+                    let mut vaults = self.tracked_vaults.write();
+                    let mut removed = Vec::new();
+                    for pk in batch {
+                        if let Some(info) = vaults.remove(pk) {
+                            removed.push((info.pool_address, *pk));
+                        }
                     }
+                    removed
+                };
+                for (pool_addr, pk) in removed {
+                    self.pool_tracked_legs_remove_vault(pool_addr, pk);
                 }
             }
             GeyserPruneMap::Bins => {
-                let mut bins = self.tracked_bin_arrays.write();
-                for pk in batch {
-                    if let Some(info) = bins.remove(pk) {
-                        self.pool_tracked_legs_remove_bin(info.pool_address, *pk);
+                let removed: Vec<(Pubkey, Pubkey)> = {
+                    let mut bins = self.tracked_bin_arrays.write();
+                    let mut removed = Vec::new();
+                    for pk in batch {
+                        if let Some(info) = bins.remove(pk) {
+                            removed.push((info.pool_address, *pk));
+                        }
                     }
+                    removed
+                };
+                for (pool_addr, pk) in removed {
+                    self.pool_tracked_legs_remove_bin(pool_addr, pk);
                 }
             }
             GeyserPruneMap::OrcaTicks => {
-                let mut ticks = self.tracked_orca_tick_arrays.write();
-                for pk in batch {
-                    if let Some(info) = ticks.remove(pk) {
-                        self.pool_tracked_legs_remove_orca_tick(info.pool_address, *pk);
+                let removed: Vec<(Pubkey, Pubkey)> = {
+                    let mut ticks = self.tracked_orca_tick_arrays.write();
+                    let mut removed = Vec::new();
+                    for pk in batch {
+                        if let Some(info) = ticks.remove(pk) {
+                            removed.push((info.pool_address, *pk));
+                        }
                     }
+                    removed
+                };
+                for (pool_addr, pk) in removed {
+                    self.pool_tracked_legs_remove_orca_tick(pool_addr, pk);
                 }
             }
             GeyserPruneMap::Wallets => {
@@ -4710,6 +4739,49 @@ impl MarketDataContext {
         out
     }
 
+    /// Vault + DLMM bin PDAs for one pool (cache-first; `pool_tracked_legs` fallback when cache miss).
+    fn pool_geyser_reserve_leg_pubkeys_for_clear(
+        &self,
+        pool: Pubkey,
+    ) -> (Vec<Pubkey>, Vec<Pubkey>) {
+        if let Some(state) = self.live_pool_cache.get(&pool) {
+            let cfg = self.config.read();
+            let mut vaults = Vec::new();
+            if let Some((base, quote)) = expected_pool_vault_pubkeys_from_cache(
+                &state,
+                cfg.enable_meteora_cpmm,
+                cfg.enable_meteora_dlmm,
+            ) {
+                vaults.push(base);
+                vaults.push(quote);
+            }
+            let bins = planned_meteora_dlmm_bin_pubkeys_for_cache(pool, &state);
+            return (vaults, bins);
+        }
+        let legs = self.pool_tracked_legs.read();
+        if let Some(entry) = legs.get(&pool) {
+            return (entry.vaults.clone(), entry.bin_arrays.clone());
+        }
+        (Vec::new(), Vec::new())
+    }
+
+    fn pool_geyser_orca_tick_pubkeys_for_clear(&self, pool: Pubkey) -> Vec<Pubkey> {
+        let from_legs = self
+            .pool_tracked_legs
+            .read()
+            .get(&pool)
+            .map(|e| e.orca_tick_arrays.clone())
+            .unwrap_or_default();
+        if let Some(state) = self.live_pool_cache.get(&pool) {
+            let mut keys: HashSet<Pubkey> = planned_orca_tick_array_pubkeys_for_cache(pool, &state)
+                .into_iter()
+                .collect();
+            keys.extend(from_legs);
+            return keys.into_iter().collect();
+        }
+        from_legs
+    }
+
     /// Pool account (bonding curve / whirlpool / lbPair / Raydium AMM) must be in the last Geyser
     /// explicit flush **or** admitted pending flush while layout-only MASTER rows still need decode.
     fn pool_pumpfun_bonding_curve_registration_satisfied(
@@ -4782,7 +4854,25 @@ impl MarketDataContext {
     /// True when all vault/bin pubkeys for this pool were included in the last Geyser sync flush.
     #[cfg_attr(not(test), allow(dead_code))]
     fn pool_has_live_vault_geyser_feed(&self, pool: Pubkey) -> bool {
-        let assets = self.pool_explicit_vault_bin_pubkeys(pool);
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return false;
+        };
+        let cfg = self.config.read();
+        let enable_meteora_cpmm = cfg.enable_meteora_cpmm;
+        let enable_dlmm = cfg.enable_meteora_dlmm;
+        let mut assets: Vec<Pubkey> = Vec::new();
+        if let Some((base_vault, quote_vault)) =
+            expected_pool_vault_pubkeys_from_cache(&state, enable_meteora_cpmm, enable_dlmm)
+        {
+            assets.push(base_vault);
+            assets.push(quote_vault);
+        }
+        assets.extend(planned_meteora_dlmm_bin_pubkeys_for_cache(pool, &state));
+        assets.extend(planned_orca_tick_array_pubkeys_for_cache(pool, &state));
+        if self.hot_pool_registry.is_hot_pool(pool) && matches!(state, CachedPoolState::PumpFun(_))
+        {
+            assets.push(pool);
+        }
         if assets.is_empty() {
             return false;
         }
@@ -6711,19 +6801,26 @@ impl MarketDataContext {
         let w = spacing * TICK_ARRAY_SIZE;
         let planned = planned_orca_tick_array_pubkeys(&pool, tick_current_index, spacing);
         let starts = [s0 - 2 * w, s0 - w, s0, s0 + w, s0 + 2 * w];
+        let stale: Vec<Pubkey> = self
+            .pool_tracked_legs
+            .read()
+            .get(&pool)
+            .map(|legs| {
+                legs.orca_tick_arrays
+                    .iter()
+                    .filter(|pda| !planned.contains(pda))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut changed = false;
         let mut new_pdas: Vec<Pubkey> = Vec::new();
         {
             let mut map = self.tracked_orca_tick_arrays.write();
-            let stale: Vec<Pubkey> = map
-                .iter()
-                .filter(|(pda, info)| info.pool_address == pool && !planned.contains(pda))
-                .map(|(pda, _)| *pda)
-                .collect();
-            for pda in stale {
-                map.remove(&pda);
-                self.pool_tracked_legs_remove_orca_tick(pool, pda);
-                changed = true;
+            for pda in &stale {
+                if map.remove(pda).is_some() {
+                    changed = true;
+                }
             }
             for (pda, start_idx) in planned.iter().zip(starts.iter()) {
                 use std::collections::hash_map::Entry;
@@ -6750,6 +6847,9 @@ impl MarketDataContext {
                     }
                 }
             }
+        }
+        for pda in &stale {
+            self.pool_tracked_legs_remove_orca_tick(pool, *pda);
         }
         for pda in new_pdas {
             self.pool_tracked_legs_note_orca_tick(pool, pda);
@@ -6791,6 +6891,7 @@ impl MarketDataContext {
         pdas.iter().all(|pda| map.contains_key(pda))
     }
 
+    #[allow(dead_code)]
     fn maybe_refresh_hot_orca_tick_window(&self, pool: Pubkey, new_tick: i32) -> bool {
         let Some(pin) = self.geyser_pin_for_hot_dlmm_pool(pool) else {
             return false;
@@ -6820,10 +6921,39 @@ impl MarketDataContext {
     }
 
     fn maybe_refresh_arb_orca_tick_window(&self, pool: Pubkey, new_tick: i32) -> bool {
-        self.maybe_refresh_hot_orca_tick_window(pool, new_tick)
+        if !self.hot_pool_registry.pool_has_arb(pool) {
+            return false;
+        }
+        let Some(pin) = self.geyser_pin_for_hot_dlmm_pool(pool) else {
+            return false;
+        };
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return false;
+        };
+        let CachedPoolState::Orca(s) = &state else {
+            return false;
+        };
+        if !self.config.read().enable_orca || s.tick_spacing == 0 {
+            return false;
+        }
+        let spacing = s.tick_spacing as i32;
+        let new_start =
+            ironcrab::solana::dex::orca_tick_array::get_tick_array_start_index(new_tick, spacing);
+        let prev = self
+            .orca_registered_tick_array_start
+            .read()
+            .get(&pool)
+            .copied();
+        if prev == Some(new_start) {
+            return false;
+        }
+        self.note_deferred_hot_pool_reserve_registration(pool, pin, "arb_orca_tick_drift");
+        // md-account-sidefx adapter enqueues TrackWorkerCommand::RetryDeferredHotPoolReserves.
+        true
     }
 
     /// C1d/C1g: when hot-pool DLMM `active_id` drifts or bin window is untracked, register PDAs (Mom + Arb shared).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn maybe_refresh_hot_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool {
         let Some(pin) = self.geyser_pin_for_hot_dlmm_pool(pool) else {
             return false;
@@ -6848,9 +6978,30 @@ impl MarketDataContext {
         self.register_meteora_dlmm_bin_arrays(pool, new_active_id, s.bin_step, pin, Instant::now())
     }
 
-    /// Fix B / C1d: arb-pinned DLMM `active_id` drift — delegates to shared hot-pool refresh.
+    /// Fix B / C1d: arb-pinned DLMM `active_id` drift — defer register to md-track-worker (I-4b).
     fn maybe_refresh_arb_dlmm_bin_window(&self, pool: Pubkey, new_active_id: i32) -> bool {
-        self.maybe_refresh_hot_dlmm_bin_window(pool, new_active_id)
+        if !self.hot_pool_registry.pool_has_arb(pool) {
+            return false;
+        }
+        let Some(pin) = self.geyser_pin_for_hot_dlmm_pool(pool) else {
+            return false;
+        };
+        let Some(state) = self.live_pool_cache.get(&pool) else {
+            return false;
+        };
+        let CachedPoolState::Meteora(s) = &state else {
+            return false;
+        };
+        if !self.config.read().enable_meteora_dlmm || !s.dlmm_bin_params_account_seeded {
+            return false;
+        }
+        let prev = self.dlmm_registered_active_id.read().get(&pool).copied();
+        if prev == Some(new_active_id) {
+            return false;
+        }
+        self.note_deferred_hot_pool_reserve_registration(pool, pin, "arb_dlmm_active_id_drift");
+        // md-account-sidefx adapter enqueues TrackWorkerCommand::RetryDeferredHotPoolReserves.
+        true
     }
 
     fn register_geyser_reserves_impl(&self, pool: Pubkey, pin: GeyserPinReason) -> bool {
@@ -7238,23 +7389,30 @@ impl MarketDataContext {
             self.demote_master_layout_to_address_book(pool);
             self.release_pool_consumer_group(admission, pool, ExplicitConsumer::MomentumPosition);
             self.release_pool_consumer_group(admission, pool, ExplicitConsumer::Momentum);
+            let (vault_keys, bin_keys) = self.pool_geyser_reserve_leg_pubkeys_for_clear(pool);
             {
                 let mut vaults = self.tracked_vaults.write();
-                for v in vaults.values_mut() {
-                    if v.pool_address == pool && v.pin == Some(GeyserPinReason::MomentumActive) {
-                        v.pin = None;
-                        v.pinned = false;
-                        changed = true;
+                for pk in vault_keys {
+                    if let Some(v) = vaults.get_mut(&pk) {
+                        if v.pool_address == pool && v.pin == Some(GeyserPinReason::MomentumActive)
+                        {
+                            v.pin = None;
+                            v.pinned = false;
+                            changed = true;
+                        }
                     }
                 }
             }
             {
                 let mut bins = self.tracked_bin_arrays.write();
-                for b in bins.values_mut() {
-                    if b.pool_address == pool && b.pin == Some(GeyserPinReason::MomentumActive) {
-                        b.pin = None;
-                        b.pinned = false;
-                        changed = true;
+                for pk in bin_keys {
+                    if let Some(b) = bins.get_mut(&pk) {
+                        if b.pool_address == pool && b.pin == Some(GeyserPinReason::MomentumActive)
+                        {
+                            b.pin = None;
+                            b.pinned = false;
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -7480,51 +7638,50 @@ impl MarketDataContext {
             && !self.hot_pool_registry.pool_has_any_pin(pool)
         {
             self.demote_master_layout_to_address_book(pool);
+            let (vault_keys, bin_keys) = self.pool_geyser_reserve_leg_pubkeys_for_clear(pool);
+            let tick_keys = self.pool_geyser_orca_tick_pubkeys_for_clear(pool);
             {
                 let mut vaults = self.tracked_vaults.write();
-                for v in vaults.values_mut() {
-                    if v.pool_address == pool && v.pin == Some(GeyserPinReason::ArbMultiDex) {
-                        v.pin = None;
-                        v.pinned = false;
-                        changed = true;
+                for pk in vault_keys {
+                    if let Some(v) = vaults.get_mut(&pk) {
+                        if v.pool_address == pool && v.pin == Some(GeyserPinReason::ArbMultiDex) {
+                            v.pin = None;
+                            v.pinned = false;
+                            changed = true;
+                        }
                     }
                 }
             }
             {
                 let mut bins = self.tracked_bin_arrays.write();
-                for b in bins.values_mut() {
-                    if b.pool_address == pool && b.pin == Some(GeyserPinReason::ArbMultiDex) {
-                        b.pin = None;
-                        b.pinned = false;
-                        changed = true;
+                for pk in bin_keys {
+                    if let Some(b) = bins.get_mut(&pk) {
+                        if b.pool_address == pool && b.pin == Some(GeyserPinReason::ArbMultiDex) {
+                            b.pin = None;
+                            b.pinned = false;
+                            changed = true;
+                        }
                     }
                 }
             }
             {
-                let remove: Vec<Pubkey> = self
-                    .tracked_orca_tick_arrays
-                    .read()
-                    .iter()
-                    .filter(|(_, t)| t.pool_address == pool)
-                    .map(|(pda, _)| *pda)
-                    .collect();
-                if !remove.is_empty() {
-                    let mut map = self.tracked_orca_tick_arrays.write();
-                    for pda in remove {
-                        map.remove(&pda);
-                        self.pool_tracked_legs_remove_orca_tick(pool, pda);
+                let mut removed_ticks = false;
+                let mut map = self.tracked_orca_tick_arrays.write();
+                for pda in &tick_keys {
+                    if map.remove(pda).is_some() {
+                        removed_ticks = true;
                         changed = true;
                     }
+                }
+                if removed_ticks {
                     self.orca_registered_tick_array_start.write().remove(&pool);
                     self.refresh_tracked_orca_tick_arrays_gauges();
                 }
-                let watch_keys: Vec<Pubkey> = self
-                    .tracked_orca_tick_arrays
-                    .read()
-                    .keys()
-                    .copied()
-                    .collect();
+                let watch_keys: Vec<Pubkey> = map.keys().copied().collect();
                 let _ = self.tracked_orca_tick_arrays_tx.send(watch_keys);
+            }
+            for pda in &tick_keys {
+                self.pool_tracked_legs_remove_orca_tick(pool, *pda);
             }
             if let Some(state) = self.live_pool_cache.get(&pool) {
                 if let Some((leg_a, leg_b)) = pool_mints_for_geyser_explicit_tracking(&state) {
@@ -19970,6 +20127,127 @@ mod pr_b_geyser_tracking_tests {
         );
     }
 
+    fn source_fn_body<'a>(src: &'a str, fn_name: &str) -> &'a str {
+        let start = src
+            .find(fn_name)
+            .unwrap_or_else(|| panic!("missing fn {fn_name}"));
+        let after_sig = src[start..]
+            .find('{')
+            .map(|off| start + off)
+            .unwrap_or_else(|| panic!("missing body for {fn_name}"));
+        let mut depth = 0i32;
+        let mut end = after_sig;
+        for (i, ch) in src[after_sig..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = after_sig + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &src[after_sig..end]
+    }
+
+    #[test]
+    fn pool_has_live_vault_geyser_feed_source_has_no_tracked_map_reads() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/market_data.rs"
+        ));
+        let block = source_fn_body(src, "fn pool_has_live_vault_geyser_feed");
+        for forbidden in [
+            "pool_explicit_vault_bin_pubkeys",
+            "tracked_vaults",
+            "tracked_bin_arrays",
+            "tracked_orca_tick_arrays",
+        ] {
+            assert!(
+                !block.contains(forbidden),
+                "pool_has_live_vault_geyser_feed must not reference {forbidden} (I-4b sidefx)"
+            );
+        }
+    }
+
+    #[test]
+    fn maybe_refresh_arb_windows_source_defers_without_tracked_register() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/market_data.rs"
+        ));
+        for (fn_name, label) in [
+            ("fn maybe_refresh_arb_dlmm_bin_window", "dlmm"),
+            ("fn maybe_refresh_arb_orca_tick_window", "orca"),
+        ] {
+            let block = source_fn_body(src, fn_name);
+            for forbidden in [
+                "register_meteora_dlmm_bin_arrays",
+                "register_orca_tick_arrays",
+                "tracked_vaults",
+                "tracked_bin_arrays",
+                "tracked_orca_tick_arrays",
+            ] {
+                assert!(
+                    !block.contains(forbidden),
+                    "{label} refresh must not reference {forbidden} (I-4b sidefx)"
+                );
+            }
+            assert!(
+                block.contains("RetryDeferredHotPoolReserves"),
+                "{label} refresh must defer via RetryDeferredHotPoolReserves (I-4b)"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_geyser_reserves_for_pool_source_has_no_values_mut_scan() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/market_data.rs"
+        ));
+        for fn_name in [
+            "fn clear_arb_geyser_reserves_for_pool",
+            "fn clear_momentum_geyser_reserves_for_active_entry",
+        ] {
+            let block = source_fn_body(src, fn_name);
+            assert!(
+                !block.contains("values_mut()"),
+                "{fn_name} must not full-scan tracked maps via values_mut (I-4b)"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_prune_batch_source_drops_tracked_map_guard_before_pool_tracked_legs() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/bin/market_data.rs"
+        ));
+        let block = source_fn_body(src, "fn apply_prune_batch");
+        for map_guard in [
+            "let mut vaults = self.tracked_vaults.write();",
+            "let mut bins = self.tracked_bin_arrays.write();",
+            "let mut ticks = self.tracked_orca_tick_arrays.write();",
+        ] {
+            let guard_pos = block
+                .find(map_guard)
+                .unwrap_or_else(|| panic!("missing guard {map_guard}"));
+            let legs_pos = block[guard_pos..]
+                .find("pool_tracked_legs_remove")
+                .map(|off| guard_pos + off)
+                .expect("pool_tracked_legs_remove after guard");
+            let between = &block[guard_pos..legs_pos];
+            assert!(
+                between.contains("};"),
+                "apply_prune_batch must drop {map_guard} before pool_tracked_legs_remove_*"
+            );
+        }
+    }
+
     #[test]
     fn register_geyser_reserves_after_trade_skips_non_hot_pool() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -22337,6 +22615,26 @@ mod pr_b_geyser_tracking_tests {
         assert_eq!(ctx.tracked_bin_arrays.read().len(), before);
 
         assert!(ctx.maybe_refresh_arb_dlmm_bin_window(pool, 500));
+        ctx.live_pool_cache.upsert(
+            pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: Pubkey::new_unique(),
+                token_y_mint: sol,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: 500,
+                bin_step: 15,
+                reserve_x_balance: Some(1),
+                reserve_y_balance: Some(1),
+                dlmm_bin_params_account_seeded: true,
+            }),
+            2,
+        );
+        let mut admission = test_admission_for(&ctx);
+        assert!(
+            ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission),
+            "active_id drift must defer to track worker for bin registration"
+        );
         assert!(
             ctx.tracked_bin_arrays.read().len() >= before,
             "new active_id must register additional bin-array PDAs"
@@ -22403,6 +22701,11 @@ mod pr_b_geyser_tracking_tests {
         ctx.live_pool_cache
             .upsert(pool, test_orca_whirlpool_cached_state(new_tick, 64), 2);
         assert!(ctx.maybe_refresh_arb_orca_tick_window(pool, new_tick));
+        let mut admission = test_admission_for(&ctx);
+        assert!(
+            ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission),
+            "tick drift must defer to track worker for tick-array registration"
+        );
         let new_start = get_tick_array_start_index(new_tick, 64);
         assert_eq!(
             ctx.orca_registered_tick_array_start.read().get(&pool),
