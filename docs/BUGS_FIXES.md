@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-MD-SIDEFX-CLEAR-REST-I4B: Sidefx-Restpfade + Clear ohne Full-Map-Scan nach #460 (I-4b)
+**Datum**: 2026-09-24  
+**Problem**: Prod SHA `ff489b4` (post-#460): Vier Threads in `RawRwLock::lock_shared_slow` auf `tracked_*`; Queues am Cap, `vault_register_ok=0`. #460 befreite nur `enqueue_deferred_hot_pool_reserve_retry` von `tracked_*`-Reads; Rest: `pool_has_live_vault_geyser_feed` → `pool_explicit_vault_bin_pubkeys`, Pin-Seed `hot_pool_reserve_registration_satisfied*`, Account-Sidefx `maybe_refresh_arb_*` → `register_*`, Track-Worker `clear_*` via `values_mut()` über ganze Maps, `apply_prune_batch`/`register_orca_tick_arrays` Lock-Order mit `pool_tracked_legs` unter `tracked_*.write()`.  
+**Fix**: Cache-first `pool_has_live_vault_geyser_feed` (`expected_pool_vault_pubkeys_from_cache`, `planned_*_for_cache`, nur `last_synced_explicit_pubkeys`). `maybe_refresh_arb_*` nur `note_deferred` + Adapter `RetryDeferredHotPoolReserves` (kein `register_*` auf Sidefx). `clear_arb`/`clear_momentum` demoten per Pool-Key-Listen (`get_mut`/`remove`), kein `values_mut()`-Scan. `register_orca_tick_arrays`/`apply_prune_batch`: `pool_tracked_legs_*` erst nach Drop des Map-Guards; Stale-Orca-Keys aus `pool_tracked_legs`. Sidefx `handlers`: kein `hot_pool_reserve_registration_satisfied` auf Repeat-Trade. Source-Grep-Tests.  
+**Invarianten**: I-4b; I-7 kein RPC; #459/#460-Defer-Pattern; kein Cap-Bump, kein neues TrackWorkerCommand.  
+**Dateien**: `src/bin/market_data.rs`, `src/market_data/sidefx/handlers.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-SIDEFX-TRACKED-READ: Sidefx `tracked_*`.read + `register_impl` Full-Map-Lock nach #459 (I-4b)
 **Datum**: 2026-09-22  
 **Problem**: Prod SHA `e00f044` (post-#459): Pin-Seed/Track-Worker/md-state/Account-Sidefx im Futex auf `tracked_vaults`/`tracked_bin_arrays`/`tracked_orca_tick_arrays`; Snapshot-Age eingefroren, `vault_register_ok=0`. #459 entfernte nur Sidefx-**Writes**; `enqueue_deferred_hot_pool_reserve_retry` las weiter `tracked_*` (Satisfied/Touch) und `register_geyser_reserves_impl` scannte alle Maps unter `write()` plus `refresh_tracked_membership_snapshot`.  

@@ -1242,28 +1242,15 @@ pub fn md_sidefx_process_generic_dex_first_trade(
     }
     let is_first_trade = host.known_trade_dex_pools_insert(*pool_address);
     if !is_first_trade {
-        if !host.is_hot_pool(pool_address) {
-            host.apply_tx_pool_accounts_for_hot_pool(
-                *pool_address,
-                *dex,
-                *mint,
-                *quote_mint,
-                pool_accounts,
-                *slot,
-            );
-            return;
-        }
-        if host.hot_pool_reserve_registration_satisfied(*pool_address) {
-            host.apply_tx_pool_accounts_for_hot_pool(
-                *pool_address,
-                *dex,
-                *mint,
-                *quote_mint,
-                pool_accounts,
-                *slot,
-            );
-            return;
-        }
+        host.apply_tx_pool_accounts_for_hot_pool(
+            *pool_address,
+            *dex,
+            *mint,
+            *quote_mint,
+            pool_accounts,
+            *slot,
+        );
+        return;
     }
     let accounts_event = MarketEvent::new(
         "market-data",
