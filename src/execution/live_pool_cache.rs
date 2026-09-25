@@ -934,39 +934,33 @@ impl LivePoolCache {
                 orca.token_b_program = self.get_mint_program(&orca.token_mint_b);
             }
         }
-        match self.pools.entry(pool) {
-            Entry::Vacant(v) => {
-                let stored_slot = if slot == 0 { 0 } else { slot };
-                self.register_vaults(&pool, &state);
-                v.insert(CacheEntry::new(state, stored_slot));
-                self.updates_total.fetch_add(1, Ordering::Relaxed);
-                true
+
+        let (entry_to_store, prepared_as_insert) = if let Some(prev) = self.pools.get(&pool) {
+            if slot > 0 && slot < prev.last_seen_slot {
+                return false;
             }
-            Entry::Occupied(mut o) => {
-                let prev = o.get();
-                if slot > 0 && slot < prev.last_seen_slot {
-                    return false;
-                }
-                state = merge_account_parse_preserves_existing(&prev.state, state, slot);
-                let refresh_age = pool_state_has_reserve_basis(&state);
-                let new_fingerprint = pool_state_material_fingerprint(&state);
-                let material_changed =
-                    new_fingerprint != pool_state_material_fingerprint(&prev.state);
-                let stored_slot = if slot == 0 {
-                    prev.slot
-                } else if material_changed {
-                    slot
-                } else {
-                    prev.slot
-                };
-                let last_seen_slot = if slot > 0 {
-                    prev.last_seen_slot.max(slot)
-                } else {
-                    prev.last_seen_slot
-                };
-                let prev_updated_at = prev.updated_at;
-                self.register_vaults(&pool, &state);
-                let entry = CacheEntry {
+            state = merge_account_parse_preserves_existing(&prev.state, state, slot);
+            let refresh_age = pool_state_has_reserve_basis(&state);
+            let new_fingerprint = pool_state_material_fingerprint(&state);
+            let material_changed = new_fingerprint != pool_state_material_fingerprint(&prev.state);
+            let stored_slot = if slot == 0 {
+                prev.slot
+            } else if material_changed {
+                slot
+            } else {
+                prev.slot
+            };
+            let last_seen_slot = if slot > 0 {
+                prev.last_seen_slot.max(slot)
+            } else {
+                prev.last_seen_slot
+            };
+            let prev_updated_at = prev.updated_at;
+            if refresh_age && !material_changed {
+                crate::metrics::inc_live_pool_cache_fingerprint_unchanged_skip_total();
+            }
+            (
+                CacheEntry {
                     state,
                     slot: stored_slot,
                     updated_at: if refresh_age && material_changed {
@@ -975,10 +969,63 @@ impl LivePoolCache {
                         prev_updated_at
                     },
                     last_seen_slot,
-                };
-                if refresh_age && !material_changed {
-                    crate::metrics::inc_live_pool_cache_fingerprint_unchanged_skip_total();
+                },
+                false,
+            )
+        } else {
+            let stored_slot = if slot == 0 { 0 } else { slot };
+            (CacheEntry::new(state, stored_slot), true)
+        };
+
+        // I-4b: never touch `vault_to_pool` while a `pools` entry guard is held.
+        self.register_vaults(&pool, &entry_to_store.state);
+
+        match self.pools.entry(pool) {
+            Entry::Vacant(v) => {
+                v.insert(entry_to_store);
+                self.updates_total.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Entry::Occupied(mut o) => {
+                let prev = o.get();
+                if slot > 0 && slot < prev.last_seen_slot {
+                    return false;
                 }
+                let entry = if prepared_as_insert {
+                    let mut merged = entry_to_store.state;
+                    merged = merge_account_parse_preserves_existing(&prev.state, merged, slot);
+                    let refresh_age = pool_state_has_reserve_basis(&merged);
+                    let new_fingerprint = pool_state_material_fingerprint(&merged);
+                    let material_changed =
+                        new_fingerprint != pool_state_material_fingerprint(&prev.state);
+                    let stored_slot = if slot == 0 {
+                        prev.slot
+                    } else if material_changed {
+                        slot
+                    } else {
+                        prev.slot
+                    };
+                    let last_seen_slot = if slot > 0 {
+                        prev.last_seen_slot.max(slot)
+                    } else {
+                        prev.last_seen_slot
+                    };
+                    if refresh_age && !material_changed {
+                        crate::metrics::inc_live_pool_cache_fingerprint_unchanged_skip_total();
+                    }
+                    CacheEntry {
+                        state: merged,
+                        slot: stored_slot,
+                        updated_at: if refresh_age && material_changed {
+                            Instant::now()
+                        } else {
+                            prev.updated_at
+                        },
+                        last_seen_slot,
+                    }
+                } else {
+                    entry_to_store
+                };
                 *o.get_mut() = entry;
                 self.updates_total.fetch_add(1, Ordering::Relaxed);
                 true
@@ -1038,8 +1085,8 @@ impl LivePoolCache {
 
     /// Update vault balance for a pool
     pub fn update_vault_balance(&self, vault: &Pubkey, balance: u64, slot: u64) {
-        if let Some(mapping) = self.vault_to_pool.get(vault) {
-            let (pool_addr, position) = *mapping;
+        let mapped = self.vault_to_pool.get(vault).map(|m| *m);
+        if let Some((pool_addr, position)) = mapped {
             if let Some(mut entry) = self.pools.get_mut(&pool_addr) {
                 let balance_changed = match &entry.state {
                     CachedPoolState::Orca(s) => match position {
@@ -3253,6 +3300,56 @@ mod tests {
             s.base_reserve,
             Some(2_000_000),
             "vault balance must apply despite pool last_seen ahead of vault slot"
+        );
+    }
+
+    /// I-4b: `upsert` (pools → vault_to_pool) and `update_vault_balance` (vault_to_pool → pools)
+    /// must not nest DashMap guards; without the fix this test hangs.
+    #[test]
+    fn upsert_and_update_vault_balance_concurrent_do_not_deadlock() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let cache = Arc::new(LivePoolCache::new());
+        let pool = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let state = CachedPoolState::PumpAmm(PumpAmmState {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            pool_base_token_account: base_vault,
+            pool_quote_token_account: quote_vault,
+            base_reserve: Some(1_000_000),
+            quote_reserve: Some(50_000_000_000),
+            pool_accounts: Vec::new(),
+            creator: None,
+        });
+
+        cache.upsert(pool, state.clone(), 1);
+
+        let started = Instant::now();
+        let cache_a = Arc::clone(&cache);
+        let state_a = state.clone();
+        let upsert_thread = thread::spawn(move || {
+            for slot in 2..2000u64 {
+                let _ = cache_a.upsert(pool, state_a.clone(), slot);
+            }
+        });
+
+        let cache_b = Arc::clone(&cache);
+        let vault_thread = thread::spawn(move || {
+            for slot in 2..2000u64 {
+                cache_b.update_vault_balance(&base_vault, slot, slot);
+                cache_b.update_vault_balance(&quote_vault, slot * 1000, slot);
+            }
+        });
+
+        upsert_thread.join().expect("upsert thread panicked");
+        vault_thread.join().expect("vault thread panicked");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "concurrent upsert/vault updates must not deadlock"
         );
     }
 

@@ -6,6 +6,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-LIVE-POOL-CACHE-ABBA: LivePoolCache DashMap ABBA nach #461 (I-4b)
+**Datum**: 2026-09-25  
+**Problem**: Prod SHA `1f03c4a` (post-#461): `md-tx-pin-seed` (`upsert` → `register_vaults` unter `pools.entry`) und `md-account-sidefx` (`update_vault_balance` mit `vault_to_pool.get` + `pools.get_mut`) verklemmen sich gegenseitig auf `LivePoolCache`. Vault-Ticks und `balance_updated_from_cache` Delta 0; Arb-HIGH-Consumer und Pool-Cache-Apply stehen. #461 hatte nur `tracked_*`-Locks vom Sidefx genommen.  
+**Fix**: `register_vaults` nur ohne lebenden `pools`-Guard (`upsert`: Mapping vor `pools.entry`). `update_vault_balance`: Vault-Mapping kopieren, Guard droppen, dann `pools.get_mut`. Unit-Test: paralleles `upsert` + `update_vault_balance` joinen in &lt;2s.  
+**Invarianten**: I-4b; kein RPC; kein Queue-Cap / TrackWorker-Scope.  
+**Dateien**: `src/execution/live_pool_cache.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-MD-SIDEFX-CLEAR-REST-I4B: Sidefx-Restpfade + Clear ohne Full-Map-Scan nach #460 (I-4b)
 **Datum**: 2026-09-24  
 **Problem**: Prod SHA `ff489b4` (post-#460): Vier Threads in `RawRwLock::lock_shared_slow` auf `tracked_*`; Queues am Cap, `vault_register_ok=0`. #460 befreite nur `enqueue_deferred_hot_pool_reserve_retry` von `tracked_*`-Reads; Rest: `pool_has_live_vault_geyser_feed` → `pool_explicit_vault_bin_pubkeys`, Pin-Seed `hot_pool_reserve_registration_satisfied*`, Account-Sidefx `maybe_refresh_arb_*` → `register_*`, Track-Worker `clear_*` via `values_mut()` über ganze Maps, `apply_prune_batch`/`register_orca_tick_arrays` Lock-Order mit `pool_tracked_legs` unter `tracked_*.write()`.  
