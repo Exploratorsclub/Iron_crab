@@ -5755,6 +5755,19 @@ impl MarketDataContext {
                 }
             }
         }
+        for pool in self.hot_pool_registry.snapshot_arb_pools() {
+            if let Some(CachedPoolState::Meteora(s)) = self.live_pool_cache.get(&pool) {
+                if s.dlmm_bin_params_account_seeded {
+                    let active_array_index =
+                        MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
+                    if let Ok(pda) =
+                        MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, active_array_index)
+                    {
+                        protected.insert(pda);
+                    }
+                }
+            }
+        }
         for (pda, info) in self.tracked_bin_arrays.read().iter() {
             if self.hot_pool_registry.is_hot_pool(info.pool_address) {
                 protected.insert(*pda);
@@ -5763,9 +5776,51 @@ impl MarketDataContext {
         protected
     }
 
+    /// True when this early-drop bin-array update covers the cached `active_id` of an arb-pinned DLMM pool.
+    fn dlmm_bin_early_drop_is_arb_pinned_active_array(&self, update: &GeyserAccountUpdate) -> bool {
+        use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
+        if update.data.len() < 56 {
+            return false;
+        }
+        let Ok(lb_pair) = Pubkey::try_from(&update.data[24..56]) else {
+            return false;
+        };
+        if !self.hot_pool_registry.pool_has_arb(lb_pair) {
+            return false;
+        }
+        let Some(CachedPoolState::Meteora(s)) = self.live_pool_cache.get(&lb_pair) else {
+            return false;
+        };
+        if !s.dlmm_bin_params_account_seeded {
+            return false;
+        }
+        let bin_array_index = i64::from_le_bytes(update.data[8..16].try_into().unwrap_or([0; 8]));
+        let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(s.active_id);
+        if bin_array_index != active_array_index {
+            return false;
+        }
+        let Ok(parsed) = BinArray::parse(&update.data, s.bin_step) else {
+            return false;
+        };
+        ironcrab::market_data::ingest::active_bin_offset_in_array(s.active_id, parsed.index)
+            .is_some()
+    }
+
     /// C1e: stash bin-array Geyser payload dropped before membership registration (METEORA owner stream).
     fn maybe_stash_dlmm_bin_array_before_early_drop(&self, update: &GeyserAccountUpdate) {
         if !ironcrab::market_data::ingest::geyser_update_looks_like_meteora_bin_array(update) {
+            return;
+        }
+        if self.dlmm_bin_early_drop_is_arb_pinned_active_array(update) {
+            if let Ok(lb_pair) = Pubkey::try_from(&update.data[24..56]) {
+                if let Some(pin) = self.geyser_pin_for_hot_dlmm_pool(lb_pair) {
+                    self.note_deferred_hot_pool_reserve_registration(
+                        lb_pair,
+                        pin,
+                        "arb_dlmm_active_bin_early_drop",
+                    );
+                }
+            }
             return;
         }
         let protected = self.dlmm_bin_stash_protected_pubkeys();
@@ -26475,6 +26530,54 @@ mod pr_b_geyser_tracking_tests {
             Instant::now()
         ));
         assert!(ctx.tracked_membership.load().bin_arrays.contains(&bin_pda));
+    }
+
+    /// Scope 2: arb-pinned DLMM active-bin array must not enter early-drop stash.
+    #[test]
+    #[serial_test::serial]
+    fn scope2_arb_pinned_active_dlmm_bin_not_stashed_on_early_drop() {
+        use ironcrab::metrics::MARKET_DATA_DLMM_BIN_EARLY_DROP_STASHED_TOTAL;
+        use ironcrab::solana::dex::meteora_bin_array_layout::BinArray;
+        use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+
+        let pool = Pubkey::new_unique();
+        let active_id = 42i32;
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.live_pool_cache
+            .upsert(pool, test_meteora_dlmm_cached_state(active_id), 1);
+        let active_array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
+        let bin_pda = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&pool, active_array_index)
+            .expect("active bin pda");
+
+        let mut data = vec![0u8; BinArray::ACCOUNT_SIZE];
+        data[8..16].copy_from_slice(&active_array_index.to_le_bytes());
+        data[24..56].copy_from_slice(pool.as_ref());
+
+        let update = GeyserAccountUpdate {
+            pubkey: bin_pda,
+            slot: 42,
+            owner: Pubkey::from_str(METEORA_DLMM).unwrap(),
+            data,
+            lamports: 0,
+            grpc_recv_at: Instant::now(),
+        };
+        let before_stash = MARKET_DATA_DLMM_BIN_EARLY_DROP_STASHED_TOTAL.load(Ordering::Relaxed);
+        ctx.maybe_stash_dlmm_bin_array_before_early_drop(&update);
+        assert_eq!(
+            MARKET_DATA_DLMM_BIN_EARLY_DROP_STASHED_TOTAL.load(Ordering::Relaxed),
+            before_stash,
+            "active bin for arb pin must not increment stash counter"
+        );
+        assert!(
+            !ctx.dlmm_bin_geyser_stash.read().contains_key(&bin_pda),
+            "active bin for arb pin must not be stashed"
+        );
     }
 
     /// C1vault: arb apply must retry deferred pins (parity with momentum apply).

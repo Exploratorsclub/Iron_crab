@@ -13,6 +13,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Invarianten**: A.56, I-7, I-MD-5; A.54/Orca unverändert.  
 **Dateien**: `src/solana/dex/pumpfun_amm.rs`, `src/arbitrage/pool_quote.rs`, `src/execution/live_pool_cache.rs`, `src/execution/cache_geyser.rs`, `docs/BUGS_FIXES.md`
 
+### FIX-PINNED-QUOTE-INPUTS: Gepinnte Pool-Quotes aus vollständigem Geyser-Zustand (Scope 2)
+**Datum**: 2026-09-27  
+**Problem**: Prod `99eaccc`: Pump-Arb-Pins ohne Slave-Reserven trotz Vault-Ticks; DLMM `active_bin_missing` / Bin-Stash vor Fenster; DLMM-Sell ohne `dlmm_marginal_price_plausible`; Orca Dynamic-Tick-Arrays parse-fail → Quote `None`.  
+**Fix**: Vault-Tick-JetStream nutzt MASTER-Cache-Reserven pro Leg; arb DLMM Active-Bin early-drop nicht stashed + Active-PDA geschützt; DLMM-Sell marginal wie Buy (100× Reserve-Mid); `parse_tick_array` akzeptiert DynamicTickArray-Discriminator. FeeConfig (Scope 1) unverändert.  
+**Invarianten**: A.48, A.54, I-4b, I-7, I-MD-5.  
+**Dateien**: `src/market_data/sidefx/handlers.rs`, `src/bin/market_data.rs`, `src/arbitrage/pool_quote.rs`, `src/solana/dex/orca_tick_array.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-LIVE-POOL-CACHE-ABBA: LivePoolCache DashMap ABBA nach #461 (I-4b)
 **Datum**: 2026-09-25  
 **Problem**: Prod SHA `1f03c4a` (post-#461): `md-tx-pin-seed` (`upsert` → `register_vaults` unter `pools.entry`) und `md-account-sidefx` (`update_vault_balance` mit `vault_to_pool.get` + `pools.get_mut`) verklemmen sich gegenseitig auf `LivePoolCache`. Vault-Ticks und `balance_updated_from_cache` Delta 0; Arb-HIGH-Consumer und Pool-Cache-Apply stehen. #461 hatte nur `tracked_*`-Locks vom Sidefx genommen.  

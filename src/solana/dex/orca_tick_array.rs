@@ -12,6 +12,13 @@ pub const TICK_ARRAY_SIZE: i32 = 88;
 /// Classic Anchor `TickArray` account discriminator (`account:TickArray`).
 pub const TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [0x45, 0x61, 0xbd, 0xbe, 0x6e, 0x07, 0x42, 0xbb];
 
+/// Anchor `DynamicTickArray` account discriminator (`account:DynamicTickArray`).
+pub const DYNAMIC_TICK_ARRAY_DISCRIMINATOR: [u8; 8] =
+    [0x11, 0xd8, 0xf6, 0x8e, 0xe1, 0xc7, 0xda, 0x38];
+
+const DYNAMIC_TICK_HEADER_LEN: usize = 4 + 32 + 16;
+const DYNAMIC_TICK_MIN_ACCOUNT_LEN: usize = 8 + DYNAMIC_TICK_HEADER_LEN + TICK_ARRAY_SIZE as usize;
+
 const TICK_ACCOUNT_BODY_LEN: usize = 4 + (Tick::LEN * TICK_ARRAY_SIZE as usize) + 32;
 pub const MIN_TICK_ARRAY_ACCOUNT_LEN: usize = 8 + TICK_ACCOUNT_BODY_LEN;
 
@@ -90,6 +97,19 @@ pub fn swap_direction_tick_array_starts(
 }
 
 pub fn parse_tick_array(data: &[u8]) -> Option<ParsedTickArray> {
+    if data.len() < 8 {
+        return None;
+    }
+    if data[0..8] == TICK_ARRAY_DISCRIMINATOR {
+        return parse_classic_tick_array(data);
+    }
+    if data[0..8] == DYNAMIC_TICK_ARRAY_DISCRIMINATOR {
+        return parse_dynamic_tick_array(data);
+    }
+    None
+}
+
+fn parse_classic_tick_array(data: &[u8]) -> Option<ParsedTickArray> {
     if data.len() < MIN_TICK_ARRAY_ACCOUNT_LEN {
         return None;
     }
@@ -111,6 +131,50 @@ pub fn parse_tick_array(data: &[u8]) -> Option<ParsedTickArray> {
     let whirlpool = Pubkey::new_from_array(body[offset..offset + 32].try_into().ok()?);
     if offset + 32 != body.len() {
         return None;
+    }
+    Some(ParsedTickArray {
+        whirlpool,
+        start_tick_index,
+        ticks,
+    })
+}
+
+fn parse_dynamic_tick_array(data: &[u8]) -> Option<ParsedTickArray> {
+    if data.len() < DYNAMIC_TICK_MIN_ACCOUNT_LEN {
+        return None;
+    }
+    let body = &data[8..];
+    let start_tick_index = i32::from_le_bytes(body[0..4].try_into().ok()?);
+    let whirlpool = Pubkey::new_from_array(body[4..36].try_into().ok()?);
+    let tick_bitmap = u128::from_le_bytes(body[36..52].try_into().ok()?);
+    let tick_data = &body[52..];
+    let mut offset = 0usize;
+    let mut ticks = Vec::with_capacity(TICK_ARRAY_SIZE as usize);
+    for slot in 0..TICK_ARRAY_SIZE as usize {
+        let tick_index = start_tick_index + slot as i32;
+        let initialized = tick_bitmap & (1u128 << slot) != 0;
+        if initialized {
+            let tick_slice = tick_data.get(offset..offset + 113)?;
+            let variant = tick_slice[0];
+            let liquidity_net = if variant == 1 {
+                i128::from_le_bytes(tick_slice[1..17].try_into().ok()?)
+            } else {
+                0
+            };
+            ticks.push(ParsedTick {
+                tick_index,
+                initialized: variant == 1,
+                liquidity_net,
+            });
+            offset += 113;
+        } else {
+            ticks.push(ParsedTick {
+                tick_index,
+                initialized: false,
+                liquidity_net: 0,
+            });
+            offset += 1;
+        }
     }
     Some(ParsedTickArray {
         whirlpool,
@@ -165,6 +229,36 @@ pub fn build_tick_array_account_bytes(
     out
 }
 
+/// Build dynamic TickArray account bytes for tests (one initialized tick slot).
+pub fn build_dynamic_tick_array_account_bytes(
+    start_tick_index: i32,
+    whirlpool: Pubkey,
+    initialized_slot: usize,
+    liquidity_net: i128,
+) -> Vec<u8> {
+    let mut body = vec![0u8; DYNAMIC_TICK_HEADER_LEN];
+    body[0..4].copy_from_slice(&start_tick_index.to_le_bytes());
+    body[4..36].copy_from_slice(whirlpool.as_ref());
+    let tick_bitmap: u128 = 1u128 << initialized_slot;
+    body[36..52].copy_from_slice(&tick_bitmap.to_le_bytes());
+    let mut tick_data = Vec::new();
+    for slot in 0..TICK_ARRAY_SIZE as usize {
+        if slot == initialized_slot {
+            let mut tick = [0u8; 113];
+            tick[0] = 1;
+            tick[1..17].copy_from_slice(&liquidity_net.to_le_bytes());
+            tick_data.extend_from_slice(&tick);
+        } else {
+            tick_data.push(0);
+        }
+    }
+    let mut out = Vec::with_capacity(8 + body.len() + tick_data.len());
+    out.extend_from_slice(&DYNAMIC_TICK_ARRAY_DISCRIMINATOR);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&tick_data);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +289,26 @@ mod tests {
         let mut bad = good.clone();
         bad[0] ^= 0xff;
         assert!(parse_tick_array(&bad).is_none());
+    }
+
+    #[test]
+    fn parse_dynamic_tick_array_initialized_slot() {
+        let pool = Pubkey::new_unique();
+        let liq_net = 9_876_543i128;
+        let bytes = build_dynamic_tick_array_account_bytes(0, pool, 3, liq_net);
+        let parsed = parse_tick_array(&bytes).expect("dynamic parse");
+        assert_eq!(parsed.whirlpool, pool);
+        assert!(parsed.ticks[3].initialized);
+        assert_eq!(parsed.ticks[3].liquidity_net, liq_net);
+        assert!(!parsed.ticks[0].initialized);
+    }
+
+    #[test]
+    fn parse_dynamic_rejects_unknown_discriminator() {
+        let pool = Pubkey::new_unique();
+        let mut bytes = build_dynamic_tick_array_account_bytes(0, pool, 0, 1);
+        bytes[0] ^= 0xff;
+        assert!(parse_tick_array(&bytes).is_none());
     }
 
     #[test]
