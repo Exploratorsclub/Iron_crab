@@ -8,7 +8,8 @@ use ironcrab::execution::live_pool_cache::{
 };
 use ironcrab::ipc::DexPoolReadiness;
 use ironcrab::solana::dex::pumpfun_amm::{
-    pump_amm_canonical_pool_creator_for_base_mint, PumpFunAmmDex,
+    pump_amm_canonical_pool_creator_for_base_mint,
+    pump_amm_reload_tier0_bootstrap_fee_config_fixture, PumpFunAmmDex,
 };
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
@@ -25,6 +26,7 @@ fn make_pump_amm_cache_with_reserves(
     base_reserve: u64,
     quote_reserve: u64,
 ) -> Arc<LivePoolCache> {
+    pump_amm_reload_tier0_bootstrap_fee_config_fixture();
     let cache = create_shared_cache();
     let creator = pump_amm_canonical_pool_creator_for_base_mint(&base_mint);
     cache.upsert(
@@ -49,6 +51,7 @@ fn make_pump_amm_cache_with_pool_accounts(
     base_mint: Pubkey,
     pool_accounts: Vec<Pubkey>,
 ) -> Arc<LivePoolCache> {
+    pump_amm_reload_tier0_bootstrap_fee_config_fixture();
     let cache = create_shared_cache();
     let creator = pump_amm_canonical_pool_creator_for_base_mint(&base_mint);
     cache.upsert(

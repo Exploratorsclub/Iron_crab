@@ -12013,6 +12013,23 @@ mod two_hop_price_tests {
         config
     }
 
+    /// FeeConfig + canonical pool creator for Pump round-trip tests (A.56; no creator guessing in quote math).
+    fn seed_pump_amm_executable_quote_globals(base_mint: &Pubkey) {
+        use ironcrab::solana::dex::pumpfun_amm::{
+            pump_amm_canonical_pool_creator_for_base_mint, pump_amm_lookup_mint_supply,
+            pump_amm_register_mint_supply_for_quote, pump_amm_register_pool_creator_for_quote,
+            pump_amm_reload_tier0_bootstrap_fee_config_fixture,
+        };
+        pump_amm_reload_tier0_bootstrap_fee_config_fixture();
+        pump_amm_register_pool_creator_for_quote(
+            *base_mint,
+            pump_amm_canonical_pool_creator_for_base_mint(base_mint),
+        );
+        if pump_amm_lookup_mint_supply(base_mint).is_none() {
+            pump_amm_register_mint_supply_for_quote(*base_mint, 1_000_000_000_000_000);
+        }
+    }
+
     fn sample_pool(
         dex: &str,
         addr: &str,
@@ -12791,6 +12808,7 @@ mod two_hop_price_tests {
         );
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+        seed_pump_amm_executable_quote_globals(&token_mint);
 
         let mut trackers = HashMap::new();
         let mut vault_balances = HashMap::new();
@@ -12942,6 +12960,7 @@ mod two_hop_price_tests {
         );
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+        seed_pump_amm_executable_quote_globals(&token_mint);
         let mut orca_tick_arrays = empty_orca_tick_arrays_snapshot();
         orca_tick_arrays.extend(test_orca_v2_quote_fixtures(&cache, pool_a, &token_mint, 1));
 
@@ -13043,6 +13062,7 @@ mod two_hop_price_tests {
         );
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+        seed_pump_amm_executable_quote_globals(&token_mint);
 
         let mut orca_tick_arrays = empty_orca_tick_arrays_snapshot();
         orca_tick_arrays.extend(test_orca_v2_quote_fixtures(&cache, pool_a, &token_mint, 99));
@@ -13166,6 +13186,7 @@ mod two_hop_price_tests {
         );
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+        seed_pump_amm_executable_quote_globals(&token_mint);
 
         let mut trackers = HashMap::new();
         let mut vault_balances = HashMap::new();
@@ -13322,6 +13343,7 @@ mod two_hop_price_tests {
         );
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+        seed_pump_amm_executable_quote_globals(&token_mint);
 
         let mut trackers = HashMap::new();
         let mut vault_balances = HashMap::new();
@@ -13459,6 +13481,7 @@ mod two_hop_price_tests {
         );
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+        seed_pump_amm_executable_quote_globals(&token_mint);
 
         let mut trackers = HashMap::new();
         let mut vault_balances = HashMap::new();
@@ -13600,6 +13623,7 @@ mod two_hop_price_tests {
         );
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+        seed_pump_amm_executable_quote_globals(&token_mint);
 
         let mut trackers = HashMap::new();
         let mut vault_balances = HashMap::new();
@@ -13776,6 +13800,7 @@ mod two_hop_price_tests {
         );
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+        seed_pump_amm_executable_quote_globals(&token_mint);
         cache.set_mint_decimals(token_mint, 6);
 
         let mut trackers = HashMap::new();
@@ -15589,6 +15614,7 @@ mod two_hop_price_tests {
         );
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+        seed_pump_amm_executable_quote_globals(&token_mint);
 
         let mut trackers = HashMap::new();
         let mut vault_balances = HashMap::new();
@@ -15697,6 +15723,7 @@ mod two_hop_price_tests {
             ironcrab::metrics::ARB_TWO_HOP_V2_ROUND_TRIP_FORMABLE_TOTAL.load(Ordering::Relaxed);
         let reserves = (1_000_000_000_000u64, 1_000_000_000u64);
         let token_mint = Pubkey::new_unique();
+        seed_pump_amm_executable_quote_globals(&token_mint);
         let mint = token_mint.to_string();
         let orca_pool = Pubkey::new_unique();
         let pump_pool = Pubkey::new_unique();
@@ -16557,6 +16584,7 @@ mod two_hop_price_tests {
         );
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_orca);
         ironcrab::execution::pool_cache_sync::apply_pool_cache_update(&cache, &update_pump);
+        seed_pump_amm_executable_quote_globals(&token_mint_pk);
         let mut orca_ticks = empty_orca_tick_arrays_snapshot();
         orca_ticks.extend(test_orca_v2_quote_fixtures(
             &cache,

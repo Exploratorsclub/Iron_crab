@@ -369,6 +369,22 @@ pub fn pump_amm_explicit_geyser_subscribe_accounts() -> &'static [Pubkey] {
     ACCOUNTS.as_slice()
 }
 
+fn pump_amm_tier0_bootstrap_fee_config_account_data() -> Vec<u8> {
+    let mut data = Vec::with_capacity(128);
+    data.extend_from_slice(&PUMP_AMM_FEE_CONFIG_ACCOUNT_DISCRIMINATOR);
+    data.push(255);
+    data.extend_from_slice(&Pubkey::default().to_bytes());
+    for v in [25u64, 5, 0] {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    data.extend_from_slice(&1u32.to_le_bytes());
+    data.extend_from_slice(&0u128.to_le_bytes());
+    for v in [2u64, 93, 30] {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    data
+}
+
 /// One-time bootstrap so quotes can run before the first Geyser FeeConfig snapshot (overwritten on live update).
 pub fn pump_amm_bootstrap_fee_config_until_geyser() {
     static BOOTSTRAP: std::sync::Once = std::sync::Once::new();
@@ -376,20 +392,17 @@ pub fn pump_amm_bootstrap_fee_config_until_geyser() {
         if pump_amm_global_fee_config_loaded() {
             return;
         }
-        let mut data = Vec::with_capacity(128);
-        data.extend_from_slice(&PUMP_AMM_FEE_CONFIG_ACCOUNT_DISCRIMINATOR);
-        data.push(255);
-        data.extend_from_slice(&Pubkey::default().to_bytes());
-        for v in [25u64, 5, 0] {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&0u128.to_le_bytes());
-        for v in [2u64, 93, 30] {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        let _ = pump_amm_update_global_fee_config_account(&data);
+        let _ = pump_amm_update_global_fee_config_account(
+            &pump_amm_tier0_bootstrap_fee_config_account_data(),
+        );
     });
+}
+
+/// Idempotent reload of the same tier-0 bootstrap FeeConfig bytes (tests / integration after cache reset).
+pub fn pump_amm_reload_tier0_bootstrap_fee_config_fixture() {
+    let _ = pump_amm_update_global_fee_config_account(
+        &pump_amm_tier0_bootstrap_fee_config_account_data(),
+    );
 }
 
 /// Update cached global FeeConfig from Geyser account data (no RPC on quote path).
@@ -439,14 +452,9 @@ pub fn pump_amm_executable_marginal_total_fee_bps(
     inputs: &PumpAmmExecutableFeeInputs,
 ) -> Option<u32> {
     let mut inputs = *inputs;
-    let creator = inputs.creator.or_else(|| {
-        pump_amm_lookup_pool_creator_by_base_mint(&inputs.base_mint).or_else(|| {
-            Some(pump_amm_canonical_pool_creator_for_base_mint(
-                &inputs.base_mint,
-            ))
-        })
-    });
-    inputs.creator = creator;
+    inputs.creator = inputs
+        .creator
+        .or_else(|| pump_amm_lookup_pool_creator_by_base_mint(&inputs.base_mint));
     let guard = PUMP_AMM_FEE_CONFIG_CACHE.read().ok()?;
     let snapshot = guard.as_ref()?;
     let fees = select_executable_fees(snapshot, &inputs)?;
@@ -465,24 +473,16 @@ pub fn pump_amm_test_reset_fee_quote_cache() {
 /// Minimal one-tier FeeConfig (tier-0 total 125 bps) for unit tests.
 #[cfg(test)]
 pub fn pump_amm_test_seed_fee_config_and_pool_context(base_mint: Pubkey) {
-    if !pump_amm_global_fee_config_loaded() {
-        let mut data = Vec::with_capacity(128);
-        data.extend_from_slice(&PUMP_AMM_FEE_CONFIG_ACCOUNT_DISCRIMINATOR);
-        data.push(255);
-        data.extend_from_slice(&Pubkey::default().to_bytes());
-        for v in [25u64, 5, 0] {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&0u128.to_le_bytes());
-        for v in [2u64, 93, 30] {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        assert!(pump_amm_update_global_fee_config_account(&data));
-    }
+    pump_amm_reload_tier0_bootstrap_fee_config_fixture();
     let creator = pump_pool_authority_pda(&base_mint);
     pump_amm_register_pool_creator_for_quote(base_mint, creator);
     pump_amm_register_mint_supply_for_quote(base_mint, 1_000_000_000_000_000);
+}
+
+#[cfg(test)]
+pub fn pump_amm_test_prepare_quote_fixture(base_mint: Pubkey) {
+    pump_amm_test_reset_fee_quote_cache();
+    pump_amm_test_seed_fee_config_and_pool_context(base_mint);
 }
 
 fn anchor_disc(ix_name: &str) -> [u8; 8] {
@@ -8084,8 +8084,8 @@ mod tests {
         base_reserve: u64,
         quote_reserve: u64,
     ) -> Arc<LivePoolCache> {
-        pump_amm_test_seed_fee_config_and_pool_context(base_mint);
-        let creator = pump_pool_authority_pda(&base_mint);
+        let creator = pump_amm_lookup_pool_creator_by_base_mint(&base_mint)
+            .unwrap_or_else(|| pump_pool_authority_pda(&base_mint));
         let cache = LivePoolCache::new();
         cache.upsert(
             pool_market,
@@ -8133,8 +8133,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_quote_exact_in_cache_hit_no_rpc() {
         let base_mint = Pubkey::new_unique();
+        pump_amm_test_prepare_quote_fixture(base_mint);
         let pool_market = Pubkey::new_unique();
         let cache = make_pump_amm_cache_with_reserves(
             pool_market,
@@ -8159,6 +8161,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_quote_exact_in_without_fee_config_cache_returns_none() {
         pump_amm_test_reset_fee_quote_cache();
         assert!(
@@ -8192,12 +8195,14 @@ mod tests {
             .is_none(),
             "empty fee_tiers on canonical pool must not guess fees"
         );
+        pump_amm_reload_tier0_bootstrap_fee_config_fixture();
     }
 
     #[test]
+    #[serial_test::serial]
     fn pump_amm_fee_config_fixture_tier0_total_is_125_bps() {
         let base_mint = Pubkey::new_unique();
-        pump_amm_test_seed_fee_config_and_pool_context(base_mint);
+        pump_amm_test_prepare_quote_fixture(base_mint);
         let fee = pump_amm_executable_marginal_total_fee_bps(&PumpAmmExecutableFeeInputs {
             base_mint,
             creator: pump_amm_lookup_pool_creator_by_base_mint(&base_mint),
