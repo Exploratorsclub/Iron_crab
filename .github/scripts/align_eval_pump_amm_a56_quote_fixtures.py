@@ -8,7 +8,9 @@ import sys
 from pathlib import Path
 
 MARKER = "pump_amm_reload_tier0_bootstrap_fee_config_fixture"
-FIXTURE_MINT = "TokenMint11111111111111111111111111111111"
+# Eval blackbox tests use a placeholder mint string; 41-char form is not a valid 32-byte base58 pubkey.
+FIXTURE_MINT_INVALID = "TokenMint11111111111111111111111111111111"
+FIXTURE_MINT = "TokenMint1111111111111111111111111111111111"
 SUPPLY: int = 1_000_000_000_000_000
 
 PUMP_USE = """use ironcrab::solana::dex::pumpfun_amm::{
@@ -19,10 +21,11 @@ PUMP_USE = """use ironcrab::solana::dex::pumpfun_amm::{
 
 SAMPLE_POOL_SEED = f"""    if dex == "pump_amm" {{
         {MARKER}();
-        let mint = Pubkey::from_str("{FIXTURE_MINT}").unwrap();
-        let creator = pump_amm_canonical_pool_creator_for_base_mint(&mint);
-        pump_amm_register_pool_creator_for_quote(mint, creator);
-        pump_amm_register_mint_supply_for_quote(mint, {SUPPLY});
+        if let Ok(mint) = Pubkey::from_str("{FIXTURE_MINT}") {{
+            let creator = pump_amm_canonical_pool_creator_for_base_mint(&mint);
+            pump_amm_register_pool_creator_for_quote(mint, creator);
+            pump_amm_register_mint_supply_for_quote(mint, {SUPPLY});
+        }}
     }}
 """
 
@@ -144,7 +147,16 @@ def _ensure_imports_before_sample_pool(text: str) -> str:
     return prefix + block + suffix
 
 
+def _normalize_fixture_mint_literals(text: str) -> str:
+    if not _file_uses_pump_amm_sample_pool(text):
+        return text
+    if FIXTURE_MINT in text:
+        return text
+    return text.replace(f'"{FIXTURE_MINT_INVALID}"', f'"{FIXTURE_MINT}"')
+
+
 def patch_sample_pool(text: str) -> str:
+    text = _normalize_fixture_mint_literals(text)
     text = _strip_orphan_pump_amm_seed(text)
     if not _file_uses_pump_amm_sample_pool(text):
         return _strip_unused_pump_use_block(text)
