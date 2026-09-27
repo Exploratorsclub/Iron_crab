@@ -58,4 +58,16 @@ pub trait IngestHost: Send + Sync {
         let _ = pool;
         None
     }
+
+    /// True when `pool` is in the arb track pin set (O(1) lookup).
+    fn ingest_pool_has_arb(&self, pool: &Pubkey) -> bool {
+        let _ = pool;
+        false
+    }
+
+    /// Cached DLMM `(active_id, bin_step)` for one pool (single cache read).
+    fn ingest_pool_dlmm_bin_meta(&self, pool: &Pubkey) -> Option<(i32, u16)> {
+        let _ = pool;
+        None
+    }
 }

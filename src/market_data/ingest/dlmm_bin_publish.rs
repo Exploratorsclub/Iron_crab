@@ -3,7 +3,8 @@
 
 use crate::ipc::BinData;
 use crate::metrics::inc_market_data_dlmm_bin_emit_active_zero_touch_total;
-use crate::solana::dex::meteora_bin_array_layout::Bin;
+use crate::solana::dex::meteora_bin_array_layout::{Bin, BinArray};
+use solana_sdk::pubkey::Pubkey;
 
 /// Bins per Meteora DLMM array (must match `BinArray::BINS_PER_ARRAY` and quote flatten).
 pub const DLMM_BINS_PER_ARRAY: i64 = 70;
@@ -17,6 +18,28 @@ pub fn active_bin_offset_in_array(active_id: i32, bin_array_index: i64) -> Optio
     } else {
         None
     }
+}
+
+/// Parse `lb_pair` and on-chain bin-array index from a Meteora bin-array account (O(1), no RPC).
+pub fn meteora_dlmm_bin_array_lb_pair_and_index(data: &[u8]) -> Option<(Pubkey, i64)> {
+    if data.len() < 56 {
+        return None;
+    }
+    let lb_pair = Pubkey::try_from(&data[24..56]).ok()?;
+    let index = i64::from_le_bytes(data[8..16].try_into().ok()?);
+    Some((lb_pair, index))
+}
+
+/// True when `active_id` lies in this bin-array account payload.
+pub fn meteora_dlmm_bin_array_contains_active_id(
+    data: &[u8],
+    active_id: i32,
+    bin_step: u16,
+) -> bool {
+    let Ok(parsed) = BinArray::parse(data, bin_step) else {
+        return false;
+    };
+    active_bin_offset_in_array(active_id, parsed.index).is_some()
 }
 
 /// Filter parsed bins for publish: non-zero liquidity only, but always retain the active bin
