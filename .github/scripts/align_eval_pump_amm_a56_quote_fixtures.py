@@ -204,6 +204,7 @@ def patch_file(path: Path) -> bool:
     if path.name in (
         "pump_amm_geyser_first.rs",
         "invariants_pumpswap_amm_liquidation.rs",
+        "invariants_dex_connector.rs",
     ):
         updated = patch_make_pump_amm_cache_with_reserves(updated)
     if updated == original:
