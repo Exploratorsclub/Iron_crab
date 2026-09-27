@@ -6904,7 +6904,7 @@ impl Dex for PumpFunAmmDex {
                     (base_reserve, quote_reserve)
                 };
 
-                let Some(fee_bps) = ({
+                let fee_bps = {
                     let creator = cache.get_pump_amm_creator_by_base_mint(&base_mint);
                     let base_mint_supply = pump_amm_lookup_mint_supply(&base_mint);
                     pump_amm_executable_marginal_total_fee_bps(&PumpAmmExecutableFeeInputs {
@@ -6914,48 +6914,52 @@ impl Dex for PumpFunAmmDex {
                         base_reserve: base_r,
                         quote_reserve: quote_r,
                     })
-                }) else {
+                };
+                if fee_bps.is_none() {
                     debug!(
                         base_mint = %base_mint_str,
                         fee_config_loaded = pump_amm_global_fee_config_loaded(),
                         "pump_amm: ExecutableMarginal quote blocked — FeeConfig cache or tier inputs missing (A.56)"
                     );
-                    return Ok(None);
-                };
-                let (amount_out, price_impact_bps) =
-                    self.quote_cp(amount_in, in_reserve, out_reserve, fee_bps);
-                if amount_out == 0 {
-                    if self.allow_rpc_on_miss {
-                        warn!(
-                            base_mint = %base_mint_str,
-                            base_reserve = base_r,
-                            quote_reserve = quote_r,
-                            "pump_amm: cache reserves degenerate (one side=0), Cold Path falling through to RPC"
-                        );
-                    } else {
+                    if !self.allow_rpc_on_miss {
                         return Ok(None);
                     }
-                } else {
-                    debug!(
-                        base_mint = %base_mint_str,
-                        pool = %pool_market,
-                        base_reserve = base_r,
-                        quote_reserve = quote_r,
-                        amount_out,
-                        "pump_amm: quote from LivePoolCache (ZERO RPC)"
-                    );
+                } else if let Some(fee_bps) = fee_bps {
+                    let (amount_out, price_impact_bps) =
+                        self.quote_cp(amount_in, in_reserve, out_reserve, fee_bps);
+                    if amount_out == 0 {
+                        if self.allow_rpc_on_miss {
+                            warn!(
+                                base_mint = %base_mint_str,
+                                base_reserve = base_r,
+                                quote_reserve = quote_r,
+                                "pump_amm: cache reserves degenerate (one side=0), Cold Path falling through to RPC"
+                            );
+                        } else {
+                            return Ok(None);
+                        }
+                    } else {
+                        debug!(
+                            base_mint = %base_mint_str,
+                            pool = %pool_market,
+                            base_reserve = base_r,
+                            quote_reserve = quote_r,
+                            amount_out,
+                            "pump_amm: quote from LivePoolCache (ZERO RPC)"
+                        );
 
-                    return Ok(Some(Quote {
-                        amount_out,
-                        price_impact_bps,
-                        route: vec![pool_market.to_string()],
-                        fee_bps,
-                        in_reserve,
-                        out_reserve,
-                        input_mint: input_mint.to_string(),
-                        output_mint: output_mint.to_string(),
-                        tick_spacing: None,
-                    }));
+                        return Ok(Some(Quote {
+                            amount_out,
+                            price_impact_bps,
+                            route: vec![pool_market.to_string()],
+                            fee_bps,
+                            in_reserve,
+                            out_reserve,
+                            input_mint: input_mint.to_string(),
+                            output_mint: output_mint.to_string(),
+                            tick_spacing: None,
+                        }));
+                    }
                 }
             }
             // Cache miss: Hot Path (allow_rpc_on_miss=false) → None. Cold Path (true) → RPC fallback. P3 #12.
