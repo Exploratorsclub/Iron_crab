@@ -103,6 +103,17 @@ def _function_body_span(text: str, fn_name: str) -> tuple[int, int] | None:
 SAMPLE_POOL_FN = re.compile(
     r"fn sample_pool\(\s*dex:\s*&str[^)]*\)\s*->\s*QuotePoolInput\s*\{"
 )
+TRADE_ONLY_POOL_FN = re.compile(
+    r"fn trade_only_pool\([^)]*\)\s*->\s*QuotePoolInput\s*\{"
+)
+
+PUMP_AMM_SEED_BLOCK = f"""    {MARKER}();
+    if let Ok(mint) = Pubkey::from_str("{FIXTURE_MINT}") {{
+        let creator = pump_amm_canonical_pool_creator_for_base_mint(&mint);
+        pump_amm_register_pool_creator_for_quote(mint, creator);
+        pump_amm_register_mint_supply_for_quote(mint, {SUPPLY});
+    }}
+"""
 
 
 def _file_uses_pump_amm_sample_pool(text: str) -> bool:
@@ -140,7 +151,7 @@ def _strip_unused_pump_use_block(text: str) -> str:
 
 
 def _ensure_imports_before_sample_pool(text: str) -> str:
-    m = SAMPLE_POOL_FN.search(text)
+    m = SAMPLE_POOL_FN.search(text) or TRADE_ONLY_POOL_FN.search(text)
     if not m:
         return text
     prefix = text[: m.start()]
@@ -158,9 +169,14 @@ def _ensure_imports_before_sample_pool(text: str) -> str:
 
 
 def _normalize_fixture_mint_literals(text: str) -> str:
-    if not _file_uses_pump_amm_sample_pool(text):
-        return text
     if FIXTURE_MINT in text:
+        return text
+    if FIXTURE_MINT_INVALID not in text:
+        return text
+    if not (
+        _file_uses_pump_amm_sample_pool(text)
+        or TRADE_ONLY_POOL_FN.search(text)
+    ):
         return text
     return text.replace(f'"{FIXTURE_MINT_INVALID}"', f'"{FIXTURE_MINT}"')
 
@@ -181,6 +197,21 @@ def patch_sample_pool(text: str) -> str:
     if not m:
         return text
     return text[: m.end()] + "\n" + SAMPLE_POOL_SEED + text[m.end() :]
+
+
+def patch_trade_only_pool(text: str) -> str:
+    m = TRADE_ONLY_POOL_FN.search(text)
+    if not m:
+        return text
+    head = text[m.end() : m.end() + 400]
+    if MARKER in head:
+        return text
+    text = _insert_pump_use_block(text)
+    text = _ensure_imports_before_sample_pool(text)
+    m = TRADE_ONLY_POOL_FN.search(text)
+    if not m:
+        return text
+    return text[: m.end()] + "\n" + PUMP_AMM_SEED_BLOCK + text[m.end() :]
 
 
 def patch_make_pump_amm_cache_with_reserves(text: str) -> str:
@@ -250,6 +281,7 @@ def patch_file(path: Path) -> bool:
     original = path.read_text(encoding="utf-8")
     updated = original
     updated = patch_sample_pool(updated)
+    updated = patch_trade_only_pool(updated)
     if path.name in (
         "pump_amm_geyser_first.rs",
         "invariants_dex_connector.rs",
