@@ -394,6 +394,16 @@ pub fn pump_amm_reload_tier0_bootstrap_fee_config_fixture() {
     );
 }
 
+/// Clears FeeConfig + pump quote globals (integration/eval tests only; not for production hot path).
+#[doc(hidden)]
+pub fn pump_amm_reset_executable_quote_globals_for_blackbox_tests() {
+    if let Ok(mut guard) = PUMP_AMM_FEE_CONFIG_CACHE.write() {
+        *guard = None;
+    }
+    PUMP_AMM_CREATOR_BY_BASE_MINT.clear();
+    PUMP_AMM_MINT_SUPPLY_BY_MINT.clear();
+}
+
 /// Update cached global FeeConfig from Geyser account data (no RPC on quote path).
 pub fn pump_amm_update_global_fee_config_account(data: &[u8]) -> bool {
     let Some(parsed) = parse_pump_amm_fee_config_account(data) else {

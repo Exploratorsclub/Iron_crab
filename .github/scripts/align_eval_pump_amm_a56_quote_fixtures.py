@@ -16,6 +16,7 @@ SUPPLY: int = 1_000_000_000_000_000
 PUMP_USE = """use ironcrab::solana::dex::pumpfun_amm::{
     pump_amm_canonical_pool_creator_for_base_mint, pump_amm_register_mint_supply_for_quote,
     pump_amm_register_pool_creator_for_quote, pump_amm_reload_tier0_bootstrap_fee_config_fixture,
+    pump_amm_reset_executable_quote_globals_for_blackbox_tests,
 };
 """
 
@@ -34,6 +35,15 @@ CACHE_RESERVES_SEED = f"""    {MARKER}();
     pump_amm_register_pool_creator_for_quote(base_mint, creator);
     pump_amm_register_mint_supply_for_quote(base_mint, {SUPPLY});
 """
+
+RESET_GLOBALS = """    pump_amm_reset_executable_quote_globals_for_blackbox_tests();
+"""
+
+LIQUIDATION_RESET_TEST_MARKERS = (
+    "fn pumpamm_cold_path_degenerate_reserves_yields_err_not_ok_none(",
+    "fn pumpamm_degenerate_cache_reserves_quote_zero_rejected(",
+    "fn pumpamm_degenerate_cache_reserves_base_zero_rejected(",
+)
 
 
 def _needs_pump_imports(text: str) -> bool:
@@ -197,16 +207,55 @@ def patch_make_pump_amm_cache_with_reserves(text: str) -> str:
     return text[:body_start] + "\n" + new_body + text[body_end:]
 
 
+RESET_USE = (
+    "use ironcrab::solana::dex::pumpfun_amm::"
+    "pump_amm_reset_executable_quote_globals_for_blackbox_tests;\n"
+)
+
+
+def _insert_reset_use_block(text: str) -> str:
+    if "pump_amm_reset_executable_quote_globals_for_blackbox_tests" in text.split("fn ")[0]:
+        return text
+    anchor = re.search(r"^(fn |const |#\[test\])", text, re.MULTILINE)
+    pos = anchor.start() if anchor else len(text)
+    return text[:pos] + RESET_USE + text[pos:]
+
+
+def _patch_liquidation_tests_reset_globals(text: str, path: Path) -> str:
+    if path.name != "invariants_pumpswap_amm_liquidation.rs":
+        return text
+    updated = text
+    for marker in LIQUIDATION_RESET_TEST_MARKERS:
+        if marker not in updated:
+            continue
+        span = _function_body_span(updated, marker.removeprefix("fn ").split("(")[0])
+        if span is None:
+            continue
+        body_start, body_end = span
+        body = updated[body_start:body_end]
+        if "pump_amm_reset_executable_quote_globals_for_blackbox_tests" in body:
+            continue
+        updated = _insert_reset_use_block(updated)
+        span = _function_body_span(updated, marker.removeprefix("fn ").split("(")[0])
+        if span is None:
+            continue
+        body_start, body_end = span
+        updated = (
+            updated[:body_start] + "\n" + RESET_GLOBALS + updated[body_start:body_end] + updated[body_end:]
+        )
+    return updated
+
+
 def patch_file(path: Path) -> bool:
     original = path.read_text(encoding="utf-8")
     updated = original
     updated = patch_sample_pool(updated)
     if path.name in (
         "pump_amm_geyser_first.rs",
-        "invariants_pumpswap_amm_liquidation.rs",
         "invariants_dex_connector.rs",
     ):
         updated = patch_make_pump_amm_cache_with_reserves(updated)
+    updated = _patch_liquidation_tests_reset_globals(updated, path)
     if updated == original:
         return False
     path.write_text(updated, encoding="utf-8")
