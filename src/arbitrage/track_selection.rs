@@ -746,7 +746,7 @@ mod tests {
         }
     }
 
-    const MINT: &str = "TokenMint11111111111111111111111111111111";
+    const MINT: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
     const RESERVE_BASE: u64 = 1_000_000_000_000;
     const RESERVE_QUOTE: u64 = 1_000_000_000;
 
@@ -1155,6 +1155,30 @@ mod tests {
     #[test]
     fn fresh_sell_quote_classifies_pool_quote_ready_without_fresh_buy() {
         use std::time::{Duration, Instant};
+
+        use std::str::FromStr;
+
+        use crate::solana::dex::pumpfun_amm::{
+            pump_amm_canonical_pool_creator_for_base_mint, pump_amm_global_fee_config_loaded,
+            pump_amm_lookup_mint_supply, pump_amm_register_mint_supply_for_quote,
+            pump_amm_register_pool_creator_for_quote,
+            pump_amm_test_seed_fee_config_and_pool_context,
+        };
+        use solana_sdk::pubkey::Pubkey;
+
+        if let Ok(mint) = Pubkey::from_str(MINT) {
+            if !pump_amm_global_fee_config_loaded() {
+                pump_amm_test_seed_fee_config_and_pool_context(mint);
+            } else {
+                pump_amm_register_pool_creator_for_quote(
+                    mint,
+                    pump_amm_canonical_pool_creator_for_base_mint(&mint),
+                );
+                if pump_amm_lookup_mint_supply(&mint).is_none() {
+                    pump_amm_register_mint_supply_for_quote(mint, 1_000_000_000_000_000);
+                }
+            }
+        }
 
         let mut sell_vault = vault(RESERVE_BASE, RESERVE_QUOTE);
         sell_vault.updated_at = Instant::now();

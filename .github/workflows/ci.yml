@@ -147,6 +147,13 @@ jobs:
             fi
           done < <(find "$EVAL/tests" -name '*.rs' -print0)
 
+      # A.56: Pump AMM ExecutableMarginal quotes need tier-0 FeeConfig fixture + creator/supply in eval blackbox tests.
+      - name: Align eval Pump AMM A.56 quote fixtures (sample_pool + cache helpers)
+        run: |
+          set -euo pipefail
+          python3 "${{ github.workspace }}/Iron_crab/.github/scripts/align_eval_pump_amm_a56_quote_fixtures.py" \
+            "${{ github.workspace }}/Iron_crab-eval"
+
       - name: Patch eval git-dep to use PR checkout
         run: |
           cat >> "${{ github.workspace }}/Iron_crab-eval/Cargo.toml" <<'EOF'
@@ -177,7 +184,7 @@ jobs:
 
       - name: Eval tests
         working-directory: ${{ github.workspace }}/Iron_crab-eval
-        run: cargo test --quiet
+        run: cargo test --quiet -- --test-threads=1
 
   python-backend:
     name: Python backend (pyo3)

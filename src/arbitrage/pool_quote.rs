@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 use crate::execution::live_pool_cache::{CachedPoolState, MeteoraState};
 use crate::ipc::BinData;
 use crate::solana::dex::meteora_bin_walker::{dlmm_fee_bps, walker_from_bins};
+use crate::solana::dex::pumpfun_amm::{
+    pump_amm_executable_marginal_total_fee_bps, pump_amm_lookup_mint_supply,
+    pump_amm_lookup_pool_creator_by_base_mint, PumpAmmExecutableFeeInputs,
+};
 use solana_sdk::pubkey::Pubkey;
 
 pub use crate::solana::dex::orca_tick_walker::{
@@ -707,9 +711,39 @@ fn state_fresh(vault: &QuoteVaultInput, now: Instant, state_ttl_ms: u64) -> bool
 
 fn cpmm_fee_bps(dex: &str) -> u64 {
     match dex {
-        "pump_amm" => 100,
         "orca" => 30,
         _ => 25,
+    }
+}
+
+fn pump_amm_cpmm_fee_bps(
+    token_mint: &str,
+    base_reserve: u64,
+    quote_reserve: u64,
+    creator: Option<Pubkey>,
+) -> Option<u64> {
+    let base_mint = Pubkey::from_str(token_mint).ok()?;
+    let fee = pump_amm_executable_marginal_total_fee_bps(&PumpAmmExecutableFeeInputs {
+        base_mint,
+        creator,
+        base_mint_supply: pump_amm_lookup_mint_supply(&base_mint),
+        base_reserve,
+        quote_reserve,
+    })?;
+    Some(u64::from(fee))
+}
+
+fn cpmm_fee_bps_for_pool(
+    dex: &str,
+    token_mint: &str,
+    base_reserve: u64,
+    quote_reserve: u64,
+    creator: Option<Pubkey>,
+) -> Option<u64> {
+    if dex == "pump_amm" {
+        pump_amm_cpmm_fee_bps(token_mint, base_reserve, quote_reserve, creator)
+    } else {
+        Some(cpmm_fee_bps(dex))
     }
 }
 
@@ -953,7 +987,15 @@ fn executable_marginal_quote(
         return None;
     }
 
-    let fee_bps = cpmm_fee_bps(&pool.dex);
+    let fee_bps = cpmm_fee_bps_for_pool(
+        &pool.dex,
+        &pool.token_mint,
+        vault.reserve_base,
+        vault.reserve_quote,
+        pump_amm_lookup_pool_creator_by_base_mint(
+            &Pubkey::from_str(&pool.token_mint).unwrap_or_default(),
+        ),
+    )?;
     let (reserve_in, reserve_out) = match side {
         QuoteSide::Buy => (vault.reserve_quote as u128, vault.reserve_base as u128),
         QuoteSide::Sell => (vault.reserve_base as u128, vault.reserve_quote as u128),
@@ -1305,7 +1347,20 @@ fn cpmm_hop_from_cached_state(
     if !supports_cpmm(dex) && dex != "pumpfun" {
         return None;
     }
-    let fee_bps = cpmm_fee_bps(dex);
+    let fee_bps = if dex == "pump_amm" {
+        let CachedPoolState::PumpAmm(s) = state else {
+            return None;
+        };
+        cpmm_fee_bps_for_pool(
+            dex,
+            &s.base_mint.to_string(),
+            s.base_reserve?,
+            s.quote_reserve?,
+            s.creator,
+        )?
+    } else {
+        cpmm_fee_bps_for_pool(dex, mint_in, reserve_in as u64, reserve_out as u64, None)?
+    };
     let amount_out = cpmm_amount_out(reserve_in, reserve_out, amount_in, fee_bps)?;
     Some(PoolQuote {
         pool_address: pool_address.to_string(),
@@ -1755,7 +1810,18 @@ fn diagnose_executable_marginal_none(
     }
 
     let (reserve_in, reserve_out) = (vault.reserve_base as u128, vault.reserve_quote as u128);
-    if cpmm_amount_out(reserve_in, reserve_out, amount_in, cpmm_fee_bps(&pool.dex)).is_none() {
+    let Some(fee_bps) = cpmm_fee_bps_for_pool(
+        &pool.dex,
+        &pool.token_mint,
+        vault.reserve_base,
+        vault.reserve_quote,
+        pump_amm_lookup_pool_creator_by_base_mint(
+            &Pubkey::from_str(&pool.token_mint).unwrap_or_default(),
+        ),
+    ) else {
+        return Some(SellQuoteNoneDetailReason::CpmmMathNone);
+    };
+    if cpmm_amount_out(reserve_in, reserve_out, amount_in, fee_bps).is_none() {
         return Some(SellQuoteNoneDetailReason::CpmmMathNone);
     }
     None
@@ -1887,7 +1953,19 @@ fn cap_sell_token_in(
             &pool.token_mint,
         )
     {
-        let fee_bps = cpmm_fee_bps(&pool.dex);
+        let fee_bps = cpmm_fee_bps_for_pool(
+            &pool.dex,
+            &pool.token_mint,
+            vault.reserve_base,
+            vault.reserve_quote,
+            pump_amm_lookup_pool_creator_by_base_mint(
+                &Pubkey::from_str(&pool.token_mint).unwrap_or_default(),
+            ),
+        )
+        .unwrap_or(0);
+        if fee_bps == 0 && pool.dex == "pump_amm" {
+            return 0;
+        }
         let reserve_in = vault.reserve_base as u128;
         let reserve_out = vault.reserve_quote as u128;
         let mut lo = 0u64;
@@ -2393,11 +2471,35 @@ pub fn select_round_trip_pools_with_orca(
 mod tests {
     use super::*;
 
+    use crate::solana::dex::pumpfun_amm::{
+        pump_amm_canonical_pool_creator_for_base_mint, pump_amm_global_fee_config_loaded,
+        pump_amm_lookup_mint_supply, pump_amm_register_mint_supply_for_quote,
+        pump_amm_register_pool_creator_for_quote, pump_amm_test_seed_fee_config_and_pool_context,
+    };
+
+    const SAMPLE_TOKEN_MINT: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
+
     fn sample_pool(dex: &str, address: &str) -> QuotePoolInput {
+        let token_mint = SAMPLE_TOKEN_MINT.to_string();
+        if dex == "pump_amm" {
+            if let Ok(mint) = Pubkey::from_str(&token_mint) {
+                if !pump_amm_global_fee_config_loaded() {
+                    pump_amm_test_seed_fee_config_and_pool_context(mint);
+                } else {
+                    pump_amm_register_pool_creator_for_quote(
+                        mint,
+                        pump_amm_canonical_pool_creator_for_base_mint(&mint),
+                    );
+                    if pump_amm_lookup_mint_supply(&mint).is_none() {
+                        pump_amm_register_mint_supply_for_quote(mint, 1_000_000_000_000_000);
+                    }
+                }
+            }
+        }
         QuotePoolInput {
             pool_address: address.to_string(),
             dex: dex.to_string(),
-            token_mint: "TokenMint11111111111111111111111111111111".to_string(),
+            token_mint,
             trade_price_buy: None,
             trade_price_sell: None,
             trade_updated_at: Instant::now(),

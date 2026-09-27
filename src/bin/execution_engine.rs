@@ -135,7 +135,11 @@ use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::meteora_dlmm::MeteoraDlmm;
 use ironcrab::solana::dex::orca::Orca;
 use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
-use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
+use ironcrab::solana::dex::pumpfun_amm::{
+    pump_amm_canonical_pool_creator_for_base_mint, pump_amm_register_mint_supply_for_quote,
+    pump_amm_register_pool_creator_for_quote, pump_amm_reload_tier0_bootstrap_fee_config_fixture,
+    PumpFunAmmDex,
+};
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::router::Router;
 use ironcrab::solana::dex::Dex;
@@ -10218,6 +10222,12 @@ async fn build_replay_context(
         } else {
             (Pubkey::new_unique(), Pubkey::new_unique())
         };
+        // Golden 6005 replay only: synthetic pool has no on-chain FeeConfig/Creator; seed test
+        // fixture bytes + canonical creator so A.56 quote path can build retry intent (no NATS discovery).
+        pump_amm_reload_tier0_bootstrap_fee_config_fixture();
+        let creator = pump_amm_canonical_pool_creator_for_base_mint(&base_mint);
+        pump_amm_register_pool_creator_for_quote(base_mint, creator);
+        pump_amm_register_mint_supply_for_quote(base_mint, 1_000_000_000_000_000);
         let state = CachedPoolState::PumpAmm(PumpAmmState {
             base_mint,
             quote_mint,
@@ -10226,10 +10236,11 @@ async fn build_replay_context(
             base_reserve: Some(1_000_000_000_000),
             quote_reserve: Some(50_000_000_000),
             pool_accounts: pool_accounts.clone(),
-            creator: None,
+            creator: Some(creator),
         });
         let cache = LivePoolCache::new();
         cache.upsert(pool_market, state, 0);
+        cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
         if let Some(balance) = f.initial_token_balance {
             lock_manager.set_available_token_balance(f.base_mint.clone(), balance);
         }

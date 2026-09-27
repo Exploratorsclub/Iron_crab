@@ -3,9 +3,14 @@
 //! Verifies A.1 Geyser-First: With LivePoolCache and cache hit, no RPC is called.
 //! RPC uses unreachable URL (http://127.0.0.1:0) — tests pass only if cache path is used.
 
-use ironcrab::execution::live_pool_cache::{CachedPoolState, LivePoolCache, PumpAmmState};
+use ironcrab::execution::live_pool_cache::{
+    create_shared_cache, CachedPoolState, LivePoolCache, PumpAmmState,
+};
 use ironcrab::ipc::DexPoolReadiness;
-use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
+use ironcrab::solana::dex::pumpfun_amm::{
+    pump_amm_canonical_pool_creator_for_base_mint,
+    pump_amm_reload_tier0_bootstrap_fee_config_fixture, PumpFunAmmDex,
+};
 use ironcrab::solana::dex::Dex;
 use ironcrab::solana::rpc::SolanaRpc;
 use solana_sdk::pubkey::Pubkey;
@@ -21,7 +26,9 @@ fn make_pump_amm_cache_with_reserves(
     base_reserve: u64,
     quote_reserve: u64,
 ) -> Arc<LivePoolCache> {
-    let cache = LivePoolCache::new();
+    pump_amm_reload_tier0_bootstrap_fee_config_fixture();
+    let cache = create_shared_cache();
+    let creator = pump_amm_canonical_pool_creator_for_base_mint(&base_mint);
     cache.upsert(
         pool_market,
         CachedPoolState::PumpAmm(PumpAmmState {
@@ -32,11 +39,11 @@ fn make_pump_amm_cache_with_reserves(
             base_reserve: Some(base_reserve),
             quote_reserve: Some(quote_reserve),
             pool_accounts: vec![],
-            creator: None,
+            creator: Some(creator),
         }),
         100,
     );
-    Arc::new(cache)
+    cache
 }
 
 fn make_pump_amm_cache_with_pool_accounts(
@@ -44,7 +51,9 @@ fn make_pump_amm_cache_with_pool_accounts(
     base_mint: Pubkey,
     pool_accounts: Vec<Pubkey>,
 ) -> Arc<LivePoolCache> {
-    let cache = LivePoolCache::new();
+    pump_amm_reload_tier0_bootstrap_fee_config_fixture();
+    let cache = create_shared_cache();
+    let creator = pump_amm_canonical_pool_creator_for_base_mint(&base_mint);
     cache.upsert(
         pool_market,
         CachedPoolState::PumpAmm(PumpAmmState {
@@ -55,12 +64,12 @@ fn make_pump_amm_cache_with_pool_accounts(
             base_reserve: Some(1),
             quote_reserve: Some(1),
             pool_accounts,
-            creator: None,
+            creator: Some(creator),
         }),
         100,
     );
     cache.merge_pump_amm_pool_accounts_readiness(pool_market, DexPoolReadiness::Ready);
-    Arc::new(cache)
+    cache
 }
 
 #[tokio::test]

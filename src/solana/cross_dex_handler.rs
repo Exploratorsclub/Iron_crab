@@ -1829,6 +1829,7 @@ mod tests {
     use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
     use crate::solana::dex::pumpfun_amm::{
         pump_amm_buy_program_ix_index, pump_amm_canonical_global_config,
+        pump_amm_lookup_pool_creator_by_base_mint, pump_amm_test_seed_fee_config_and_pool_context,
         PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR, PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
         PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
     };
@@ -1859,6 +1860,8 @@ mod tests {
         base_reserve: u64,
         quote_reserve: u64,
     ) -> Arc<LivePoolCache> {
+        pump_amm_test_seed_fee_config_and_pool_context(base_mint);
+        let creator = pump_amm_lookup_pool_creator_by_base_mint(&base_mint);
         let cache = LivePoolCache::new();
         cache.upsert(
             pool_market,
@@ -1870,7 +1873,7 @@ mod tests {
                 base_reserve: Some(base_reserve),
                 quote_reserve: Some(quote_reserve),
                 pool_accounts: vec![],
-                creator: None,
+                creator,
             }),
             100,
         );
