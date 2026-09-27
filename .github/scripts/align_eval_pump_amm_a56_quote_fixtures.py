@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""CI-only: patch ironcrab-eval tests for A.56 Pump AMM ExecutableMarginal FeeConfig fixtures."""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+MARKER = "pump_amm_reload_tier0_bootstrap_fee_config_fixture"
+FIXTURE_MINT = "TokenMint11111111111111111111111111111111"
+SUPPLY: int = 1_000_000_000_000_000
+
+PUMP_USE = """use ironcrab::solana::dex::pumpfun_amm::{
+    pump_amm_canonical_pool_creator_for_base_mint, pump_amm_register_mint_supply_for_quote,
+    pump_amm_register_pool_creator_for_quote, pump_amm_reload_tier0_bootstrap_fee_config_fixture,
+};
+"""
+
+SAMPLE_POOL_SEED = f"""    if dex == "pump_amm" {{
+        {MARKER}();
+        let mint = Pubkey::from_str("{FIXTURE_MINT}").unwrap();
+        let creator = pump_amm_canonical_pool_creator_for_base_mint(&mint);
+        pump_amm_register_pool_creator_for_quote(mint, creator);
+        pump_amm_register_mint_supply_for_quote(mint, {SUPPLY});
+    }}
+"""
+
+CACHE_RESERVES_SEED = f"""    {MARKER}();
+    let creator = pump_amm_canonical_pool_creator_for_base_mint(&base_mint);
+    pump_amm_register_pool_creator_for_quote(base_mint, creator);
+    pump_amm_register_mint_supply_for_quote(base_mint, {SUPPLY});
+"""
+
+
+def _needs_pump_imports(text: str) -> bool:
+    return (
+        "pump_amm_canonical_pool_creator_for_base_mint" not in text
+        or MARKER not in text
+        or "pump_amm_register_pool_creator_for_quote" not in text
+    )
+
+
+def _insert_pump_use_block(text: str) -> str:
+    if not _needs_pump_imports(text):
+        return text
+    anchor = re.search(r"^(fn |const |#\[test\])", text, re.MULTILINE)
+    pos = anchor.start() if anchor else len(text)
+    return text[:pos] + PUMP_USE + "\n" + text[pos:]
+
+
+def _ensure_from_str_import(text: str) -> str:
+    if "use std::str::FromStr;" in text:
+        return text
+    if "Pubkey::from_str" not in text:
+        return text
+    anchor = re.search(r"^(fn |const |#\[test\])", text, re.MULTILINE)
+    pos = anchor.start() if anchor else len(text)
+    return text[:pos] + "use std::str::FromStr;\n" + text[pos:]
+
+
+def _ensure_pubkey_import(text: str) -> str:
+    if "use solana_sdk::pubkey::Pubkey;" in text:
+        return text
+    if "Pubkey::" not in text:
+        return text
+    anchor = re.search(r"^(fn |const |#\[test\])", text, re.MULTILINE)
+    pos = anchor.start() if anchor else len(text)
+    return text[:pos] + "use solana_sdk::pubkey::Pubkey;\n" + text[pos:]
+
+
+def _function_body_span(text: str, fn_name: str) -> tuple[int, int] | None:
+    m = re.search(rf"\bfn {re.escape(fn_name)}\(", text)
+    if not m:
+        return None
+    brace = text.find("{", m.end())
+    if brace < 0:
+        return None
+    depth = 0
+    for offset, ch in enumerate(text[brace:], start=0):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return brace + 1, brace + offset
+    return None
+
+
+def _sample_pool_already_seeded(text: str) -> bool:
+    return bool(
+        re.search(r'if dex == "pump_amm"[\s\S]{0,500}' + re.escape(MARKER), text)
+    )
+
+
+def patch_sample_pool(text: str) -> str:
+    if _sample_pool_already_seeded(text):
+        return text
+    m = re.search(r"fn sample_pool\([^)]*\)\s*->\s*QuotePoolInput\s*\{", text)
+    if not m:
+        return text
+    text = _insert_pump_use_block(text)
+    text = _ensure_pubkey_import(text)
+    text = _ensure_from_str_import(text)
+    m = re.search(r"fn sample_pool\([^)]*\)\s*->\s*QuotePoolInput\s*\{", text)
+    if not m:
+        return text
+    return text[: m.end()] + "\n" + SAMPLE_POOL_SEED + text[m.end() :]
+
+
+def patch_make_pump_amm_cache_with_reserves(text: str) -> str:
+    span = _function_body_span(text, "make_pump_amm_cache_with_reserves")
+    if span is None:
+        return text
+    body_start, body_end = span
+    if MARKER in text[body_start:body_end]:
+        return text
+    text = _insert_pump_use_block(text)
+    text = _ensure_pubkey_import(text)
+    span = _function_body_span(text, "make_pump_amm_cache_with_reserves")
+    if span is None:
+        return text
+    body_start, body_end = span
+    body = text[body_start:body_end]
+    new_body = CACHE_RESERVES_SEED + body
+    new_body = re.sub(
+        r"creator:\s*None,",
+        "creator: Some(creator),",
+        new_body,
+        count=1,
+    )
+    return text[:body_start] + "\n" + new_body + text[body_end:]
+
+
+def patch_file(path: Path) -> bool:
+    original = path.read_text(encoding="utf-8")
+    updated = original
+    updated = patch_sample_pool(updated)
+    if path.name in (
+        "pump_amm_geyser_first.rs",
+        "invariants_pumpswap_amm_liquidation.rs",
+    ):
+        updated = patch_make_pump_amm_cache_with_reserves(updated)
+    if updated == original:
+        return False
+    path.write_text(updated, encoding="utf-8")
+    return True
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: align_eval_pump_amm_a56_quote_fixtures.py EVAL_ROOT", file=sys.stderr)
+        return 2
+    eval_root = Path(sys.argv[1])
+    tests = eval_root / "tests"
+    if not tests.is_dir():
+        print(f"missing tests dir: {tests}", file=sys.stderr)
+        return 1
+    changed = 0
+    for path in sorted(tests.glob("*.rs")):
+        if patch_file(path):
+            changed += 1
+            print(f"aligned {path.relative_to(eval_root)}")
+    print(f"align_eval_pump_amm_a56: {changed} file(s) updated")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
