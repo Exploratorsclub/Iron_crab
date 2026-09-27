@@ -9,7 +9,7 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 ### FIX-PUMP-FEE-CONFIG: Pump AMM ExecutableMarginal nutzte feste 100/125 bps statt FeeConfig (A.56)
 **Datum**: 2026-09-27  
 **Problem**: Screening (`cpmm_fee_bps` 100) und Execution-Quote (`DEFAULT_TOTAL_FEE_BPS` 125) wichen von on-chain FeeConfig ab; Prod-Orca↔Pump-Round-Trips lagen artefaktbedingt bei −99/−100 bps.  
-**Fix**: FeeConfig-Account `5PHirr8…` per Geyser cachen; Quote zieht `lp+protocol+creator` bps (Tier-Walk wie Pump Fees SDK) aus Reserves + Mint-Supply + Creator; ohne Cache/Inputs `None`. Explicit-Subscribe in `cache_geyser`.  
+**Fix**: FeeConfig-Account `5PHirr8…` per Geyser cachen; Quote zieht `lp+protocol+creator` bps (Tier-Walk wie Pump Fees SDK) aus Reserves + Mint-Supply + Creator; ohne Cache/Inputs `None`. Explicit-Subscribe in `cache_geyser`. Kein synthetischer Bootstrap in `create_shared_cache` (nur Test-Fixtures seeden explizit).  
 **Invarianten**: A.56, I-7, I-MD-5; A.54/Orca unverändert.  
 **Dateien**: `src/solana/dex/pumpfun_amm.rs`, `src/arbitrage/pool_quote.rs`, `src/execution/live_pool_cache.rs`, `src/execution/cache_geyser.rs`, `docs/BUGS_FIXES.md`
 

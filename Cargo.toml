@@ -194,3 +194,13 @@ name = "multi_hop_search_worker"
 path = "tests/multi_hop_search_worker.rs"
 required-features = ["test_helpers"]
 
+[[test]]
+name = "dex_connector_contracts"
+path = "tests/dex_connector_contracts.rs"
+required-features = ["test_helpers"]
+
+[[test]]
+name = "pump_amm_geyser_first_test"
+path = "tests/pump_amm_geyser_first_test.rs"
+required-features = ["test_helpers"]
+

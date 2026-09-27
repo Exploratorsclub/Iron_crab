@@ -369,7 +369,7 @@ pub fn pump_amm_explicit_geyser_subscribe_accounts() -> &'static [Pubkey] {
     ACCOUNTS.as_slice()
 }
 
-fn pump_amm_tier0_bootstrap_fee_config_account_data() -> Vec<u8> {
+fn pump_amm_test_tier0_fee_config_fixture_account_data() -> Vec<u8> {
     let mut data = Vec::with_capacity(128);
     data.extend_from_slice(&PUMP_AMM_FEE_CONFIG_ACCOUNT_DISCRIMINATOR);
     data.push(255);
@@ -385,23 +385,12 @@ fn pump_amm_tier0_bootstrap_fee_config_account_data() -> Vec<u8> {
     data
 }
 
-/// One-time bootstrap so quotes can run before the first Geyser FeeConfig snapshot (overwritten on live update).
-pub fn pump_amm_bootstrap_fee_config_until_geyser() {
-    static BOOTSTRAP: std::sync::Once = std::sync::Once::new();
-    BOOTSTRAP.call_once(|| {
-        if pump_amm_global_fee_config_loaded() {
-            return;
-        }
-        let _ = pump_amm_update_global_fee_config_account(
-            &pump_amm_tier0_bootstrap_fee_config_account_data(),
-        );
-    });
-}
-
-/// Idempotent reload of the same tier-0 bootstrap FeeConfig bytes (tests / integration after cache reset).
+/// Loads tier-0 FeeConfig **fixture bytes** for unit/integration tests only (125 bps total).
+/// Production must not call — real quotes require Geyser snapshot of `5PHirr8…` (A.56).
+#[doc(hidden)]
 pub fn pump_amm_reload_tier0_bootstrap_fee_config_fixture() {
     let _ = pump_amm_update_global_fee_config_account(
-        &pump_amm_tier0_bootstrap_fee_config_account_data(),
+        &pump_amm_test_tier0_fee_config_fixture_account_data(),
     );
 }
 

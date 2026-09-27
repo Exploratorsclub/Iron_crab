@@ -49,10 +49,10 @@ use crate::ipc::DexPoolReadiness;
 use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
 use crate::solana::dex::orca_whirlpool_layout::{self, WhirlpoolParsed};
 use crate::solana::dex::pumpfun_amm::{
-    pump_amm_bootstrap_fee_config_until_geyser, pump_amm_global_fee_config_pubkey,
-    pump_amm_normalize_v14_pool_accounts, pump_amm_register_mint_supply_for_quote,
-    pump_amm_register_pool_creator_for_quote, pump_amm_sell_extended_layout_ready,
-    pump_amm_update_global_fee_config_account, PumpAmmSellExtendedReadinessParams,
+    pump_amm_global_fee_config_pubkey, pump_amm_normalize_v14_pool_accounts,
+    pump_amm_register_mint_supply_for_quote, pump_amm_register_pool_creator_for_quote,
+    pump_amm_sell_extended_layout_ready, pump_amm_update_global_fee_config_account,
+    PumpAmmSellExtendedReadinessParams,
 };
 
 // ============================================================================
@@ -3050,7 +3050,6 @@ pub type SharedLivePoolCache = Arc<LivePoolCache>;
 
 /// Create a new shared cache
 pub fn create_shared_cache() -> SharedLivePoolCache {
-    pump_amm_bootstrap_fee_config_until_geyser();
     Arc::new(LivePoolCache::new())
 }
 
