@@ -184,7 +184,7 @@ jobs:
 
       - name: Eval tests
         working-directory: ${{ github.workspace }}/Iron_crab-eval
-        run: cargo test --quiet
+        run: cargo test --quiet -- --test-threads=1
 
   python-backend:
     name: Python backend (pyo3)
