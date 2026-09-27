@@ -16,6 +16,8 @@
 #[cfg(not(windows))]
 use super::live_pool_cache::parse_pool_account;
 use super::live_pool_cache::SharedLivePoolCache;
+#[cfg(not(windows))]
+use crate::solana::dex::pumpfun_amm::pump_amm_explicit_geyser_subscribe_accounts;
 use anyhow::{anyhow, Result};
 use solana_sdk::pubkey::Pubkey;
 #[cfg(not(windows))]
@@ -254,6 +256,7 @@ async fn run_cache_subscription(
                                         // Is this a MINT account? (82 bytes, owned by Token Program or Token-2022)
                                         // The owner of the mint account IS the token program!
                                         if data_len == 82 && (owner == token_program || owner == token_2022_program) {
+                                            cache.update_mint_supply_from_geyser(&pubkey, &account_info.data);
                                             // This mint uses the token program indicated by `owner`
                                             cache.update_mint_program(&pubkey, owner);
                                             mint_update_count += 1;
@@ -285,6 +288,8 @@ async fn run_cache_subscription(
                                                     );
                                                 }
                                             }
+                                        } else if pubkey == pump_amm_explicit_geyser_subscribe_accounts()[0] {
+                                            cache.update_pump_amm_global_fee_config_account(&account_info.data);
                                         } else {
                                             // Try to parse as pool account
                                             if let Some(state) = parse_pool_account(&owner, &account_info.data) {
@@ -414,6 +419,23 @@ fn build_cache_subscribe_request(
                 },
             );
         }
+    }
+
+    let pump_fee_config_accounts: Vec<String> = pump_amm_explicit_geyser_subscribe_accounts()
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+    if !pump_fee_config_accounts.is_empty() {
+        accounts_filter.insert(
+            "pump_amm_global_fee_config".to_string(),
+            SubscribeRequestFilterAccounts {
+                account: pump_fee_config_accounts,
+                owner: vec![],
+                filters: vec![],
+                nonempty_txn_signature: None,
+                cuckoo_accounts_filter: None,
+            },
+        );
     }
 
     SubscribeRequest {

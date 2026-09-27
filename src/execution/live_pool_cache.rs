@@ -49,8 +49,10 @@ use crate::ipc::DexPoolReadiness;
 use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
 use crate::solana::dex::orca_whirlpool_layout::{self, WhirlpoolParsed};
 use crate::solana::dex::pumpfun_amm::{
-    pump_amm_normalize_v14_pool_accounts, pump_amm_sell_extended_layout_ready,
-    PumpAmmSellExtendedReadinessParams,
+    pump_amm_bootstrap_fee_config_until_geyser, pump_amm_global_fee_config_pubkey,
+    pump_amm_normalize_v14_pool_accounts, pump_amm_register_mint_supply_for_quote,
+    pump_amm_register_pool_creator_for_quote, pump_amm_sell_extended_layout_ready,
+    pump_amm_update_global_fee_config_account, PumpAmmSellExtendedReadinessParams,
 };
 
 // ============================================================================
@@ -979,6 +981,11 @@ impl LivePoolCache {
 
         // I-4b: never touch `vault_to_pool` while a `pools` entry guard is held.
         self.register_vaults(&pool, &entry_to_store.state);
+        if let CachedPoolState::PumpAmm(ref s) = entry_to_store.state {
+            if let Some(creator) = s.creator {
+                pump_amm_register_pool_creator_for_quote(s.base_mint, creator);
+            }
+        }
 
         match self.pools.entry(pool) {
             Entry::Vacant(v) => {
@@ -2096,6 +2103,40 @@ impl LivePoolCache {
         None
     }
 
+    /// Pump AMM pool creator for FeeConfig tier selection (A.56).
+    pub fn get_pump_amm_creator_by_base_mint(&self, base_mint: &Pubkey) -> Option<Pubkey> {
+        for entry in self.pools.iter() {
+            if let CachedPoolState::PumpAmm(ref s) = entry.value().state {
+                if s.base_mint == *base_mint {
+                    return s.creator;
+                }
+            }
+        }
+        None
+    }
+
+    /// Ingest Geyser update for the global Pump AMM FeeConfig account (explicit subscribe, I-MD-5).
+    pub fn update_pump_amm_global_fee_config_account(&self, data: &[u8]) -> bool {
+        let _ = self;
+        pump_amm_update_global_fee_config_account(data)
+    }
+
+    /// Parse SPL mint supply (offset 36, u64) for Pump fee tier market-cap (Geyser only).
+    pub fn update_mint_supply_from_geyser(&self, mint: &Pubkey, data: &[u8]) -> bool {
+        if data.len() < 44 {
+            return false;
+        }
+        let supply = u64::from_le_bytes(data[36..44].try_into().unwrap_or([0; 8]));
+        pump_amm_register_mint_supply_for_quote(*mint, supply);
+        true
+    }
+
+    #[must_use]
+    pub fn pump_amm_global_fee_config_geyser_pubkey(&self) -> Pubkey {
+        let _ = self;
+        pump_amm_global_fee_config_pubkey()
+    }
+
     /// Get the pool market address for a PumpAmm pool by base_mint, regardless of whether
     /// pool_accounts or reserves are populated. Used as a fast-path in discover_pool_static
     /// to do a single getAccount instead of the slow getProgramAccounts scan.
@@ -3009,6 +3050,7 @@ pub type SharedLivePoolCache = Arc<LivePoolCache>;
 
 /// Create a new shared cache
 pub fn create_shared_cache() -> SharedLivePoolCache {
+    pump_amm_bootstrap_fee_config_until_geyser();
     Arc::new(LivePoolCache::new())
 }
 

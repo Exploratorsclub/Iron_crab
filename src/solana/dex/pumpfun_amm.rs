@@ -183,9 +183,307 @@ const PUMPFUN_AMM_MARKET_MIN_DATA_LEN: usize = PUMPFUN_AMM_MARKET_QUOTE_MINT_OFF
 // Distinct from bonding-curve `creator-vault` (hyphen) — AMM uses underscore `creator_vault` + this seed.
 const PUMPFUN_AMM_MARKET_CREATOR_SEED_OFFSET: usize = 211;
 
-// Observed on-chain: buy_exact_quote_in fee fields sum to 125 bps (lp 2 + protocol 93 + creator 30).
-// We use that as a conservative default for quoting.
-const DEFAULT_TOTAL_FEE_BPS: u32 = 125;
+/// Anchor discriminator for Pump Fees program `FeeConfig` account (`fee_config.rs` in pump-public-docs).
+pub const PUMP_AMM_FEE_CONFIG_ACCOUNT_DISCRIMINATOR: [u8; 8] =
+    [143, 52, 146, 187, 219, 123, 76, 155];
+
+/// Parsed fee basis points from a Pump Fees `FeeConfig` account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PumpAmmFeesBps {
+    pub lp_fee_bps: u64,
+    pub protocol_fee_bps: u64,
+    pub creator_fee_bps: u64,
+}
+
+impl PumpAmmFeesBps {
+    #[must_use]
+    pub fn total_bps(&self) -> u32 {
+        let sum = self
+            .lp_fee_bps
+            .saturating_add(self.protocol_fee_bps)
+            .saturating_add(self.creator_fee_bps);
+        u32::try_from(sum).unwrap_or(u32::MAX)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PumpAmmFeeConfigSnapshot {
+    pub flat_fees: PumpAmmFeesBps,
+    pub fee_tiers: Vec<(u128, PumpAmmFeesBps)>,
+}
+
+/// Inputs for ExecutableMarginal Pump AMM CPMM fee (A.56).
+#[derive(Debug, Clone, Copy)]
+pub struct PumpAmmExecutableFeeInputs {
+    pub base_mint: Pubkey,
+    pub creator: Option<Pubkey>,
+    pub base_mint_supply: Option<u64>,
+    pub base_reserve: u64,
+    pub quote_reserve: u64,
+}
+
+static PUMP_AMM_FEE_CONFIG_CACHE: LazyLock<std::sync::RwLock<Option<PumpAmmFeeConfigSnapshot>>> =
+    LazyLock::new(|| std::sync::RwLock::new(None));
+static PUMP_AMM_CREATOR_BY_BASE_MINT: LazyLock<DashMap<Pubkey, Pubkey>> =
+    LazyLock::new(DashMap::new);
+static PUMP_AMM_MINT_SUPPLY_BY_MINT: LazyLock<DashMap<Pubkey, u64>> = LazyLock::new(DashMap::new);
+
+fn read_u64_le(data: &[u8], off: &mut usize) -> Option<u64> {
+    let end = off.checked_add(8)?;
+    let val = u64::from_le_bytes(data.get(*off..end)?.try_into().ok()?);
+    *off = end;
+    Some(val)
+}
+
+fn read_u128_le(data: &[u8], off: &mut usize) -> Option<u128> {
+    let lo = read_u64_le(data, off)?;
+    let hi = read_u64_le(data, off)?;
+    Some(u128::from(lo) | (u128::from(hi) << 64))
+}
+
+fn read_fees_bps(data: &[u8], off: &mut usize) -> Option<PumpAmmFeesBps> {
+    Some(PumpAmmFeesBps {
+        lp_fee_bps: read_u64_le(data, off)?,
+        protocol_fee_bps: read_u64_le(data, off)?,
+        creator_fee_bps: read_u64_le(data, off)?,
+    })
+}
+
+/// Parse Pump Fees program global `FeeConfig` account bytes (Borsh layout).
+pub fn parse_pump_amm_fee_config_account(data: &[u8]) -> Option<PumpAmmFeeConfigSnapshot> {
+    if data.len() < 8 + 1 + 32 + 24 + 4 {
+        return None;
+    }
+    if data[..8] != PUMP_AMM_FEE_CONFIG_ACCOUNT_DISCRIMINATOR {
+        return None;
+    }
+    let mut off = 8usize;
+    off += 1; // bump
+    off += 32; // admin
+    let flat_fees = read_fees_bps(data, &mut off)?;
+    let tier_count = {
+        let end = off.checked_add(4)?;
+        let n = u32::from_le_bytes(data.get(off..end)?.try_into().ok()?) as usize;
+        off = end;
+        n
+    };
+    if tier_count > 64 {
+        return None;
+    }
+    let mut fee_tiers = Vec::with_capacity(tier_count);
+    for _ in 0..tier_count {
+        let threshold = read_u128_le(data, &mut off)?;
+        let fees = read_fees_bps(data, &mut off)?;
+        fee_tiers.push((threshold, fees));
+    }
+    if off > data.len() {
+        return None;
+    }
+    Some(PumpAmmFeeConfigSnapshot {
+        flat_fees,
+        fee_tiers,
+    })
+}
+
+fn pump_pool_authority_pda(base_mint: &Pubkey) -> Pubkey {
+    let pump_program =
+        Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap_or_default();
+    Pubkey::find_program_address(&[b"pool-authority", base_mint.as_ref()], &pump_program).0
+}
+
+fn is_pump_canonical_pool(base_mint: &Pubkey, creator: Pubkey) -> bool {
+    pump_pool_authority_pda(base_mint) == creator
+}
+
+fn pool_market_cap_lamports(
+    base_mint_supply: u64,
+    base_reserve: u64,
+    quote_reserve: u64,
+) -> Option<u128> {
+    if base_reserve == 0 {
+        return None;
+    }
+    let supply = u128::from(base_mint_supply);
+    let cap = u128::from(quote_reserve)
+        .checked_mul(supply)?
+        .checked_div(u128::from(base_reserve))?;
+    Some(cap)
+}
+
+fn calculate_fee_tier(
+    fee_tiers: &[(u128, PumpAmmFeesBps)],
+    market_cap_lamports: u128,
+) -> Option<PumpAmmFeesBps> {
+    let first = fee_tiers.first()?;
+    if market_cap_lamports < first.0 {
+        return Some(first.1);
+    }
+    for tier in fee_tiers.iter().rev() {
+        if market_cap_lamports >= tier.0 {
+            return Some(tier.1);
+        }
+    }
+    Some(first.1)
+}
+
+fn select_executable_fees(
+    snapshot: &PumpAmmFeeConfigSnapshot,
+    inputs: &PumpAmmExecutableFeeInputs,
+) -> Option<PumpAmmFeesBps> {
+    let creator = inputs.creator?;
+    if is_pump_canonical_pool(&inputs.base_mint, creator) {
+        if snapshot.fee_tiers.is_empty() {
+            return None;
+        }
+        let market_cap = if let Some(supply) = inputs.base_mint_supply {
+            pool_market_cap_lamports(supply, inputs.base_reserve, inputs.quote_reserve)?
+        } else if snapshot.fee_tiers.first().is_some_and(|t| t.0 == 0) {
+            // Tier-0 threshold 0: fee does not depend on market cap (Pump fee_tier walk).
+            0
+        } else {
+            return None;
+        };
+        calculate_fee_tier(&snapshot.fee_tiers, market_cap)
+    } else {
+        Some(snapshot.flat_fees)
+    }
+}
+
+/// Pump.fun bonding-curve pool authority PDA for canonical PumpSwap pool check.
+#[must_use]
+pub fn pump_amm_canonical_pool_creator_for_base_mint(base_mint: &Pubkey) -> Pubkey {
+    pump_pool_authority_pda(base_mint)
+}
+
+/// Global FeeConfig pubkey subscribed via Geyser (A.56 / I-MD-5).
+#[must_use]
+pub fn pump_amm_global_fee_config_pubkey() -> Pubkey {
+    Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap_or_default()
+}
+
+/// Explicit Geyser account subscriptions for Pump AMM global fee config (single account).
+#[must_use]
+pub fn pump_amm_explicit_geyser_subscribe_accounts() -> &'static [Pubkey] {
+    static ACCOUNTS: LazyLock<[Pubkey; 1]> =
+        LazyLock::new(|| [pump_amm_global_fee_config_pubkey()]);
+    ACCOUNTS.as_slice()
+}
+
+/// One-time bootstrap so quotes can run before the first Geyser FeeConfig snapshot (overwritten on live update).
+pub fn pump_amm_bootstrap_fee_config_until_geyser() {
+    static BOOTSTRAP: std::sync::Once = std::sync::Once::new();
+    BOOTSTRAP.call_once(|| {
+        if pump_amm_global_fee_config_loaded() {
+            return;
+        }
+        let mut data = Vec::with_capacity(128);
+        data.extend_from_slice(&PUMP_AMM_FEE_CONFIG_ACCOUNT_DISCRIMINATOR);
+        data.push(255);
+        data.extend_from_slice(&Pubkey::default().to_bytes());
+        for v in [25u64, 5, 0] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u128.to_le_bytes());
+        for v in [2u64, 93, 30] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let _ = pump_amm_update_global_fee_config_account(&data);
+    });
+}
+
+/// Update cached global FeeConfig from Geyser account data (no RPC on quote path).
+pub fn pump_amm_update_global_fee_config_account(data: &[u8]) -> bool {
+    let Some(parsed) = parse_pump_amm_fee_config_account(data) else {
+        return false;
+    };
+    if let Ok(mut guard) = PUMP_AMM_FEE_CONFIG_CACHE.write() {
+        *guard = Some(parsed);
+        true
+    } else {
+        false
+    }
+}
+
+pub fn pump_amm_register_pool_creator_for_quote(base_mint: Pubkey, creator: Pubkey) {
+    if creator != Pubkey::default() {
+        PUMP_AMM_CREATOR_BY_BASE_MINT.insert(base_mint, creator);
+    }
+}
+
+pub fn pump_amm_register_mint_supply_for_quote(mint: Pubkey, supply: u64) {
+    PUMP_AMM_MINT_SUPPLY_BY_MINT.insert(mint, supply);
+}
+
+#[must_use]
+pub fn pump_amm_lookup_pool_creator_by_base_mint(base_mint: &Pubkey) -> Option<Pubkey> {
+    PUMP_AMM_CREATOR_BY_BASE_MINT.get(base_mint).map(|r| *r)
+}
+
+#[must_use]
+pub fn pump_amm_lookup_mint_supply(mint: &Pubkey) -> Option<u64> {
+    PUMP_AMM_MINT_SUPPLY_BY_MINT.get(mint).map(|r| *r)
+}
+
+#[must_use]
+pub fn pump_amm_global_fee_config_loaded() -> bool {
+    PUMP_AMM_FEE_CONFIG_CACHE
+        .read()
+        .ok()
+        .is_some_and(|g| g.is_some())
+}
+
+/// Total fee bps for Pump AMM ExecutableMarginal quotes; `None` if FeeConfig cache or tier inputs missing.
+#[must_use]
+pub fn pump_amm_executable_marginal_total_fee_bps(
+    inputs: &PumpAmmExecutableFeeInputs,
+) -> Option<u32> {
+    let mut inputs = *inputs;
+    let creator = inputs.creator.or_else(|| {
+        pump_amm_lookup_pool_creator_by_base_mint(&inputs.base_mint).or_else(|| {
+            Some(pump_amm_canonical_pool_creator_for_base_mint(
+                &inputs.base_mint,
+            ))
+        })
+    });
+    inputs.creator = creator;
+    let guard = PUMP_AMM_FEE_CONFIG_CACHE.read().ok()?;
+    let snapshot = guard.as_ref()?;
+    let fees = select_executable_fees(snapshot, &inputs)?;
+    Some(fees.total_bps())
+}
+
+#[cfg(test)]
+pub fn pump_amm_test_reset_fee_quote_cache() {
+    if let Ok(mut guard) = PUMP_AMM_FEE_CONFIG_CACHE.write() {
+        *guard = None;
+    }
+    PUMP_AMM_CREATOR_BY_BASE_MINT.clear();
+    PUMP_AMM_MINT_SUPPLY_BY_MINT.clear();
+}
+
+/// Minimal one-tier FeeConfig (tier-0 total 125 bps) for unit tests.
+#[cfg(test)]
+pub fn pump_amm_test_seed_fee_config_and_pool_context(base_mint: Pubkey) {
+    if !pump_amm_global_fee_config_loaded() {
+        let mut data = Vec::with_capacity(128);
+        data.extend_from_slice(&PUMP_AMM_FEE_CONFIG_ACCOUNT_DISCRIMINATOR);
+        data.push(255);
+        data.extend_from_slice(&Pubkey::default().to_bytes());
+        for v in [25u64, 5, 0] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u128.to_le_bytes());
+        for v in [2u64, 93, 30] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        assert!(pump_amm_update_global_fee_config_account(&data));
+    }
+    let creator = pump_pool_authority_pda(&base_mint);
+    pump_amm_register_pool_creator_for_quote(base_mint, creator);
+    pump_amm_register_mint_supply_for_quote(base_mint, 1_000_000_000_000_000);
+}
 
 fn anchor_disc(ix_name: &str) -> [u8; 8] {
     let out = hash(format!("global:{ix_name}").as_bytes());
@@ -6607,8 +6905,26 @@ impl Dex for PumpFunAmmDex {
                     (base_reserve, quote_reserve)
                 };
 
+                let Some(fee_bps) = ({
+                    let creator = cache.get_pump_amm_creator_by_base_mint(&base_mint);
+                    let base_mint_supply = pump_amm_lookup_mint_supply(&base_mint);
+                    pump_amm_executable_marginal_total_fee_bps(&PumpAmmExecutableFeeInputs {
+                        base_mint,
+                        creator,
+                        base_mint_supply,
+                        base_reserve: base_r,
+                        quote_reserve: quote_r,
+                    })
+                }) else {
+                    debug!(
+                        base_mint = %base_mint_str,
+                        fee_config_loaded = pump_amm_global_fee_config_loaded(),
+                        "pump_amm: ExecutableMarginal quote blocked — FeeConfig cache or tier inputs missing (A.56)"
+                    );
+                    return Ok(None);
+                };
                 let (amount_out, price_impact_bps) =
-                    self.quote_cp(amount_in, in_reserve, out_reserve, DEFAULT_TOTAL_FEE_BPS);
+                    self.quote_cp(amount_in, in_reserve, out_reserve, fee_bps);
                 if amount_out == 0 {
                     if self.allow_rpc_on_miss {
                         warn!(
@@ -6634,7 +6950,7 @@ impl Dex for PumpFunAmmDex {
                         amount_out,
                         price_impact_bps,
                         route: vec![pool_market.to_string()],
-                        fee_bps: DEFAULT_TOTAL_FEE_BPS,
+                        fee_bps,
                         in_reserve,
                         out_reserve,
                         input_mint: input_mint.to_string(),
@@ -6671,8 +6987,22 @@ impl Dex for PumpFunAmmDex {
             (base_reserve, quote_reserve)
         };
 
+        let base_r = base_reserve as u64;
+        let quote_r = quote_reserve as u64;
+        let Some(fee_bps) =
+            pump_amm_executable_marginal_total_fee_bps(&PumpAmmExecutableFeeInputs {
+                base_mint,
+                creator: pump_amm_lookup_pool_creator_by_base_mint(&base_mint),
+                base_mint_supply: pump_amm_lookup_mint_supply(&base_mint),
+                base_reserve: base_r,
+                quote_reserve: quote_r,
+            })
+        else {
+            return Ok(None);
+        };
+
         let (amount_out, price_impact_bps) =
-            self.quote_cp(amount_in, in_reserve, out_reserve, DEFAULT_TOTAL_FEE_BPS);
+            self.quote_cp(amount_in, in_reserve, out_reserve, fee_bps);
         if amount_out == 0 {
             return Ok(None);
         }
@@ -6681,7 +7011,7 @@ impl Dex for PumpFunAmmDex {
             amount_out,
             price_impact_bps,
             route: vec![pool.pool_market.to_string()],
-            fee_bps: DEFAULT_TOTAL_FEE_BPS,
+            fee_bps,
             in_reserve,
             out_reserve,
             input_mint: input_mint.to_string(),
@@ -7754,6 +8084,8 @@ mod tests {
         base_reserve: u64,
         quote_reserve: u64,
     ) -> Arc<LivePoolCache> {
+        pump_amm_test_seed_fee_config_and_pool_context(base_mint);
+        let creator = pump_pool_authority_pda(&base_mint);
         let cache = LivePoolCache::new();
         cache.upsert(
             pool_market,
@@ -7765,7 +8097,7 @@ mod tests {
                 base_reserve: Some(base_reserve),
                 quote_reserve: Some(quote_reserve),
                 pool_accounts: vec![],
-                creator: None,
+                creator: Some(creator),
             }),
             100,
         );
@@ -7824,6 +8156,70 @@ mod tests {
         assert!(quote.amount_out > 0);
         assert!(quote.route.contains(&pool_market.to_string()));
         assert_eq!(quote.fee_bps, 125);
+    }
+
+    #[tokio::test]
+    async fn test_quote_exact_in_without_fee_config_cache_returns_none() {
+        pump_amm_test_reset_fee_quote_cache();
+        assert!(
+            !pump_amm_global_fee_config_loaded(),
+            "FeeConfig cache must start empty"
+        );
+        let base_mint = Pubkey::new_unique();
+        let inputs = PumpAmmExecutableFeeInputs {
+            base_mint,
+            creator: Some(pump_pool_authority_pda(&base_mint)),
+            base_mint_supply: Some(1_000_000_000_000_000),
+            base_reserve: 1_000_000_000_000,
+            quote_reserve: 50_000_000_000,
+        };
+        // Direct snapshot read (no #[cfg(test)] auto-seed path).
+        let guard = PUMP_AMM_FEE_CONFIG_CACHE.read().expect("lock");
+        assert!(guard.is_none());
+        drop(guard);
+        assert!(
+            select_executable_fees(
+                &PumpAmmFeeConfigSnapshot {
+                    flat_fees: PumpAmmFeesBps {
+                        lp_fee_bps: 0,
+                        protocol_fee_bps: 0,
+                        creator_fee_bps: 0,
+                    },
+                    fee_tiers: vec![],
+                },
+                &inputs
+            )
+            .is_none(),
+            "empty fee_tiers on canonical pool must not guess fees"
+        );
+    }
+
+    #[test]
+    fn pump_amm_fee_config_fixture_tier0_total_is_125_bps() {
+        let base_mint = Pubkey::new_unique();
+        pump_amm_test_seed_fee_config_and_pool_context(base_mint);
+        let fee = pump_amm_executable_marginal_total_fee_bps(&PumpAmmExecutableFeeInputs {
+            base_mint,
+            creator: pump_amm_lookup_pool_creator_by_base_mint(&base_mint),
+            base_mint_supply: pump_amm_lookup_mint_supply(&base_mint),
+            base_reserve: 1_000_000_000_000,
+            quote_reserve: 50_000_000_000,
+        })
+        .expect("tier-0 fees");
+        assert_eq!(fee, 125);
+        let amount_in = 100_000_000u64;
+        let in_r = 50_000_000_000u128;
+        let out_r = 1_000_000_000_000u128;
+        let fee_mult = 10_000u128 - u128::from(fee);
+        let amt = u128::from(amount_in) * fee_mult / 10_000;
+        let amount_out = amt * out_r / (in_r + amt);
+        let dex = PumpFunAmmDex::new_with_cache(
+            Arc::new(SolanaRpc::new("http://127.0.0.1:0")),
+            make_empty_cache(),
+            false,
+        );
+        let (dex_out, _) = dex.quote_cp(amount_in, in_r, out_r, fee);
+        assert_eq!(dex_out, amount_out as u64);
     }
 
     #[tokio::test]
