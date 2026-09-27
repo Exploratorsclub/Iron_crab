@@ -4,6 +4,7 @@ use super::host::IngestHost;
 use crate::ipc::MarketEvent;
 use crate::market_data::publish::PublishHost;
 use crate::nats::NatsClient;
+use crate::solana::geyser_listener::GeyserAccountUpdate;
 use solana_sdk::pubkey::Pubkey;
 
 /// Tracked wallet surface for Geyser account balance snapshots (no bin-internal types).
@@ -50,6 +51,15 @@ pub trait AccountIngestHost: IngestHost + Send + Sync {
         &self,
         pubkey: &Pubkey,
     ) -> Option<AccountOrcaTickArrayView>;
+
+    /// Admit a single arb-pinned active-bin array from Geyser (register + membership snapshot).
+    fn account_admit_arb_pinned_active_dlmm_bin(
+        &self,
+        update: &GeyserAccountUpdate,
+    ) -> Option<AccountBinArrayView> {
+        let _ = (update,);
+        None
+    }
 }
 
 impl<T: AccountIngestHost + ?Sized> AccountIngestHost for std::sync::Arc<T> {

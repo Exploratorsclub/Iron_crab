@@ -28,7 +28,10 @@ pub use account_parse::{
     wsol_ata_balance_lamports_from_geyser_data, WalletGeyserSnapshotMint,
     WalletGeyserSnapshotToPublish, WalletGeyserUpdateSource,
 };
-pub use dlmm_bin_publish::{active_bin_offset_in_array, filter_dlmm_bins_for_publish};
+pub use dlmm_bin_publish::{
+    active_bin_offset_in_array, filter_dlmm_bins_for_publish,
+    meteora_dlmm_bin_array_contains_active_id, meteora_dlmm_bin_array_lb_pair_and_index,
+};
 pub use host::IngestHost;
 pub use tx_filter::geyser_tx_involves_wallet;
 pub use tx_handler::handle_geyser_transaction_update;

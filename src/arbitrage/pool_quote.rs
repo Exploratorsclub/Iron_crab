@@ -916,15 +916,8 @@ fn executable_marginal_quote(
                 trade_implied_sol_per_token(amount_out, amount_in, pool.token_decimals)
             }
         };
-        // Buy screening uses a small SOL probe where marginal ≈ mid. Sell legs in round-trip
-        // pairing use the full buy token amount; slippage vs reserve mid is expected and must
-        // not reject an otherwise valid bin-walker quote (P2 sell_quote_none fix).
-        let marginal_ok = if side == QuoteSide::Sell {
-            is_plausible_sol_per_token_price(&pool.token_mint, marginal_price)
-        } else {
-            dlmm_marginal_price_plausible(marginal_price, reserve_mid, trade_mid)
-                && is_plausible_sol_per_token_price(&pool.token_mint, marginal_price)
-        };
+        let marginal_ok = dlmm_marginal_price_plausible(marginal_price, reserve_mid, trade_mid)
+            && is_plausible_sol_per_token_price(&pool.token_mint, marginal_price);
         if !marginal_ok {
             return None;
         }
@@ -3393,6 +3386,47 @@ mod tests {
     }
 
     #[test]
+    fn dlmm_sell_rejects_marginal_price_above_reserve_mid_factor() {
+        let active_id = 0i32;
+        let bin_step = 100u16;
+        let token_amount = 1_000_000u64;
+        let sol_amount = 1_000_000_000u64;
+        let array_index = active_id as i64 / 70;
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            array_index,
+            vec![BinData {
+                offset: 0,
+                amount_x: token_amount,
+                amount_y: sol_amount,
+            }],
+        );
+        let pool = sample_pool("meteora_dlmm", "dlmm");
+        let vault = QuoteVaultInput {
+            reserve_base: token_amount,
+            reserve_quote: sol_amount,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(active_id),
+            bin_step: Some(bin_step),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(pool.token_mint.clone()),
+        };
+        let sell_quote = quote_exact_in(
+            &pool,
+            Some(&vault),
+            Some(&bins),
+            &pool.token_mint,
+            NATIVE_SOL_MINT,
+            token_amount,
+        );
+        assert!(
+            sell_quote.is_none(),
+            "absurd DLMM sell marginal must be None"
+        );
+    }
+
+    #[test]
     fn dlmm_sell_large_token_amount_succeeds_without_marginal_probe_gate() {
         let active_id = 0i32;
         let bin_step = 100u16;
@@ -3913,6 +3947,56 @@ mod tests {
             )
             .is_none(),
             "orca without whirlpool fields and ticks must not use vault k"
+        );
+    }
+
+    #[test]
+    fn orca_dynamic_tick_array_parses_and_quotes() {
+        use crate::solana::dex::orca_tick_array::{
+            build_dynamic_tick_array_account_bytes, parse_tick_array,
+            swap_direction_tick_array_starts,
+        };
+
+        let tick = 192i32;
+        let sqrt = 18_452_475_124_341_242_880u128;
+        let liq = 800_000_000_000u128;
+        let pool_pk = Pubkey::new_unique();
+        let mint_a = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let mint_b = Pubkey::new_unique();
+        let whirlpool = OrcaWhirlpoolQuoteInput {
+            pool: pool_pk,
+            token_mint_a: mint_a,
+            token_mint_b: mint_b,
+            sqrt_price: sqrt,
+            liquidity: liq,
+            tick_current_index: tick,
+            tick_spacing: 64,
+            fee_rate: 300,
+        };
+        let (s0, s1, s2) =
+            swap_direction_tick_array_starts(tick, whirlpool.tick_spacing as i32, true);
+        let mut ticks: OrcaTickArrays = HashMap::new();
+        for (idx, start) in [s0, s1, s2].into_iter().enumerate() {
+            let slot = if idx == 0 { 1usize } else { 0usize };
+            let bytes = build_dynamic_tick_array_account_bytes(
+                start,
+                whirlpool.pool,
+                slot,
+                500_000_000_000i128,
+            );
+            ticks.insert(start, parse_tick_array(&bytes).expect("dynamic parse"));
+        }
+        let sol_in = 25_000_000u64;
+        assert!(
+            orca_quote_exact_in(
+                &whirlpool,
+                &ticks,
+                &mint_a.to_string(),
+                &mint_b.to_string(),
+                sol_in,
+            )
+            .is_some(),
+            "dynamic tick arrays must feed orca_quote_exact_in"
         );
     }
 

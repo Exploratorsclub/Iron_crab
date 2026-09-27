@@ -512,7 +512,9 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
         ) {
             inc_market_data_dlmm_bin_owner_update_total();
         }
-        if let Some(bin_array_info) = host.account_membership_bin_array_info(&account_update.pubkey)
+        if let Some(bin_array_info) = host
+            .account_membership_bin_array_info(&account_update.pubkey)
+            .or_else(|| host.account_admit_arb_pinned_active_dlmm_bin(&account_update))
         {
             inc_market_data_dlmm_bin_membership_hit_total();
             publish_meteora_dlmm_bin_array_from_geyser(
