@@ -126,6 +126,24 @@ def _strip_unused_pump_use_block(text: str) -> str:
     return text.replace(PUMP_USE + "\n", "", 1)
 
 
+def _ensure_imports_before_sample_pool(text: str) -> str:
+    m = SAMPLE_POOL_FN.search(text)
+    if not m:
+        return text
+    prefix = text[: m.start()]
+    suffix = text[m.start() :]
+    inserts: list[str] = []
+    if "Pubkey::from_str" in text or MARKER in text:
+        if "use solana_sdk::pubkey::Pubkey;" not in text:
+            inserts.append("use solana_sdk::pubkey::Pubkey;")
+        if "use std::str::FromStr;" not in text:
+            inserts.append("use std::str::FromStr;")
+    if not inserts:
+        return text
+    block = "\n".join(inserts) + "\n\n"
+    return prefix + block + suffix
+
+
 def patch_sample_pool(text: str) -> str:
     text = _strip_orphan_pump_amm_seed(text)
     if not _file_uses_pump_amm_sample_pool(text):
@@ -136,8 +154,7 @@ def patch_sample_pool(text: str) -> str:
     if not m:
         return text
     text = _insert_pump_use_block(text)
-    text = _ensure_pubkey_import(text)
-    text = _ensure_from_str_import(text)
+    text = _ensure_imports_before_sample_pool(text)
     m = SAMPLE_POOL_FN.search(text)
     if not m:
         return text
