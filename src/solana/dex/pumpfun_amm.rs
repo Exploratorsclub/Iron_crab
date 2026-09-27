@@ -6921,9 +6921,15 @@ impl Dex for PumpFunAmmDex {
                         fee_config_loaded = pump_amm_global_fee_config_loaded(),
                         "pump_amm: ExecutableMarginal quote blocked — FeeConfig cache or tier inputs missing (A.56)"
                     );
+                    let degenerate_reserves = base_r == 0 || quote_r == 0;
                     if !self.allow_rpc_on_miss {
                         return Ok(None);
                     }
+                    if !degenerate_reserves {
+                        // Cold path with non-degenerate cache but no FeeConfig: Ok(None), no RPC (A.56 / I-7).
+                        return Ok(None);
+                    }
+                    // Cold path + degenerate cache reserves: fall through to RPC (A.32).
                 } else if let Some(fee_bps) = fee_bps {
                     let (amount_out, price_impact_bps) =
                         self.quote_cp(amount_in, in_reserve, out_reserve, fee_bps);
