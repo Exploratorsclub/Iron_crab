@@ -87,22 +87,58 @@ def _function_body_span(text: str, fn_name: str) -> tuple[int, int] | None:
     return None
 
 
+SAMPLE_POOL_FN = re.compile(
+    r"fn sample_pool\(\s*dex:\s*&str[^)]*\)\s*->\s*QuotePoolInput\s*\{"
+)
+
+
+def _file_uses_pump_amm_sample_pool(text: str) -> bool:
+    return 'sample_pool("pump_amm"' in text or "sample_pool(\"pump_amm\"" in text
+
+
 def _sample_pool_already_seeded(text: str) -> bool:
-    return bool(
-        re.search(r'if dex == "pump_amm"[\s\S]{0,500}' + re.escape(MARKER), text)
-    )
+    m = SAMPLE_POOL_FN.search(text)
+    if not m:
+        return False
+    head = text[m.end() : m.end() + 600]
+    return MARKER in head and 'if dex == "pump_amm"' in head
+
+
+ORPHAN_PUMP_SEED = re.compile(
+    r"\n\s*if dex == \"pump_amm\" \{[^}]*"
+    + re.escape(MARKER)
+    + r"[^}]*\}\s*\n"
+)
+
+
+def _strip_orphan_pump_amm_seed(text: str) -> str:
+    """Remove a prior mis-patch that inserted the seed outside `sample_pool(dex: ...)`."""
+    if _sample_pool_already_seeded(text):
+        return text
+    return ORPHAN_PUMP_SEED.sub("\n", text, count=1)
+
+
+def _strip_unused_pump_use_block(text: str) -> str:
+    if _file_uses_pump_amm_sample_pool(text):
+        return text
+    if PUMP_USE.strip() not in text:
+        return text
+    return text.replace(PUMP_USE + "\n", "", 1)
 
 
 def patch_sample_pool(text: str) -> str:
+    text = _strip_orphan_pump_amm_seed(text)
+    if not _file_uses_pump_amm_sample_pool(text):
+        return _strip_unused_pump_use_block(text)
     if _sample_pool_already_seeded(text):
         return text
-    m = re.search(r"fn sample_pool\([^)]*\)\s*->\s*QuotePoolInput\s*\{", text)
+    m = SAMPLE_POOL_FN.search(text)
     if not m:
         return text
     text = _insert_pump_use_block(text)
     text = _ensure_pubkey_import(text)
     text = _ensure_from_str_import(text)
-    m = re.search(r"fn sample_pool\([^)]*\)\s*->\s*QuotePoolInput\s*\{", text)
+    m = SAMPLE_POOL_FN.search(text)
     if not m:
         return text
     return text[: m.end()] + "\n" + SAMPLE_POOL_SEED + text[m.end() :]
