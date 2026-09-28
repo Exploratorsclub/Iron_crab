@@ -65,7 +65,8 @@ use ironcrab::ipc::ExecutionResult;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
     IntentTier, MarketEvent, MarketEventKind, OrcaTickSnapshot, PoolCacheUpdate,
-    PoolCacheUpdateType, TradeIntent, TradeResources, TradeSide, TradingRegime,
+    PoolCacheUpdateType, PumpAmmGlobalFeeConfigUpdate, TradeIntent, TradeResources, TradeSide,
+    TradingRegime,
 };
 use ironcrab::metrics::{
     arb_heartbeat_finished, arb_pool_cache_apply_batches_inc, arb_pool_cache_sync_fetch_empty_inc,
@@ -136,9 +137,10 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
     config_subject, ensure_execution_results_stream, execution_results_consumer_config,
-    split_arb_track_requests_update, trim_reconcile_update_to_budget, ArbTrackActiveEntry,
-    ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRemovedEntry, ArbTrackRequestsUpdate,
-    ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME,
+    pump_amm_global_fee_config_consumer_config_arb_strategy, split_arb_track_requests_update,
+    trim_reconcile_update_to_budget, ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness,
+    ArbTrackRemovedEntry, ArbTrackRequestsUpdate, ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES,
+    CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
     STREAM_NAME, TOPIC_EXECUTION_RESULTS,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
@@ -9389,6 +9391,50 @@ fn spawn_arb_pool_cache_sync_worker(ctx: Arc<ArbContext>, consumer: JetStreamPul
     });
 }
 
+fn spawn_arb_pump_amm_global_fee_config_worker(consumer: JetStreamPullConsumer) {
+    use ironcrab::solana::dex::pumpfun_amm::pump_amm_update_global_fee_config_account;
+
+    tokio::spawn(async move {
+        loop {
+            use futures::StreamExt;
+            match consumer
+                .fetch()
+                .max_messages(4)
+                .expires(Duration::from_millis(250))
+                .messages()
+                .await
+            {
+                Ok(mut messages) => {
+                    while let Some(msg_result) = messages.next().await {
+                        if let Ok(msg) = msg_result {
+                            NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            match serde_json::from_slice::<PumpAmmGlobalFeeConfigUpdate>(
+                                &msg.payload,
+                            ) {
+                                Ok(update) => {
+                                    let _ = pump_amm_update_global_fee_config_account(
+                                        &update.account_data,
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to deserialize PumpAmmGlobalFeeConfigUpdate");
+                                }
+                            }
+                            if let Err(e) = msg.ack().await {
+                                warn!(error = %e, "Failed to ack PumpAmmGlobalFeeConfigUpdate");
+                            }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Err(_) => {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    });
+}
+
 fn spawn_arb_config_js_worker(ctx: Arc<ArbContext>, consumer: JetStreamPullConsumer) {
     tokio::spawn(async move {
         loop {
@@ -9756,6 +9802,47 @@ async fn main() -> Result<()> {
         None
     };
 
+    let pump_amm_fee_config_consumer = if let Some(ref nats) = ctx.nats {
+        use async_nats::jetstream;
+
+        let jetstream = jetstream::new(nats.client().clone());
+        match jetstream
+            .get_stream(PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME)
+            .await
+        {
+            Ok(stream) => {
+                match stream
+                    .create_consumer(pump_amm_global_fee_config_consumer_config_arb_strategy())
+                    .await
+                {
+                    Ok(consumer) => {
+                        info!(
+                            stream = PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
+                            deliver_policy = "Last",
+                            durable = "arb-strategy-pump-amm-fee-config",
+                            "Arb Pump FeeConfig consumer created (A.56)"
+                        );
+                        Some(consumer)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to create arb Pump FeeConfig JetStream consumer");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                info!(
+                    error = %e,
+                    stream = PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
+                    "Pump FeeConfig JetStream stream not found (market-data may not be running)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // JetStream consumer for ExecutionResults — release in-flight arb dedup on terminal EE outcomes.
     let execution_results_consumer = if let Some(ref nats) = ctx.nats {
         if let Err(e) = ensure_execution_results_stream(nats.client()).await {
@@ -9845,6 +9932,10 @@ async fn main() -> Result<()> {
     if let Some(consumer) = pool_cache_consumer {
         info!("Starting dedicated PoolCache JetStream sync worker (decoupled from main loop)");
         spawn_arb_pool_cache_sync_worker(ctx.clone(), consumer);
+    }
+    if let Some(consumer) = pump_amm_fee_config_consumer {
+        info!("Starting dedicated Pump FeeConfig JetStream worker (A.56)");
+        spawn_arb_pump_amm_global_fee_config_worker(consumer);
     }
     if let Some(consumer) = execution_results_consumer {
         info!("Starting dedicated ExecutionResults JetStream worker (in-flight arb dedup)");

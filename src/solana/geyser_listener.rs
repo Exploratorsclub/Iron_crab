@@ -223,6 +223,8 @@ pub(crate) fn build_account_subscribe_request(
     program_ids: &[Pubkey],
     tracked_cuckoo: Option<&mut CompressedAccountFilterSet>,
 ) -> SubscribeRequest {
+    use crate::solana::dex::pumpfun_amm::pump_amm_global_fee_config_pubkey;
+
     let mut accounts_filter = HashMap::new();
 
     for (idx, program_id) in program_ids.iter().enumerate() {
@@ -237,6 +239,17 @@ pub(crate) fn build_account_subscribe_request(
             },
         );
     }
+
+    accounts_filter.insert(
+        "pump_amm_global_fee_config".to_string(),
+        SubscribeRequestFilterAccounts {
+            account: vec![pump_amm_global_fee_config_pubkey().to_string()],
+            owner: vec![],
+            filters: vec![],
+            nonempty_txn_signature: None,
+            cuckoo_accounts_filter: None,
+        },
+    );
 
     let mut req = SubscribeRequest {
         accounts: accounts_filter,
@@ -1391,7 +1404,10 @@ mod geyser_resilience_tests {
         GeyserAccountListener::coalesce_pending_subscription(&pending, req_a);
         GeyserAccountListener::coalesce_pending_subscription(&pending, req_b);
         let taken = pending.lock().unwrap().take().expect("pending req");
-        assert!(taken.accounts.is_empty());
+        assert_eq!(taken.accounts.len(), 1);
+        assert!(taken
+            .accounts
+            .contains_key("pump_amm_global_fee_config"));
     }
 
     #[test]
@@ -1542,5 +1558,38 @@ mod geyser_resilience_tests {
             tx_liveness_tick_action(100, 100, 50, 50, 200, 199, true),
             TxLivenessTickAction::FirstWindowBaseline
         );
+    }
+
+    #[test]
+    fn build_account_subscribe_includes_pump_fee_config_not_fee_program_owner() {
+        use crate::solana::dex::pumpfun_amm::pump_amm_global_fee_config_pubkey;
+        let req = build_account_subscribe_request(&[], None);
+        let fee = pump_amm_global_fee_config_pubkey().to_string();
+        let fee_program = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
+        let filter = req
+            .accounts
+            .get("pump_amm_global_fee_config")
+            .expect("pump fee filter");
+        assert_eq!(filter.account, vec![fee]);
+        assert!(filter.owner.is_empty());
+        for f in req.accounts.values() {
+            assert!(!f.owner.contains(&fee_program.to_string()));
+        }
+    }
+
+    #[test]
+    fn build_tx_subscribe_excludes_pump_fee_config_account_filter() {
+        let pk = solana_sdk::pubkey::Pubkey::new_from_array([7u8; 32]);
+        let req = build_tx_subscribe_request(std::slice::from_ref(&pk));
+        assert!(req.accounts.is_empty());
+        assert!(!req.accounts.contains_key("pump_amm_global_fee_config"));
+    }
+
+    #[test]
+    fn account_subscribe_rebuild_retains_pump_fee_config() {
+        let req_a = build_account_subscribe_request(&[], None);
+        let req_b = build_account_subscribe_request(&[], None);
+        assert!(req_a.accounts.contains_key("pump_amm_global_fee_config"));
+        assert!(req_b.accounts.contains_key("pump_amm_global_fee_config"));
     }
 }

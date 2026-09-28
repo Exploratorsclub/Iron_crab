@@ -6,8 +6,13 @@ use crate::metrics::{
 };
 use crate::solana::dex::meteora_bin_array_layout::BinArray;
 use crate::solana::dex::meteora_dlmm_layout::DlmmPool;
+use crate::solana::dex::pumpfun_amm::pump_amm_global_fee_config_pubkey;
 use crate::solana::geyser_listener::GeyserAccountUpdate;
 use solana_sdk::pubkey::Pubkey;
+
+/// Pump Fees program owner (only global FeeConfig account is ingested; not owner-wide subscribe).
+pub const PUMP_AMM_FEE_PROGRAM_OWNER: Pubkey =
+    solana_sdk::pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
 
 /// Pre-decoded DEX program owners (no base58 / heap per update).
 const RAYDIUM_AMM_V4_OWNER: Pubkey =
@@ -111,6 +116,10 @@ pub fn account_geyser_update_relevance<H: IngestHost>(
         return AccountGeyserRelevance::Relevant;
     }
 
+    if u.pubkey == pump_amm_global_fee_config_pubkey() {
+        return AccountGeyserRelevance::Relevant;
+    }
+
     if !account_geyser_update_is_dex_pool_owner(&u.owner) {
         return AccountGeyserRelevance::EarlyDrop(
             MarketDataAccountEarlyDropReason::NonDexNonMembership,
@@ -154,6 +163,9 @@ pub fn account_geyser_enrich_path_needs_classify<H: IngestHost>(
         {
             return false;
         }
+        return true;
+    }
+    if u.pubkey == pump_amm_global_fee_config_pubkey() {
         return true;
     }
     if !account_geyser_update_is_dex_pool_owner(&u.owner) {
@@ -537,5 +549,43 @@ mod tests {
         assert!(account_geyser_enrich_path_needs_classify(&host, &u));
         let (class, _) = classify_account_geyser_update(&host, &u);
         assert_eq!(class, AccountUpdateClass::Enrich);
+    }
+
+    #[test]
+    fn fee_config_pubkey_relevant_without_membership() {
+        let host = MockIngestHost::new();
+        let u = sample_update(
+            pump_amm_global_fee_config_pubkey(),
+            PUMP_AMM_FEE_PROGRAM_OWNER,
+        );
+        assert_eq!(
+            account_geyser_update_relevance(&host, &u),
+            AccountGeyserRelevance::Relevant
+        );
+    }
+
+    #[test]
+    fn other_fee_program_owner_non_membership_dropped() {
+        let host = MockIngestHost::new();
+        let u = sample_update(Pubkey::new_unique(), PUMP_AMM_FEE_PROGRAM_OWNER);
+        assert_eq!(
+            account_geyser_update_relevance(&host, &u),
+            AccountGeyserRelevance::EarlyDrop(
+                MarketDataAccountEarlyDropReason::NonDexNonMembership
+            )
+        );
+    }
+
+    #[test]
+    fn fee_config_parse_failure_does_not_clear_cache() {
+        use crate::solana::dex::pumpfun_amm::{
+            pump_amm_global_fee_config_loaded, pump_amm_reload_tier0_bootstrap_fee_config_fixture,
+            pump_amm_test_reset_fee_quote_cache, pump_amm_update_global_fee_config_account,
+        };
+        pump_amm_test_reset_fee_quote_cache();
+        pump_amm_reload_tier0_bootstrap_fee_config_fixture();
+        assert!(pump_amm_global_fee_config_loaded());
+        assert!(!pump_amm_update_global_fee_config_account(&[0u8; 64]));
+        assert!(pump_amm_global_fee_config_loaded());
     }
 }

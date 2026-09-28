@@ -71,9 +71,9 @@ use ironcrab::ipc::{
     DecisionRecord, DexPoolReadiness, ExecutionResult, ExecutionStatus, ExplicitAmount,
     FairnessPolicy, FeePolicy, FillStatus, FillUnavailableReason, IntentOrigin, IntentTier,
     KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate, PositionAuthoritySnapshot,
-    PriorityFeePercentiles, RecordHeader, RejectReason, SimulationResult,
-    TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide, TradingRegime,
-    POSITION_AUTHORITY_KV_BUCKET,
+    PriorityFeePercentiles, PumpAmmGlobalFeeConfigUpdate, RecordHeader, RejectReason,
+    SimulationResult, TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide,
+    TradingRegime, POSITION_AUTHORITY_KV_BUCKET,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
@@ -115,14 +115,17 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
-    ensure_trade_intents_stream, pool_cache_live_consumer_config_execution_engine,
-    wallet_snapshot_consumer_config, wallet_snapshot_live_consumer_config_execution_engine,
+    ensure_pump_amm_global_fee_config_stream, ensure_trade_intents_stream,
+    pool_cache_live_consumer_config_execution_engine,
+    pump_amm_global_fee_config_consumer_config_execution_engine, wallet_snapshot_consumer_config,
+    wallet_snapshot_live_consumer_config_execution_engine,
     wallet_tx_confirm_live_consumer_config_execution_engine, MomentumActivePinReason,
     MomentumActivePoolEntry, MomentumActivePoolsUpdate, NatsClient, NatsConfig, CONFIG_STREAM_NAME,
-    MOMENTUM_ACTIVE_POOLS_WIRE_VERSION, STREAM_NAME, TOPIC_CONTROL_REQUESTS,
-    TOPIC_CONTROL_RESPONSES, TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
-    TOPIC_MOMENTUM_ACTIVE_POOLS, TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS,
-    TRADE_INTENTS_STREAM_NAME, WALLET_SNAPSHOT_STREAM_NAME, WALLET_TX_CONFIRM_STREAM_NAME,
+    MOMENTUM_ACTIVE_POOLS_WIRE_VERSION, PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME, STREAM_NAME,
+    TOPIC_CONTROL_REQUESTS, TOPIC_CONTROL_RESPONSES, TOPIC_DECISION_RECORDS,
+    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_ACTIVE_POOLS,
+    TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, TRADE_INTENTS_STREAM_NAME,
+    WALLET_SNAPSHOT_STREAM_NAME, WALLET_TX_CONFIRM_STREAM_NAME,
 };
 use ironcrab::position_authority::{
     open_positions_count_from_kv_snapshots, position_authority_drift_ee_vs_kv,
@@ -138,7 +141,7 @@ use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
 use ironcrab::solana::dex::pumpfun_amm::{
     pump_amm_canonical_pool_creator_for_base_mint, pump_amm_register_mint_supply_for_quote,
     pump_amm_register_pool_creator_for_quote, pump_amm_reload_tier0_bootstrap_fee_config_fixture,
-    PumpFunAmmDex,
+    pump_amm_update_global_fee_config_account, PumpFunAmmDex,
 };
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::router::Router;
@@ -7877,6 +7880,90 @@ async fn run_pool_cache_consumer_task(
     }
 }
 
+/// Cold-path: Pump AMM global FeeConfig JetStream → process-static cache (A.56).
+async fn run_pump_amm_global_fee_config_consumer_task(
+    consumer: JetStreamPullConsumer,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    use futures::StreamExt;
+
+    let consumer = consumer;
+    loop {
+        if *shutdown_rx.borrow() {
+            info!("Pump AMM FeeConfig consumer task shutting down");
+            break;
+        }
+
+        match consumer
+            .fetch()
+            .max_messages(EE_JETSTREAM_CONSUMER_BATCH_MAX)
+            .expires(EE_JETSTREAM_CONSUMER_FETCH_EXPIRES)
+            .messages()
+            .await
+        {
+            Ok(mut messages) => {
+                while let Some(msg_result) = messages.next().await {
+                    match msg_result {
+                        Ok(msg) => {
+                            match serde_json::from_slice::<PumpAmmGlobalFeeConfigUpdate>(
+                                &msg.payload,
+                            ) {
+                                Ok(update) => {
+                                    if pump_amm_update_global_fee_config_account(
+                                        &update.account_data,
+                                    ) {
+                                        debug!(
+                                            slot = update.slot,
+                                            "Applied PumpAmmGlobalFeeConfigUpdate to process cache"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to deserialize PumpAmmGlobalFeeConfigUpdate");
+                                }
+                            }
+                            if let Err(e) = msg.ack().await {
+                                warn!(error = %e, "Failed to ack PumpAmmGlobalFeeConfigUpdate");
+                            }
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "JetStream Pump FeeConfig fetch returned error");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "No new PumpAmmGlobalFeeConfigUpdate messages");
+            }
+        }
+
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn create_pump_amm_global_fee_config_consumer_for_ee(
+    nats_client: &NatsClient,
+) -> Option<JetStreamPullConsumer> {
+    use async_nats::jetstream;
+
+    if ensure_pump_amm_global_fee_config_stream(nats_client.client())
+        .await
+        .is_err()
+    {
+        return None;
+    }
+
+    let jetstream = jetstream::new(nats_client.client().clone());
+    let stream = jetstream
+        .get_stream(PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME)
+        .await
+        .ok()?;
+    stream
+        .create_consumer(pump_amm_global_fee_config_consumer_config_execution_engine())
+        .await
+        .ok()
+}
+
 /// Cold-path task: WalletBalanceSnapshot JetStream → LockManager (last-value wins per mint).
 async fn run_wallet_snapshot_consumer_task(
     ctx: Arc<ExecutionContext>,
@@ -8743,6 +8830,19 @@ async fn main() -> Result<()> {
             info!(
                 stream = STREAM_NAME,
                 "Pool cache live consumer task started immediately after bootstrap (no startup gap)"
+            );
+        }
+
+        if let Some(consumer) = create_pump_amm_global_fee_config_consumer_for_ee(nats_client).await
+        {
+            let shutdown_rx_fee = shutdown_rx.clone();
+            tokio::spawn(async move {
+                run_pump_amm_global_fee_config_consumer_task(consumer, shutdown_rx_fee).await;
+            });
+            info!(
+                stream = PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
+                deliver_policy = "Last",
+                "Pump AMM FeeConfig consumer task started (A.56)"
             );
         }
     }

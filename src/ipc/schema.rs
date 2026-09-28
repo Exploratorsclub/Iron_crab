@@ -3174,3 +3174,32 @@ impl PoolCacheUpdate {
         );
     }
 }
+
+// ============================================================================
+// Pump AMM global FeeConfig (A.56 — market-data account Geyser → JetStream)
+// ============================================================================
+
+/// Raw FeeConfig account bytes from market-data Geyser account session (A.56).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PumpAmmGlobalFeeConfigUpdate {
+    #[serde(flatten)]
+    pub header: RecordHeader,
+    pub slot: u64,
+    pub account_data: Vec<u8>,
+}
+
+impl PumpAmmGlobalFeeConfigUpdate {
+    pub fn new(
+        component: &str,
+        build: &str,
+        run_id: &str,
+        slot: u64,
+        account_data: Vec<u8>,
+    ) -> Self {
+        Self {
+            header: RecordHeader::new(component, build, run_id),
+            slot,
+            account_data,
+        }
+    }
+}
