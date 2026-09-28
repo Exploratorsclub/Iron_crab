@@ -1405,9 +1405,7 @@ mod geyser_resilience_tests {
         GeyserAccountListener::coalesce_pending_subscription(&pending, req_b);
         let taken = pending.lock().unwrap().take().expect("pending req");
         assert_eq!(taken.accounts.len(), 1);
-        assert!(taken
-            .accounts
-            .contains_key("pump_amm_global_fee_config"));
+        assert!(taken.accounts.contains_key("pump_amm_global_fee_config"));
     }
 
     #[test]

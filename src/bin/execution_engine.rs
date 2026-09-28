@@ -116,8 +116,7 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_pump_amm_global_fee_config_stream, ensure_trade_intents_stream,
-    pool_cache_live_consumer_config_execution_engine,
-    pump_amm_global_fee_config_consumer_config_execution_engine, wallet_snapshot_consumer_config,
+    pool_cache_live_consumer_config_execution_engine, wallet_snapshot_consumer_config,
     wallet_snapshot_live_consumer_config_execution_engine,
     wallet_tx_confirm_live_consumer_config_execution_engine, MomentumActivePinReason,
     MomentumActivePoolEntry, MomentumActivePoolsUpdate, NatsClient, NatsConfig, CONFIG_STREAM_NAME,
@@ -141,7 +140,7 @@ use ironcrab::solana::dex::pumpfun::{BondingCurveState, PumpFunDex};
 use ironcrab::solana::dex::pumpfun_amm::{
     pump_amm_canonical_pool_creator_for_base_mint, pump_amm_register_mint_supply_for_quote,
     pump_amm_register_pool_creator_for_quote, pump_amm_reload_tier0_bootstrap_fee_config_fixture,
-    pump_amm_update_global_fee_config_account, PumpFunAmmDex,
+    PumpFunAmmDex,
 };
 use ironcrab::solana::dex::raydium::Raydium;
 use ironcrab::solana::dex::router::Router;
@@ -7318,6 +7317,11 @@ fn token_program_for_mint_owner(owner: &Pubkey) -> Option<Pubkey> {
 use ironcrab::execution::pool_cache_sync::{
     apply_pool_cache_update, bootstrap_pool_cache_from_jetstream,
 };
+use ironcrab::execution::pump_amm_fee_config_sync::{
+    apply_pump_amm_global_fee_config_jetstream_update,
+    bootstrap_pump_amm_global_fee_config_from_jetstream,
+    create_pump_amm_global_fee_config_live_consumer,
+};
 
 /// Bootstrap open positions count from wallet snapshots (JetStream)
 ///
@@ -7909,9 +7913,7 @@ async fn run_pump_amm_global_fee_config_consumer_task(
                                 &msg.payload,
                             ) {
                                 Ok(update) => {
-                                    if pump_amm_update_global_fee_config_account(
-                                        &update.account_data,
-                                    ) {
+                                    if apply_pump_amm_global_fee_config_jetstream_update(&update) {
                                         debug!(
                                             slot = update.slot,
                                             "Applied PumpAmmGlobalFeeConfigUpdate to process cache"
@@ -7941,27 +7943,45 @@ async fn run_pump_amm_global_fee_config_consumer_task(
     }
 }
 
-async fn create_pump_amm_global_fee_config_consumer_for_ee(
+async fn start_pump_amm_global_fee_config_jetstream_tasks(
     nats_client: &NatsClient,
-) -> Option<JetStreamPullConsumer> {
-    use async_nats::jetstream;
-
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     if ensure_pump_amm_global_fee_config_stream(nats_client.client())
         .await
         .is_err()
     {
-        return None;
+        return;
     }
 
-    let jetstream = jetstream::new(nats_client.client().clone());
-    let stream = jetstream
-        .get_stream(PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME)
-        .await
-        .ok()?;
-    stream
-        .create_consumer(pump_amm_global_fee_config_consumer_config_execution_engine())
-        .await
-        .ok()
+    match bootstrap_pump_amm_global_fee_config_from_jetstream(nats_client).await {
+        Ok(applied) => {
+            if applied {
+                info!("Pump AMM FeeConfig: bootstrap applied last JetStream snapshot (A.56)");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "Pump AMM FeeConfig JetStream bootstrap failed");
+        }
+    }
+
+    match create_pump_amm_global_fee_config_live_consumer(nats_client).await {
+        Ok(Some(consumer)) => {
+            let shutdown_rx_fee = shutdown_rx.clone();
+            tokio::spawn(async move {
+                run_pump_amm_global_fee_config_consumer_task(consumer, shutdown_rx_fee).await;
+            });
+            info!(
+                stream = PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
+                deliver_policy = "New",
+                "Pump AMM FeeConfig live consumer task started (ephemeral, A.56)"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(error = %e, "Failed to create Pump AMM FeeConfig live JetStream consumer");
+        }
+    }
 }
 
 /// Cold-path task: WalletBalanceSnapshot JetStream → LockManager (last-value wins per mint).
@@ -8832,19 +8852,10 @@ async fn main() -> Result<()> {
                 "Pool cache live consumer task started immediately after bootstrap (no startup gap)"
             );
         }
+    }
 
-        if let Some(consumer) = create_pump_amm_global_fee_config_consumer_for_ee(nats_client).await
-        {
-            let shutdown_rx_fee = shutdown_rx.clone();
-            tokio::spawn(async move {
-                run_pump_amm_global_fee_config_consumer_task(consumer, shutdown_rx_fee).await;
-            });
-            info!(
-                stream = PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
-                deliver_policy = "Last",
-                "Pump AMM FeeConfig consumer task started (A.56)"
-            );
-        }
+    if let Some(ref nats_client) = &nats {
+        start_pump_amm_global_fee_config_jetstream_tasks(nats_client, shutdown_rx.clone()).await;
     }
 
     // I-24d: No global Startup-Seeding/Discovery-Rebuild. market-data is Discovery authority.

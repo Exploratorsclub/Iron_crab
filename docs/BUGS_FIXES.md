@@ -9,9 +9,9 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 ### FIX-PUMP-FEE-CONFIG-MD-SESSION: FeeConfig nur in totem `cache_geyser` abonniert (Prod `1db61b9`)
 **Datum**: 2026-09-28  
 **Problem**: Prod `1db61b9`: Pump-Quotes blieben `None`, weil `PUMP_AMM_FEE_CONFIG_CACHE` leer war. Der Geyser-Filter saß in `build_cache_subscribe_request` (`cache_geyser`), aber `spawn_cache_geyser_task` startet die execution-engine nicht. Market-Data droppte FeeConfig-Updates als `NonDexNonMembership`.  
-**Fix**: Explicit Account-Filter `5PHirr8…` in `build_account_subscribe_request`; Relevanz vor Non-DEX-Drop; JetStream-Subject `ironcrab.pump_amm.global_fee_config` + Stream `PUMP_AMM_GLOBAL_FEE_CONFIG`; arb-strategy und execution-engine konsumieren mit `DeliverPolicy::Last` und `pump_amm_update_global_fee_config_account`.  
+**Fix**: Explicit Account-Filter `5PHirr8…` in `build_account_subscribe_request`; Relevanz vor Non-DEX-Drop; JetStream-Subject `ironcrab.pump_amm.global_fee_config` + Stream `PUMP_AMM_GLOBAL_FEE_CONFIG`. **Startup:** ephemeraler `DeliverPolicy::Last`-Bootstrap liest den Stream-Tail (nicht Durable-Ack); Live-Updates über ephemeralen `DeliverPolicy::New`-Consumer. arb-strategy und execution-engine wenden `pump_amm_update_global_fee_config_account` an.  
 **Invarianten**: A.56, I-7, I-4b, I-MD-5.  
-**Dateien**: `geyser_listener.rs`, `account_filter.rs`, `market_data.rs`, `jetstream.rs`, `ipc/schema.rs`, `arb_strategy.rs`, `execution_engine.rs`, `docs/BUGS_FIXES.md`
+**Dateien**: `geyser_listener.rs`, `account_filter.rs`, `market_data.rs`, `jetstream.rs`, `ipc/schema.rs`, `execution/pump_amm_fee_config_sync.rs`, `arb_strategy.rs`, `execution_engine.rs`, `docs/BUGS_FIXES.md`
 
 ### FIX-PUMP-FEE-CONFIG: Pump AMM ExecutableMarginal nutzte feste 100/125 bps statt FeeConfig (A.56)
 **Datum**: 2026-09-27  

@@ -205,28 +205,24 @@ pub async fn ensure_pump_amm_global_fee_config_stream(client: &async_nats::Clien
     }
 }
 
-/// Consumer for execution-engine: last FeeConfig snapshot on startup, then live updates.
-pub fn pump_amm_global_fee_config_consumer_config_execution_engine(
-) -> jetstream::consumer::pull::Config {
+/// Ephemeral bootstrap consumer: `Last` on the fixed subject (re-read stream tail every process start).
+pub fn pump_amm_global_fee_config_bootstrap_consumer_config() -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {
         deliver_policy: jetstream::consumer::DeliverPolicy::Last,
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
-        durable_name: Some("execution-engine-pump-amm-fee-config".to_string()),
-        max_ack_pending: 16,
         filter_subject: TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG.to_string(),
+        max_ack_pending: 4,
         ..Default::default()
     }
 }
 
-/// Consumer for arb-strategy: last FeeConfig snapshot on startup, then live updates.
-pub fn pump_amm_global_fee_config_consumer_config_arb_strategy() -> jetstream::consumer::pull::Config
-{
+/// Ephemeral live consumer: incremental FeeConfig updates after consumer creation.
+pub fn pump_amm_global_fee_config_live_consumer_config() -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {
-        deliver_policy: jetstream::consumer::DeliverPolicy::Last,
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
-        durable_name: Some("arb-strategy-pump-amm-fee-config".to_string()),
-        max_ack_pending: 16,
         filter_subject: TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG.to_string(),
+        max_ack_pending: 16,
         ..Default::default()
     }
 }
@@ -738,18 +734,24 @@ mod tests {
     }
 
     #[test]
-    fn pump_amm_fee_config_consumers_use_last_deliver_policy() {
-        let ee = pump_amm_global_fee_config_consumer_config_execution_engine();
-        let arb = pump_amm_global_fee_config_consumer_config_arb_strategy();
+    fn pump_amm_fee_config_bootstrap_consumer_is_ephemeral_last() {
+        let cfg = pump_amm_global_fee_config_bootstrap_consumer_config();
+        assert!(cfg.durable_name.is_none());
         assert!(matches!(
-            ee.deliver_policy,
+            cfg.deliver_policy,
             jetstream::consumer::DeliverPolicy::Last
         ));
+        assert_eq!(cfg.filter_subject, TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG);
+    }
+
+    #[test]
+    fn pump_amm_fee_config_live_consumer_is_ephemeral_new() {
+        let cfg = pump_amm_global_fee_config_live_consumer_config();
+        assert!(cfg.durable_name.is_none());
         assert!(matches!(
-            arb.deliver_policy,
-            jetstream::consumer::DeliverPolicy::Last
+            cfg.deliver_policy,
+            jetstream::consumer::DeliverPolicy::New
         ));
-        assert_eq!(ee.filter_subject, TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG);
-        assert_eq!(arb.filter_subject, TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG);
+        assert_eq!(cfg.filter_subject, TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG);
     }
 }

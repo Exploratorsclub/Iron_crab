@@ -61,6 +61,11 @@ use ironcrab::execution::live_pool_cache::{
     create_shared_cache, CachedPoolState, LivePoolCache, SharedLivePoolCache,
 };
 use ironcrab::execution::pool_cache_sync::bootstrap_pool_cache_from_jetstream;
+use ironcrab::execution::pump_amm_fee_config_sync::{
+    apply_pump_amm_global_fee_config_jetstream_update,
+    bootstrap_pump_amm_global_fee_config_from_jetstream,
+    create_pump_amm_global_fee_config_live_consumer,
+};
 use ironcrab::ipc::ExecutionResult;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
@@ -137,11 +142,10 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
     config_subject, ensure_execution_results_stream, execution_results_consumer_config,
-    pump_amm_global_fee_config_consumer_config_arb_strategy, split_arb_track_requests_update,
-    trim_reconcile_update_to_budget, ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness,
-    ArbTrackRemovedEntry, ArbTrackRequestsUpdate, ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES,
-    CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
-    STREAM_NAME, TOPIC_EXECUTION_RESULTS,
+    split_arb_track_requests_update, trim_reconcile_update_to_budget, ArbTrackActiveEntry,
+    ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRemovedEntry, ArbTrackRequestsUpdate,
+    ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME,
+    PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_EXECUTION_RESULTS,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
@@ -9392,8 +9396,6 @@ fn spawn_arb_pool_cache_sync_worker(ctx: Arc<ArbContext>, consumer: JetStreamPul
 }
 
 fn spawn_arb_pump_amm_global_fee_config_worker(consumer: JetStreamPullConsumer) {
-    use ironcrab::solana::dex::pumpfun_amm::pump_amm_update_global_fee_config_account;
-
     tokio::spawn(async move {
         loop {
             use futures::StreamExt;
@@ -9412,9 +9414,8 @@ fn spawn_arb_pump_amm_global_fee_config_worker(consumer: JetStreamPullConsumer) 
                                 &msg.payload,
                             ) {
                                 Ok(update) => {
-                                    let _ = pump_amm_update_global_fee_config_account(
-                                        &update.account_data,
-                                    );
+                                    let _ =
+                                        apply_pump_amm_global_fee_config_jetstream_update(&update);
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "Failed to deserialize PumpAmmGlobalFeeConfigUpdate");
@@ -9803,39 +9804,28 @@ async fn main() -> Result<()> {
     };
 
     let pump_amm_fee_config_consumer = if let Some(ref nats) = ctx.nats {
-        use async_nats::jetstream;
-
-        let jetstream = jetstream::new(nats.client().clone());
-        match jetstream
-            .get_stream(PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME)
-            .await
-        {
-            Ok(stream) => {
-                match stream
-                    .create_consumer(pump_amm_global_fee_config_consumer_config_arb_strategy())
-                    .await
-                {
-                    Ok(consumer) => {
-                        info!(
-                            stream = PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
-                            deliver_policy = "Last",
-                            durable = "arb-strategy-pump-amm-fee-config",
-                            "Arb Pump FeeConfig consumer created (A.56)"
-                        );
-                        Some(consumer)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to create arb Pump FeeConfig JetStream consumer");
-                        None
-                    }
-                }
+        match bootstrap_pump_amm_global_fee_config_from_jetstream(nats).await {
+            Ok(applied) if applied => {
+                info!("Arb Pump FeeConfig: bootstrap applied last JetStream snapshot (A.56)");
             }
+            Ok(_) => {}
             Err(e) => {
+                warn!(error = %e, "Arb Pump FeeConfig JetStream bootstrap failed");
+            }
+        }
+
+        match create_pump_amm_global_fee_config_live_consumer(nats).await {
+            Ok(Some(consumer)) => {
                 info!(
-                    error = %e,
                     stream = PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
-                    "Pump FeeConfig JetStream stream not found (market-data may not be running)"
+                    deliver_policy = "New",
+                    "Arb Pump FeeConfig live consumer created (ephemeral, A.56)"
                 );
+                Some(consumer)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "Failed to create arb Pump FeeConfig live JetStream consumer");
                 None
             }
         }
