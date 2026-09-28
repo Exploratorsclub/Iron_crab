@@ -6,6 +6,7 @@ pub mod live_pool_cache;
 pub mod pool_address_book;
 pub mod pool_cache_sync;
 pub mod position_utils;
+pub mod pump_amm_fee_config_sync;
 pub mod quote_calculator;
 pub mod tokens_per_sol;
 pub mod tx_builder;

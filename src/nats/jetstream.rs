@@ -27,6 +27,12 @@ use super::{
     TOPIC_WALLET_TX_CONFIRM_PATTERN,
 };
 
+/// JetStream stream for Pump AMM global FeeConfig account snapshots (A.56).
+pub const PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME: &str = "PUMP_AMM_GLOBAL_FEE_CONFIG";
+
+/// Fixed subject (single global account; not under POOL_CACHE).
+pub const TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG: &str = "ironcrab.pump_amm.global_fee_config";
+
 /// JetStream stream name for pool cache updates
 pub const STREAM_NAME: &str = "POOL_CACHE";
 
@@ -156,6 +162,68 @@ pub async fn ensure_wallet_snapshot_stream(client: &async_nats::Client) -> Resul
             );
             Err(e).context("WALLET_SNAPSHOT stream creation/update failed")
         }
+    }
+}
+
+/// Create or update JetStream stream for Pump AMM global FeeConfig (A.56).
+pub async fn ensure_pump_amm_global_fee_config_stream(client: &async_nats::Client) -> Result<()> {
+    let jetstream = jetstream::new(client.clone());
+
+    let stream_config = jetstream::stream::Config {
+        name: PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME.to_string(),
+        subjects: vec![TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG.to_string()],
+        retention: jetstream::stream::RetentionPolicy::Limits,
+        max_age: std::time::Duration::from_secs(7 * 24 * 60 * 60),
+        storage: jetstream::stream::StorageType::File,
+        num_replicas: 1,
+        discard: jetstream::stream::DiscardPolicy::Old,
+        max_messages_per_subject: 1,
+        allow_rollup: true,
+        ..Default::default()
+    };
+
+    match jetstream.get_or_create_stream(stream_config).await {
+        Ok(mut stream) => {
+            let info = stream.info().await?;
+            info!(
+                stream_name = %PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
+                subject = %TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG,
+                max_msgs_per_subject = 1,
+                num_messages = info.state.messages,
+                "JetStream PUMP_AMM_GLOBAL_FEE_CONFIG stream ready"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                stream_name = %PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
+                error = %e,
+                "Failed to create/update PUMP_AMM_GLOBAL_FEE_CONFIG stream"
+            );
+            Err(e).context("PUMP_AMM_GLOBAL_FEE_CONFIG stream creation/update failed")
+        }
+    }
+}
+
+/// Ephemeral bootstrap consumer: `Last` on the fixed subject (re-read stream tail every process start).
+pub fn pump_amm_global_fee_config_bootstrap_consumer_config() -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::Last,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        filter_subject: TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG.to_string(),
+        max_ack_pending: 4,
+        ..Default::default()
+    }
+}
+
+/// Ephemeral live consumer: incremental FeeConfig updates after consumer creation.
+pub fn pump_amm_global_fee_config_live_consumer_config() -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        filter_subject: TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG.to_string(),
+        max_ack_pending: 16,
+        ..Default::default()
     }
 }
 
@@ -663,5 +731,27 @@ mod tests {
             live.filter_subject,
             "ironcrab.wallet_tx_confirm.WALLET123.*"
         );
+    }
+
+    #[test]
+    fn pump_amm_fee_config_bootstrap_consumer_is_ephemeral_last() {
+        let cfg = pump_amm_global_fee_config_bootstrap_consumer_config();
+        assert!(cfg.durable_name.is_none());
+        assert!(matches!(
+            cfg.deliver_policy,
+            jetstream::consumer::DeliverPolicy::Last
+        ));
+        assert_eq!(cfg.filter_subject, TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG);
+    }
+
+    #[test]
+    fn pump_amm_fee_config_live_consumer_is_ephemeral_new() {
+        let cfg = pump_amm_global_fee_config_live_consumer_config();
+        assert!(cfg.durable_name.is_none());
+        assert!(matches!(
+            cfg.deliver_policy,
+            jetstream::consumer::DeliverPolicy::New
+        ));
+        assert_eq!(cfg.filter_subject, TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG);
     }
 }

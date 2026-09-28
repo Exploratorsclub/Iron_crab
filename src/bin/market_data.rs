@@ -40,7 +40,8 @@ use ironcrab::config::{Config, MarketDataGeyserCfg, WalletTrackerCfg};
 use ironcrab::ipc::{
     ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ControlRequest, ControlRequestKind,
     DexPoolReadiness, ExecutionResult, ExecutionStatus, IntentTier, MarketEvent, MarketEventKind,
-    PoolCacheUpdate, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
+    PoolCacheUpdate, PumpAmmGlobalFeeConfigUpdate, NATIVE_SOL_MINT,
+    POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use ironcrab::market_data::cold::{
     cold_path_raydium_serum_backfill_and_publish, cold_path_rpc_refresh_meteora_cpmm_pool_row,
@@ -189,19 +190,22 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
-    ensure_pool_cache_stream, ensure_wallet_snapshot_stream, ensure_wallet_tx_confirm_stream,
+    ensure_pool_cache_stream, ensure_pump_amm_global_fee_config_stream,
+    ensure_wallet_snapshot_stream, ensure_wallet_tx_confirm_stream,
     execution_results_consumer_config, pool_subject, wallet_snapshot_consumer_config,
     wallet_snapshot_subject, wallet_tx_confirm_subject, ArbTrackActiveEntry, ArbTrackReadiness,
     ArbTrackRemovedEntry, ArbTrackRequestsUpdate, MomentumActivePinReason, MomentumActivePoolEntry,
     MomentumActivePoolsUpdate, MomentumRemovedPoolEntry, NatsClient, NatsConfig,
     CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, TOPIC_ARB_TRACK_REQUESTS,
     TOPIC_CONTROL_REQUESTS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
-    TOPIC_MOMENTUM_ACTIVE_POOLS, WALLET_SNAPSHOT_STREAM_NAME,
+    TOPIC_MOMENTUM_ACTIVE_POOLS, TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG, WALLET_SNAPSHOT_STREAM_NAME,
 };
 use ironcrab::position_authority::is_sol_or_wsol_mint;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use ironcrab::solana::dex::pumpfun::PumpFunDex;
-use ironcrab::solana::dex::pumpfun_amm::PumpFunAmmDex;
+use ironcrab::solana::dex::pumpfun_amm::{
+    parse_pump_amm_fee_config_account, pump_amm_global_fee_config_pubkey, PumpFunAmmDex,
+};
 use ironcrab::solana::dex_parser::{DexType, OrcaPoolInfo};
 use ironcrab::solana::geyser_pool_discovery::{
     DexType as PoolDexType, PoolDiscoveryEvent, PoolDiscoveryIngest,
@@ -9848,6 +9852,12 @@ async fn main() -> Result<()> {
                 info!("JetStream WALLET_SNAPSHOT stream ready for position reconciliation");
             }
 
+            if let Err(e) = ensure_pump_amm_global_fee_config_stream(client.client()).await {
+                error!(error = %e, "Failed to create/update JetStream PUMP_AMM_GLOBAL_FEE_CONFIG stream");
+            } else {
+                info!("JetStream PUMP_AMM_GLOBAL_FEE_CONFIG stream ready (A.56 FeeConfig)");
+            }
+
             // PR3: JetStream stream for wallet TX confirmations (execution-engine confirm path)
             if let Err(e) = ensure_wallet_tx_confirm_stream(client.client()).await {
                 error!(error = %e, "Failed to create/update JetStream WALLET_TX_CONFIRM stream");
@@ -11653,6 +11663,34 @@ async fn handle_geyser_account(
     md_account_sidefx: &MdAccountSidefxSender,
     update_class: ironcrab::market_data::ingest::AccountUpdateClass,
 ) {
+    if account_update.pubkey == pump_amm_global_fee_config_pubkey() {
+        account_count.fetch_add(1, Ordering::Relaxed);
+        record_market_data_tokio_progress();
+        ironcrab::metrics::record_activity();
+
+        if parse_pump_amm_fee_config_account(&account_update.data).is_some() {
+            if let Some(nats) = ctx.nats() {
+                let payload = PumpAmmGlobalFeeConfigUpdate::new(
+                    "market-data",
+                    BUILD_VERSION,
+                    run_id,
+                    account_update.slot,
+                    account_update.data.clone(),
+                );
+                account_path_enqueue_jetstream(
+                    publish_tx,
+                    Some(nats),
+                    TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG.to_string(),
+                    &payload,
+                    "PumpAmmGlobalFeeConfigUpdate",
+                    false,
+                )
+                .await;
+            }
+        }
+        return;
+    }
+
     handle_geyser_account_update(
         ctx.as_ref(),
         run_id,
