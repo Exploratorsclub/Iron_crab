@@ -2,6 +2,8 @@
 
 Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
+**2026-09-28**: Der ungenutzte Execution-Engine-Geyser-Client (`src/execution/cache_geyser.rs`, `spawn_cache_geyser_task`) wurde entfernt; LivePoolCache wird weiter per JetStream-Slave von Market-Data befuellt.
+
 ---
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
