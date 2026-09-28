@@ -1,6 +1,5 @@
 pub mod account_janitor;
 pub mod bundle_auction;
-pub mod cache_geyser;
 pub mod error_detection;
 pub mod live_pool_cache;
 pub mod pool_address_book;
