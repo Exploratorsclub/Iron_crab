@@ -193,7 +193,8 @@ use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_pool_cache_stream, ensure_pump_amm_global_fee_config_stream,
     ensure_wallet_snapshot_stream, ensure_wallet_tx_confirm_stream,
-    execution_results_consumer_config, pool_subject, wallet_snapshot_consumer_config,
+    execution_results_consumer_config, pool_subject,
+    pump_amm_global_fee_config_stream_message_count, wallet_snapshot_consumer_config,
     wallet_snapshot_subject, wallet_tx_confirm_subject, ArbTrackActiveEntry, ArbTrackReadiness,
     ArbTrackRemovedEntry, ArbTrackRequestsUpdate, MomentumActivePinReason, MomentumActivePoolEntry,
     MomentumActivePoolsUpdate, MomentumRemovedPoolEntry, NatsClient, NatsConfig,
@@ -203,7 +204,7 @@ use ironcrab::nats::{
 };
 use ironcrab::position_authority::is_sol_or_wsol_mint;
 use ironcrab::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
-use ironcrab::solana::dex::pumpfun::PumpFunDex;
+use ironcrab::solana::dex::pumpfun::{PumpFunDex, PUMPFUN_FEE_PROGRAM};
 use ironcrab::solana::dex::pumpfun_amm::{
     parse_pump_amm_fee_config_account, pump_amm_global_fee_config_pubkey, PumpFunAmmDex,
 };
@@ -11671,6 +11672,20 @@ struct PumpAmmFeeConfigJetStreamPublishState {
 static PUMP_AMM_FEE_CONFIG_JETSTREAM_PUBLISH: OnceLock<Arc<PumpAmmFeeConfigJetStreamPublishState>> =
     OnceLock::new();
 
+/// True when JetStream has no FeeConfig snapshot yet (`max_messages_per_subject=1`, single subject).
+fn pump_amm_fee_config_cold_seed_rpc_wanted(stream_messages: u64) -> bool {
+    stream_messages == 0
+}
+
+/// RPC cold-seed candidate: correct fee-program owner and parseable FeeConfig layout.
+fn pump_amm_fee_config_rpc_account_seedable(
+    owner: &Pubkey,
+    account_data: &[u8],
+    fee_program: &Pubkey,
+) -> bool {
+    owner == fee_program && parse_pump_amm_fee_config_account(account_data).is_some()
+}
+
 fn pump_amm_fee_config_jetstream_publish_state() -> Arc<PumpAmmFeeConfigJetStreamPublishState> {
     PUMP_AMM_FEE_CONFIG_JETSTREAM_PUBLISH
         .get_or_init(|| {
@@ -11749,6 +11764,141 @@ fn spawn_pump_amm_fee_config_jetstream_retry_task(
     });
 }
 
+async fn stage_pump_amm_fee_config_jetstream_publish(
+    run_id: &str,
+    slot: u64,
+    account_data: &[u8],
+    publish_tx: Option<&AccountPublishSender>,
+    nats: Option<&NatsClient>,
+) -> bool {
+    let state = pump_amm_fee_config_jetstream_publish_state();
+    let pending = PumpAmmFeeConfigPendingJetStream {
+        run_id: run_id.to_string(),
+        slot,
+        account_data: account_data.to_vec(),
+    };
+    {
+        let mut guard = state.pending.lock().await;
+        *guard = Some(pending.clone());
+    }
+
+    if nats.is_none() && publish_tx.is_none() {
+        return false;
+    }
+
+    let published =
+        try_publish_pump_amm_fee_config_jetstream(publish_tx, nats, run_id, slot, account_data)
+            .await;
+    if published {
+        ironcrab::metrics::inc_market_data_pump_amm_fee_config_publish_ok_total();
+        state
+            .last_handler_enqueue_succeeded
+            .store(true, Ordering::Relaxed);
+        let mut guard = state.pending.lock().await;
+        if guard
+            .as_ref()
+            .is_some_and(|p| p.slot == pending.slot && p.account_data == pending.account_data)
+        {
+            *guard = None;
+        }
+        return true;
+    }
+
+    ironcrab::metrics::inc_market_data_pump_amm_fee_config_publish_fail_total();
+    if state
+        .last_handler_enqueue_succeeded
+        .swap(false, Ordering::Relaxed)
+    {
+        warn!(
+            slot,
+            "PumpAmmGlobalFeeConfig JetStream enqueue failed after prior success; retry worker will republish"
+        );
+    }
+    state.notify.notify_one();
+    false
+}
+
+/// Cold-path RPC seed when JetStream `PUMP_AMM_GLOBAL_FEE_CONFIG` is empty at market-data start (A.56).
+async fn cold_seed_pump_amm_fee_config_jetstream_if_empty(
+    run_id: &str,
+    rpc: &SolanaRpc,
+    publish_tx: Option<&AccountPublishSender>,
+    nats: Option<&NatsClient>,
+) {
+    let Some(nats) = nats else {
+        warn!("PumpAmmGlobalFeeConfig cold seed skipped: NATS unavailable");
+        return;
+    };
+
+    let stream_messages = match pump_amm_global_fee_config_stream_message_count(nats.client()).await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "PumpAmmGlobalFeeConfig cold seed skipped: JetStream stream info unavailable"
+            );
+            return;
+        }
+    };
+
+    if !pump_amm_fee_config_cold_seed_rpc_wanted(stream_messages) {
+        info!(
+            stream_messages,
+            "PumpAmmGlobalFeeConfig JetStream already seeded; skipping cold-path RPC"
+        );
+        return;
+    }
+
+    let pubkey = pump_amm_global_fee_config_pubkey();
+    let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM).expect("valid pump fee program pubkey");
+
+    let (account, slot) = match rpc.get_account_with_slot_retry(&pubkey).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                error = %e,
+                pubkey = %pubkey,
+                "PumpAmmGlobalFeeConfig cold seed RPC getAccount failed (Geyser remains update path)"
+            );
+            return;
+        }
+    };
+
+    if !pump_amm_fee_config_rpc_account_seedable(&account.owner, &account.data, &fee_program) {
+        warn!(
+            pubkey = %pubkey,
+            owner = %account.owner,
+            data_len = account.data.len(),
+            "PumpAmmGlobalFeeConfig cold seed RPC account not seedable (owner or layout)"
+        );
+        return;
+    }
+
+    ironcrab::metrics::inc_market_data_pump_amm_fee_config_parse_ok_total();
+    if stage_pump_amm_fee_config_jetstream_publish(
+        run_id,
+        slot,
+        &account.data,
+        publish_tx,
+        Some(nats),
+    )
+    .await
+    {
+        info!(
+            slot,
+            pubkey = %pubkey,
+            "PumpAmmGlobalFeeConfig cold-seeded JetStream from RPC"
+        );
+    } else {
+        warn!(
+            slot,
+            pubkey = %pubkey,
+            "PumpAmmGlobalFeeConfig cold seed JetStream publish pending (retry worker active)"
+        );
+    }
+}
+
 async fn try_publish_pump_amm_fee_config_jetstream(
     publish_tx: Option<&AccountPublishSender>,
     nats: Option<&NatsClient>,
@@ -11781,7 +11931,6 @@ async fn handle_pump_amm_global_fee_config_geyser_account(
     nats: Option<&NatsClient>,
 ) {
     ironcrab::metrics::inc_market_data_pump_amm_fee_config_account_seen_total();
-    let state = pump_amm_fee_config_jetstream_publish_state();
 
     if parse_pump_amm_fee_config_account(&account_update.data).is_none() {
         ironcrab::metrics::inc_market_data_pump_amm_fee_config_parse_fail_total();
@@ -11789,54 +11938,14 @@ async fn handle_pump_amm_global_fee_config_geyser_account(
     }
     ironcrab::metrics::inc_market_data_pump_amm_fee_config_parse_ok_total();
 
-    let pending = PumpAmmFeeConfigPendingJetStream {
-        run_id: run_id.to_string(),
-        slot: account_update.slot,
-        account_data: account_update.data.clone(),
-    };
-    {
-        let mut guard = state.pending.lock().await;
-        *guard = Some(pending.clone());
-    }
-
-    if nats.is_none() && publish_tx.is_none() {
-        return;
-    }
-
-    let published = try_publish_pump_amm_fee_config_jetstream(
-        publish_tx,
-        nats,
+    stage_pump_amm_fee_config_jetstream_publish(
         run_id,
         account_update.slot,
         &account_update.data,
+        publish_tx,
+        nats,
     )
     .await;
-    if published {
-        ironcrab::metrics::inc_market_data_pump_amm_fee_config_publish_ok_total();
-        state
-            .last_handler_enqueue_succeeded
-            .store(true, Ordering::Relaxed);
-        let mut guard = state.pending.lock().await;
-        if guard
-            .as_ref()
-            .is_some_and(|p| p.slot == pending.slot && p.account_data == pending.account_data)
-        {
-            *guard = None;
-        }
-        return;
-    }
-
-    ironcrab::metrics::inc_market_data_pump_amm_fee_config_publish_fail_total();
-    if state
-        .last_handler_enqueue_succeeded
-        .swap(false, Ordering::Relaxed)
-    {
-        warn!(
-            slot = account_update.slot,
-            "PumpAmmGlobalFeeConfig JetStream enqueue failed after prior success; retry worker will republish"
-        );
-    }
-    state.notify.notify_one();
 }
 
 /// Geyser account ingest (dedizierter Task-Fairness, siehe MARKET-DATA-ACCOUNT-INGEST-FAIRNESS).
@@ -12250,6 +12359,14 @@ async fn run_geyser_loop(
         account_publish_tx.clone(),
         ctx.nats.as_ref().map(NatsClient::clone_for_spawned_publish),
     );
+
+    cold_seed_pump_amm_fee_config_jetstream_if_empty(
+        run_id,
+        &rpc,
+        account_publish_tx.as_ref(),
+        ctx.nats.as_ref(),
+    )
+    .await;
 
     // PR3: separate Geyser session for wallet TX status → JetStream WalletTxConfirmed (I-4).
     #[cfg(not(windows))]
@@ -21723,6 +21840,34 @@ mod pr_b_geyser_tracking_tests {
             creator: None,
             token_program: None,
         }));
+    }
+
+    #[test]
+    fn pump_amm_fee_config_cold_seed_rpc_wanted_only_when_stream_empty() {
+        assert!(pump_amm_fee_config_cold_seed_rpc_wanted(0));
+        assert!(!pump_amm_fee_config_cold_seed_rpc_wanted(1));
+        assert!(!pump_amm_fee_config_cold_seed_rpc_wanted(99));
+    }
+
+    #[test]
+    fn pump_amm_fee_config_rpc_account_seedable_checks_owner_and_layout() {
+        let fee_program = Pubkey::from_str(PUMPFUN_FEE_PROGRAM).unwrap();
+        let data = test_pump_amm_fee_config_fixture_account_bytes();
+        assert!(pump_amm_fee_config_rpc_account_seedable(
+            &fee_program,
+            &data,
+            &fee_program,
+        ));
+        assert!(!pump_amm_fee_config_rpc_account_seedable(
+            &Pubkey::new_unique(),
+            &data,
+            &fee_program,
+        ));
+        assert!(!pump_amm_fee_config_rpc_account_seedable(
+            &fee_program,
+            &[0u8; 16],
+            &fee_program,
+        ));
     }
 
     fn test_pump_amm_fee_config_fixture_account_bytes() -> Vec<u8> {
