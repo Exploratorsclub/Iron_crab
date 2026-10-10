@@ -2645,8 +2645,8 @@ mod tests {
     use crate::solana::dex::pumpfun_amm::{
         pump_amm_canonical_pool_creator_for_base_mint, pump_amm_global_fee_config_loaded,
         pump_amm_lookup_mint_supply, pump_amm_register_mint_supply_for_quote,
-        pump_amm_register_pool_creator_for_quote,
-        pump_amm_test_fee_cache_lock, pump_amm_test_reset_fee_quote_cache_assuming_locked,
+        pump_amm_register_pool_creator_for_quote, pump_amm_test_fee_cache_lock,
+        pump_amm_test_reset_fee_quote_cache_assuming_locked,
         pump_amm_test_seed_fee_config_and_pool_context,
     };
 
