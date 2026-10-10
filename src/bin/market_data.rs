@@ -7129,8 +7129,12 @@ impl MarketDataContext {
             return false;
         }
         let prev = self.dlmm_registered_active_id.read().get(&pool).copied();
-        if prev == Some(new_active_id) {
+        let bins_untracked = !self.pool_geyser_bins_fully_tracked_for_cache(pool, &state);
+        if prev == Some(new_active_id) && !bins_untracked {
             return false;
+        }
+        if bins_untracked && prev == Some(new_active_id) {
+            ironcrab::metrics::inc_market_data_dlmm_bin_window_refresh_untracked_total();
         }
         self.note_deferred_hot_pool_reserve_registration(pool, pin, "arb_dlmm_active_id_drift");
         // md-account-sidefx adapter enqueues TrackWorkerCommand::RetryDeferredHotPoolReserves.
@@ -23146,6 +23150,33 @@ mod pr_b_geyser_tracking_tests {
             "retry must register additional bin-array PDAs in tracked map"
         );
         assert_eq!(ctx.dlmm_registered_active_id.read().get(&pool), Some(&500));
+    }
+
+    /// Fix B: arb-pinned DLMM defers bin registration when active_id matches but window is incomplete.
+    #[test]
+    fn arb_dlmm_bin_window_refreshes_when_untracked_same_active_id() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.live_pool_cache
+            .upsert(pool, test_meteora_dlmm_cached_state(10), 1);
+        ctx.dlmm_registered_active_id.write().insert(pool, 10);
+
+        assert!(
+            ctx.maybe_refresh_arb_dlmm_bin_window(pool, 10),
+            "untracked bin window must defer registration even when active_id unchanged"
+        );
+
+        assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        let state = ctx.live_pool_cache.get(&pool).unwrap();
+        assert!(ctx.pool_geyser_bins_fully_tracked_for_cache(pool, &state));
+        assert!(
+            !ctx.maybe_refresh_arb_dlmm_bin_window(pool, 10),
+            "fully tracked window must be idempotent for same active_id"
+        );
     }
 
     fn test_orca_whirlpool_cached_state(tick: i32, spacing: u16) -> CachedPoolState {
