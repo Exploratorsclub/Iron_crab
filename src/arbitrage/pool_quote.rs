@@ -410,6 +410,33 @@ pub fn dlmm_active_bin_in_map(vault: &QuoteVaultInput, dlmm_bins: Option<&DlmmBi
     }
 }
 
+/// Cached inputs required before a pool may enter V2 round-trip pairing (no RPC; same gates as the quoter).
+pub fn v2_executable_quote_inputs_complete(
+    pool: &QuotePoolInput,
+    vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    orca: OrcaExecCtx<'_>,
+) -> bool {
+    if pool.dex == "pump_amm" {
+        return vault.is_some() && pump_amm_global_fee_config_loaded();
+    }
+    if is_orca_dex(&pool.dex) {
+        return orca.whirlpool.is_some() && orca.ticks.is_some();
+    }
+    if is_meteora_dlmm_dex(&pool.dex) {
+        let Some(vault) = vault else {
+            return false;
+        };
+        return vault.active_id.is_some()
+            && vault.bin_step.is_some()
+            && dlmm_active_bin_in_map(vault, dlmm_bins);
+    }
+    if supports_cpmm(&pool.dex) {
+        return vault.is_some();
+    }
+    false
+}
+
 /// Diagnose why a buy leg failed freshness for round-trip selection.
 pub fn diagnose_no_fresh_buy_quote(
     pool: &QuotePoolInput,
@@ -2404,6 +2431,23 @@ pub fn select_round_trip_pools_with_orca(
             .unwrap_or(OrcaExecCtx::NONE)
     };
 
+    let pairing_candidates: Vec<&RoundTripPoolCandidate<'_>> = candidates
+        .iter()
+        .filter(|c| {
+            v2_executable_quote_inputs_complete(
+                c.pool,
+                c.vault,
+                c.dlmm_bins,
+                orca_for(&c.pool.pool_address),
+            )
+        })
+        .collect();
+    if pairing_candidates.len() < 2 {
+        return Err(RoundTripSelectFailure::InsufficientPools(
+            RoundTripInsufficient::new(RoundTripInsufficientSubreason::CandidatesLt2),
+        ));
+    }
+
     struct BuyCandidate<'a> {
         candidate: &'a RoundTripPoolCandidate<'a>,
         quote: PoolQuote,
@@ -2416,7 +2460,7 @@ pub fn select_round_trip_pools_with_orca(
     }
 
     let mut valid_buys: Vec<BuyCandidate<'_>> = Vec::new();
-    for candidate in candidates {
+    for candidate in &pairing_candidates {
         let orca = orca_for(&candidate.pool.pool_address);
         let buy_quote = quote_exact_in_with_orca(
             candidate.pool,
@@ -2483,7 +2527,7 @@ pub fn select_round_trip_pools_with_orca(
     }
 
     let distinct_dexes: std::collections::HashSet<&str> =
-        candidates.iter().map(|c| c.dex).collect();
+        pairing_candidates.iter().map(|c| c.dex).collect();
     if distinct_dexes.len() < 2 {
         return Err(RoundTripSelectFailure::InsufficientPools(
             RoundTripInsufficient::new(RoundTripInsufficientSubreason::SingleDexCandidates),
@@ -2501,7 +2545,7 @@ pub fn select_round_trip_pools_with_orca(
     let mut state_stale_age_bucket_counts: HashMap<FreshnessAgeBucket, usize> = HashMap::new();
 
     for buy in &valid_buys {
-        for sell_candidate in candidates {
+        for sell_candidate in &pairing_candidates {
             if sell_candidate.dex == buy.candidate.dex {
                 continue;
             }
@@ -3292,14 +3336,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient {
-                subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
-                no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
-                sell_quote_none_detail_counts: None,
-                sell_not_fresh_detail_counts: None,
-                no_fresh_buy_quote_detail: None,
-                state_stale_age_bucket_counts: None,
-            })
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient::new(
+                RoundTripInsufficientSubreason::CandidatesLt2,
+            ))
         );
     }
 
@@ -3331,14 +3370,110 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient {
-                subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
-                no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingDlmmBins),
-                sell_quote_none_detail_counts: None,
-                sell_not_fresh_detail_counts: None,
-                no_fresh_buy_quote_detail: None,
-                state_stale_age_bucket_counts: None,
-            })
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient::new(
+                RoundTripInsufficientSubreason::CandidatesLt2,
+            ))
+        );
+    }
+
+    #[test]
+    fn select_round_trip_pools_excludes_orca_without_ticks_from_pairing() {
+        let (pool_orca, vault_orca, wp, _ticks) =
+            sample_orca_executable_leg("poolOrca", 1_000_000_000_000, 900_000_000);
+        let orca_map = HashMap::from([(
+            "poolOrca",
+            OrcaExecCtx {
+                whirlpool: Some(&wp),
+                ticks: None,
+            },
+        )]);
+        let pool_pump = sample_pool("pump_amm", "poolPump");
+        let vault_pump = sample_vault(1_000_000_000_000, 1_100_000_000);
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &pool_orca,
+                vault: Some(&vault_orca),
+                dlmm_bins: None,
+                dex: "orca",
+            },
+            RoundTripPoolCandidate {
+                pool: &pool_pump,
+                vault: Some(&vault_pump),
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+        ];
+        let err = select_round_trip_pools_with_orca(
+            &candidates,
+            &orca_map,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient::new(
+                RoundTripInsufficientSubreason::CandidatesLt2,
+            ))
+        );
+        let orca_sub = diagnose_buy_quote_none_with_orca(
+            &pool_orca,
+            Some(&vault_orca),
+            None,
+            orca_map["poolOrca"],
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+        );
+        assert_eq!(orca_sub, NoFreshBuyQuoteSubreason::OrcaTicksMissing);
+    }
+
+    #[test]
+    fn select_round_trip_pools_excludes_dlmm_without_active_bin_in_map() {
+        let pool_pump = sample_pool("pump_amm", "poolPump");
+        let vault_pump = sample_vault(1_000_000_000_000, 1_100_000_000);
+        let pool_dlmm = sample_pool("meteora_dlmm", "poolDlmm");
+        let vault_dlmm = QuoteVaultInput {
+            reserve_base: 1_000_000_000_000,
+            reserve_quote: 1_000_000_000,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(42),
+            bin_step: Some(100),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(pool_dlmm.token_mint.clone()),
+        };
+        let candidates = [
+            RoundTripPoolCandidate {
+                pool: &pool_pump,
+                vault: Some(&vault_pump),
+                dlmm_bins: None,
+                dex: "pump_amm",
+            },
+            RoundTripPoolCandidate {
+                pool: &pool_dlmm,
+                vault: Some(&vault_dlmm),
+                dlmm_bins: None,
+                dex: "meteora_dlmm",
+            },
+        ];
+        assert!(!v2_executable_quote_inputs_complete(
+            &pool_dlmm,
+            Some(&vault_dlmm),
+            None,
+            OrcaExecCtx::NONE,
+        ));
+        let err = select_round_trip_pools(
+            &candidates,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient::new(
+                RoundTripInsufficientSubreason::CandidatesLt2,
+            ))
         );
     }
 
@@ -3397,14 +3532,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient {
-                subreason: RoundTripInsufficientSubreason::NoCrossDexSell,
-                no_cross_dex_sell_detail: Some(NoCrossDexSellDetailReason::SellMissingVault),
-                sell_quote_none_detail_counts: None,
-                sell_not_fresh_detail_counts: None,
-                no_fresh_buy_quote_detail: None,
-                state_stale_age_bucket_counts: None,
-            })
+            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient::new(
+                RoundTripInsufficientSubreason::CandidatesLt2,
+            ))
         );
     }
 

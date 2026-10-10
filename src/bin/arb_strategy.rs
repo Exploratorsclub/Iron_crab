@@ -39,7 +39,7 @@ use ironcrab::arbitrage::in_flight::{
 use ironcrab::arbitrage::pool_quote::{
     classify_cross_dex_sell_failure_with_orca, diagnose_buy_quote_none_with_orca,
     dlmm_active_bin_in_map, is_quote_fresh_with_orca, quote_exact_in_with_orca,
-    select_round_trip_pools_with_orca, OrcaExecCtx,
+    select_round_trip_pools_with_orca, v2_executable_quote_inputs_complete, OrcaExecCtx,
 };
 use ironcrab::arbitrage::{
     arb_track_removal_reason, classify_cross_dex_sell_failure, dlmm_marginal_price_plausible,
@@ -3784,7 +3784,6 @@ impl TokenArbTracker {
             )
             .collect();
 
-        let distinct_dexes: HashSet<&str> = candidates.iter().map(|c| c.dex).collect();
         let now = Instant::now();
         let orca_for = |pool_address: &str| {
             orca_map
@@ -3792,6 +3791,18 @@ impl TokenArbTracker {
                 .copied()
                 .unwrap_or(OrcaExecCtx::NONE)
         };
+        let distinct_dexes: HashSet<&str> = candidates
+            .iter()
+            .filter(|c| {
+                v2_executable_quote_inputs_complete(
+                    c.pool,
+                    c.vault,
+                    c.dlmm_bins,
+                    orca_for(&c.pool.pool_address),
+                )
+            })
+            .map(|c| c.dex)
+            .collect();
 
         let mut pairing_token_amount: Option<u64> = None;
         let mut pairing_buy_quote: Option<PoolQuote> = None;
