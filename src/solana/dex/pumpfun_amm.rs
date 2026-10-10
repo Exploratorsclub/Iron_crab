@@ -460,8 +460,20 @@ pub fn pump_amm_executable_marginal_total_fee_bps(
     Some(fees.total_bps())
 }
 
+/// Serializes unit tests that reset/seed the process-global Pump AMM FeeConfig quote cache.
 #[cfg(test)]
-pub fn pump_amm_test_reset_fee_quote_cache() {
+static PUMP_AMM_TEST_FEE_CACHE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold for the duration of a test that resets/seeds the FeeConfig cache or asserts on an empty cache.
+#[cfg(test)]
+pub fn pump_amm_test_fee_cache_lock() -> std::sync::MutexGuard<'static, ()> {
+    PUMP_AMM_TEST_FEE_CACHE_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+fn pump_amm_test_reset_fee_quote_cache_body() {
     if let Ok(mut guard) = PUMP_AMM_FEE_CONFIG_CACHE.write() {
         *guard = None;
     }
@@ -469,9 +481,21 @@ pub fn pump_amm_test_reset_fee_quote_cache() {
     PUMP_AMM_MINT_SUPPLY_BY_MINT.clear();
 }
 
+#[cfg(test)]
+pub fn pump_amm_test_reset_fee_quote_cache() {
+    let _fee_cache = pump_amm_test_fee_cache_lock();
+    pump_amm_test_reset_fee_quote_cache_body();
+}
+
+/// Caller must already hold [`pump_amm_test_fee_cache_lock`].
+#[cfg(test)]
+pub fn pump_amm_test_reset_fee_quote_cache_assuming_locked() {
+    pump_amm_test_reset_fee_quote_cache_body();
+}
+
 /// Minimal one-tier FeeConfig (tier-0 total 125 bps) for unit tests.
 #[cfg(test)]
-pub fn pump_amm_test_seed_fee_config_and_pool_context(base_mint: Pubkey) {
+fn pump_amm_test_seed_fee_config_and_pool_context_body(base_mint: Pubkey) {
     pump_amm_reload_tier0_bootstrap_fee_config_fixture();
     let creator = pump_pool_authority_pda(&base_mint);
     pump_amm_register_pool_creator_for_quote(base_mint, creator);
@@ -479,9 +503,16 @@ pub fn pump_amm_test_seed_fee_config_and_pool_context(base_mint: Pubkey) {
 }
 
 #[cfg(test)]
+pub fn pump_amm_test_seed_fee_config_and_pool_context(base_mint: Pubkey) {
+    let _fee_cache = pump_amm_test_fee_cache_lock();
+    pump_amm_test_seed_fee_config_and_pool_context_body(base_mint);
+}
+
+#[cfg(test)]
 pub fn pump_amm_test_prepare_quote_fixture(base_mint: Pubkey) {
-    pump_amm_test_reset_fee_quote_cache();
-    pump_amm_test_seed_fee_config_and_pool_context(base_mint);
+    let _fee_cache = pump_amm_test_fee_cache_lock();
+    pump_amm_test_reset_fee_quote_cache_body();
+    pump_amm_test_seed_fee_config_and_pool_context_body(base_mint);
 }
 
 fn anchor_disc(ix_name: &str) -> [u8; 8] {
