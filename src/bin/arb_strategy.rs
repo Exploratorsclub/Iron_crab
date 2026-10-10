@@ -6752,6 +6752,31 @@ impl ArbContext {
                 .and_then(|v| v.dlmm_token_x_mint.clone())
         };
         let dlmm_sol_is_x = dlmm_token_x_mint.as_deref() == Some(NATIVE_SOL_MINT);
+        let (active_id, bin_step) = if dex == "meteora_dlmm" {
+            let mut merged_active_id = active_id;
+            let mut merged_bin_step = bin_step;
+            if let Some(existing) = cache.get(pool_address) {
+                if merged_active_id.is_none() {
+                    merged_active_id = existing.active_id;
+                }
+                if merged_bin_step.is_none() {
+                    merged_bin_step = existing.bin_step;
+                }
+            }
+            if merged_active_id.is_none() || merged_bin_step.is_none() {
+                let (slave_active_id, slave_bin_step) =
+                    resolve_dlmm_meta_for_pool_update(pool_address, &cache, &self.live_pool_cache);
+                if merged_active_id.is_none() {
+                    merged_active_id = slave_active_id;
+                }
+                if merged_bin_step.is_none() {
+                    merged_bin_step = slave_bin_step;
+                }
+            }
+            (merged_active_id, merged_bin_step)
+        } else {
+            (active_id, bin_step)
+        };
         let new_vault = VaultBalanceCache {
             reserve_base,
             reserve_quote,
@@ -12723,6 +12748,77 @@ mod two_hop_price_tests {
             refreshed_after > refreshed_before || seeded_after > seeded_before,
             "stale pinned vault must pull fresher SLAVE snapshot"
         );
+    }
+
+    #[test]
+    fn pool_state_update_meteora_dlmm_preserves_active_id_when_event_omits_it() {
+        let cache = create_shared_cache();
+        let token_mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint_str = token_mint.to_string();
+        let pool_str = pool.to_string();
+        cache.upsert(
+            pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: token_mint,
+                token_y_mint: Pubkey::from_str(NATIVE_SOL_MINT).unwrap(),
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: 7,
+                bin_step: 20,
+                reserve_x_balance: Some(1),
+                reserve_y_balance: Some(1),
+                dlmm_bin_params_account_seeded: true,
+            }),
+            1,
+        );
+
+        let ctx = test_arb_context(cache);
+        ctx.vault_balances.write().insert(
+            pool_str.clone(),
+            VaultBalanceCache {
+                reserve_base: 1_000_000_000,
+                reserve_quote: 2_000_000_000,
+                update_slot: 10,
+                active_id: Some(7),
+                bin_step: Some(20),
+                updated_at: Instant::now(),
+                dlmm_sol_is_x: false,
+                dlmm_token_x_mint: Some(mint_str.clone()),
+            },
+        );
+
+        ctx.handle_pool_state_update(
+            &pool_str,
+            "meteora_dlmm",
+            1_100_000_000,
+            2_100_000_000,
+            11,
+            None,
+            None,
+            &mint_str,
+            NATIVE_SOL_MINT,
+        );
+        let vaults = ctx.vault_balances.read();
+        let vault = vaults.get(&pool_str).expect("vault");
+        assert_eq!(vault.active_id, Some(7));
+        assert_eq!(vault.bin_step, Some(20));
+        drop(vaults);
+
+        ctx.handle_pool_state_update(
+            &pool_str,
+            "meteora_dlmm",
+            1_200_000_000,
+            2_200_000_000,
+            12,
+            Some(9),
+            Some(20),
+            &mint_str,
+            NATIVE_SOL_MINT,
+        );
+        let vaults = ctx.vault_balances.read();
+        let vault = vaults.get(&pool_str).expect("vault");
+        assert_eq!(vault.active_id, Some(9));
     }
 
     #[test]
