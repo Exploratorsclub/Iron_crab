@@ -3962,6 +3962,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn diagnose_buy_quote_none_pump_amm_fee_config_missing() {
         pump_amm_test_reset_fee_quote_cache();
         let pool = QuotePoolInput {
