@@ -523,6 +523,21 @@ pub static MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_REJECTED_TOTAL: Lazy<AtomicU64
 /// DLMM bin-array publishes from stashed Geyser replay (post-register / post-sync).
 pub static MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Pump AMM global FeeConfig account updates observed on the Geyser account session (A.56).
+pub static MARKET_DATA_PUMP_AMM_FEE_CONFIG_ACCOUNT_SEEN_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Pump AMM global FeeConfig account bytes parsed successfully for JetStream publish.
+pub static MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_OK_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Pump AMM global FeeConfig account bytes rejected by parser (no publish, pending retained).
+pub static MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_FAIL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Pump AMM global FeeConfig JetStream publish succeeded (handler or retry worker).
+pub static MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Pump AMM global FeeConfig JetStream enqueue failed on the Geyser account handler path.
+pub static MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_FAIL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// DLMM bin-array handler publishes on ExecHot lane.
 pub static MARKET_DATA_DLMM_BIN_PUBLISH_EXEC_HOT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1123,6 +1138,31 @@ pub fn inc_market_data_hot_pool_account_bootstrap_rejected_total() {
 #[inline]
 pub fn inc_market_data_dlmm_bin_replay_publish_total() {
     MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pump_amm_fee_config_account_seen_total() {
+    MARKET_DATA_PUMP_AMM_FEE_CONFIG_ACCOUNT_SEEN_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pump_amm_fee_config_parse_ok_total() {
+    MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pump_amm_fee_config_parse_fail_total() {
+    MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_FAIL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pump_amm_fee_config_publish_ok_total() {
+    MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pump_amm_fee_config_publish_fail_total() {
+    MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_FAIL_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -5792,6 +5832,26 @@ pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_TRADE_STALE: Lazy<AtomicU64>
     Lazy::new(|| AtomicU64::new(0));
 pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NOT_FRESH_AFTER: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_ORCA_TICKS_MISSING: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_ORCA_WALK_NONE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_DLMM_ACTIVE_BIN_MISSING: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_DLMM_WALKER_ZERO: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_DLMM_MARGINAL_REJECT: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_RESERVES_IMPLAUSIBLE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_CPMM_MATH_NONE: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_FEE_CONFIG_MISSING: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+pub static ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_UNSUPPORTED_DEX: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// A.56: Pump FeeConfig cache present in arb-strategy process (0/1 gauge).
+pub static ARB_PUMP_AMM_FEE_CONFIG_LOADED: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// PoolStateUpdate scheduled off-hot-loop rescreen for selected mints (C1vault).
 pub static ARB_VAULT_RESCREEN_SCHEDULED_TOTAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// C1h5: v2 screen scheduled sell-leg recovery (track dirty + rescreen) after sell_not_fresh.
@@ -6566,9 +6626,25 @@ pub fn arb_two_hop_v2_no_fresh_buy_quote_detail_inc(reason: &str) {
         "state_stale" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_STATE_STALE,
         "trade_stale" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_TRADE_STALE,
         "not_fresh_after_quote" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NOT_FRESH_AFTER,
+        "orca_ticks_missing" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_ORCA_TICKS_MISSING,
+        "orca_walk_none" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_ORCA_WALK_NONE,
+        "dlmm_active_bin_missing" => {
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_DLMM_ACTIVE_BIN_MISSING
+        }
+        "dlmm_walker_zero" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_DLMM_WALKER_ZERO,
+        "dlmm_marginal_reject" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_DLMM_MARGINAL_REJECT,
+        "reserves_implausible" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_RESERVES_IMPLAUSIBLE,
+        "cpmm_math_none" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_CPMM_MATH_NONE,
+        "fee_config_missing" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_FEE_CONFIG_MISSING,
+        "unsupported_dex" => &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_UNSUPPORTED_DEX,
         _ => return,
     };
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Set `arb_pump_amm_fee_config_loaded` gauge (0 or 1).
+pub fn arb_pump_amm_fee_config_loaded_set(loaded: bool) {
+    ARB_PUMP_AMM_FEE_CONFIG_LOADED.store(loaded as u64, Ordering::Relaxed);
 }
 
 /// Increment `arb_vault_rescreen_scheduled_total`.
@@ -7886,6 +7962,42 @@ fn append_arb_c1h2_freshness_forensics_total(out: &mut String) {
             "not_fresh_after_quote",
             &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_NOT_FRESH_AFTER,
         ),
+        (
+            "orca_ticks_missing",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_ORCA_TICKS_MISSING,
+        ),
+        (
+            "orca_walk_none",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_ORCA_WALK_NONE,
+        ),
+        (
+            "dlmm_active_bin_missing",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_DLMM_ACTIVE_BIN_MISSING,
+        ),
+        (
+            "dlmm_walker_zero",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_DLMM_WALKER_ZERO,
+        ),
+        (
+            "dlmm_marginal_reject",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_DLMM_MARGINAL_REJECT,
+        ),
+        (
+            "reserves_implausible",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_RESERVES_IMPLAUSIBLE,
+        ),
+        (
+            "cpmm_math_none",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_CPMM_MATH_NONE,
+        ),
+        (
+            "fee_config_missing",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_FEE_CONFIG_MISSING,
+        ),
+        (
+            "unsupported_dex",
+            &*ARB_TWO_HOP_V2_NO_FRESH_BUY_QUOTE_DETAIL_UNSUPPORTED_DEX,
+        ),
     ] {
         out.push_str(&format!(
             "arb_two_hop_v2_no_fresh_buy_quote_detail_total{{reason=\"{reason}\"}} "
@@ -7893,6 +8005,13 @@ fn append_arb_c1h2_freshness_forensics_total(out: &mut String) {
         out.push_str(&counter.load(Ordering::Relaxed).to_string());
         out.push('\n');
     }
+    out.push_str("arb_pump_amm_fee_config_loaded ");
+    out.push_str(
+        &ARB_PUMP_AMM_FEE_CONFIG_LOADED
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    out.push('\n');
 }
 
 fn append_arb_two_hop_v2_sell_quote_none_detail_total(out: &mut String) {
@@ -9820,6 +9939,26 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_dlmm_bin_replay_publish_total",
         MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pump_amm_fee_config_account_seen_total",
+        MARKET_DATA_PUMP_AMM_FEE_CONFIG_ACCOUNT_SEEN_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pump_amm_fee_config_parse_ok_total",
+        MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pump_amm_fee_config_parse_fail_total",
+        MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_FAIL_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pump_amm_fee_config_publish_ok_total",
+        MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pump_amm_fee_config_publish_fail_total",
+        MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_FAIL_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_dlmm_bin_publish_exec_hot_total",

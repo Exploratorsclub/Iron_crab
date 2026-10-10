@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -11648,6 +11649,191 @@ async fn handle_pool_discovery_market_event(
     }
 }
 
+#[derive(Clone)]
+struct PumpAmmFeeConfigPendingJetStream {
+    run_id: String,
+    slot: u64,
+    account_data: Vec<u8>,
+}
+
+struct PumpAmmFeeConfigJetStreamPublishState {
+    pending: Mutex<Option<PumpAmmFeeConfigPendingJetStream>>,
+    notify: Notify,
+    /// True after the last handler-path enqueue succeeded; used for success→fail warn edge.
+    last_handler_enqueue_succeeded: AtomicBool,
+}
+
+static PUMP_AMM_FEE_CONFIG_JETSTREAM_PUBLISH: OnceLock<Arc<PumpAmmFeeConfigJetStreamPublishState>> =
+    OnceLock::new();
+
+fn pump_amm_fee_config_jetstream_publish_state() -> Arc<PumpAmmFeeConfigJetStreamPublishState> {
+    PUMP_AMM_FEE_CONFIG_JETSTREAM_PUBLISH
+        .get_or_init(|| {
+            Arc::new(PumpAmmFeeConfigJetStreamPublishState {
+                pending: Mutex::new(None),
+                notify: Notify::new(),
+                last_handler_enqueue_succeeded: AtomicBool::new(true),
+            })
+        })
+        .clone()
+}
+
+#[cfg(test)]
+async fn test_reset_pump_amm_fee_config_jetstream_publish_state() {
+    let state = pump_amm_fee_config_jetstream_publish_state();
+    *state.pending.lock().await = None;
+    state
+        .last_handler_enqueue_succeeded
+        .store(true, Ordering::Relaxed);
+}
+
+async fn pump_amm_fee_config_jetstream_retry_pending_once(
+    publish_tx: Option<&AccountPublishSender>,
+    nats: Option<&NatsClient>,
+) -> bool {
+    let state = pump_amm_fee_config_jetstream_publish_state();
+    let snap = {
+        let guard = state.pending.lock().await;
+        guard.clone()
+    };
+    let Some(snap) = snap else {
+        return false;
+    };
+    let published = try_publish_pump_amm_fee_config_jetstream(
+        publish_tx,
+        nats,
+        &snap.run_id,
+        snap.slot,
+        &snap.account_data,
+    )
+    .await;
+    if !published {
+        return false;
+    }
+    ironcrab::metrics::inc_market_data_pump_amm_fee_config_publish_ok_total();
+    let mut guard = state.pending.lock().await;
+    if guard
+        .as_ref()
+        .is_some_and(|p| p.slot == snap.slot && p.account_data == snap.account_data)
+    {
+        *guard = None;
+    }
+    true
+}
+
+fn spawn_pump_amm_fee_config_jetstream_retry_task(
+    publish_tx: Option<AccountPublishSender>,
+    nats: Option<NatsClient>,
+) {
+    let state = pump_amm_fee_config_jetstream_publish_state();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = state.notify.notified() => {}
+                _ = tick.tick() => {}
+            }
+            let _ = pump_amm_fee_config_jetstream_retry_pending_once(
+                publish_tx.as_ref(),
+                nats.as_ref(),
+            )
+            .await;
+        }
+    });
+}
+
+async fn try_publish_pump_amm_fee_config_jetstream(
+    publish_tx: Option<&AccountPublishSender>,
+    nats: Option<&NatsClient>,
+    run_id: &str,
+    slot: u64,
+    account_data: &[u8],
+) -> bool {
+    let payload = PumpAmmGlobalFeeConfigUpdate::new(
+        "market-data",
+        BUILD_VERSION,
+        run_id,
+        slot,
+        account_data.to_vec(),
+    );
+    account_path_enqueue_jetstream(
+        publish_tx,
+        nats,
+        TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG.to_string(),
+        &payload,
+        "PumpAmmGlobalFeeConfigUpdate",
+        false,
+    )
+    .await
+}
+
+async fn handle_pump_amm_global_fee_config_geyser_account(
+    run_id: &str,
+    account_update: &GeyserAccountUpdate,
+    publish_tx: Option<&AccountPublishSender>,
+    nats: Option<&NatsClient>,
+) {
+    ironcrab::metrics::inc_market_data_pump_amm_fee_config_account_seen_total();
+    let state = pump_amm_fee_config_jetstream_publish_state();
+
+    if parse_pump_amm_fee_config_account(&account_update.data).is_none() {
+        ironcrab::metrics::inc_market_data_pump_amm_fee_config_parse_fail_total();
+        return;
+    }
+    ironcrab::metrics::inc_market_data_pump_amm_fee_config_parse_ok_total();
+
+    let pending = PumpAmmFeeConfigPendingJetStream {
+        run_id: run_id.to_string(),
+        slot: account_update.slot,
+        account_data: account_update.data.clone(),
+    };
+    {
+        let mut guard = state.pending.lock().await;
+        *guard = Some(pending.clone());
+    }
+
+    if nats.is_none() && publish_tx.is_none() {
+        return;
+    }
+
+    let published = try_publish_pump_amm_fee_config_jetstream(
+        publish_tx,
+        nats,
+        run_id,
+        account_update.slot,
+        &account_update.data,
+    )
+    .await;
+    if published {
+        ironcrab::metrics::inc_market_data_pump_amm_fee_config_publish_ok_total();
+        state
+            .last_handler_enqueue_succeeded
+            .store(true, Ordering::Relaxed);
+        let mut guard = state.pending.lock().await;
+        if guard
+            .as_ref()
+            .is_some_and(|p| p.slot == pending.slot && p.account_data == pending.account_data)
+        {
+            *guard = None;
+        }
+        return;
+    }
+
+    ironcrab::metrics::inc_market_data_pump_amm_fee_config_publish_fail_total();
+    if state
+        .last_handler_enqueue_succeeded
+        .swap(false, Ordering::Relaxed)
+    {
+        warn!(
+            slot = account_update.slot,
+            "PumpAmmGlobalFeeConfig JetStream enqueue failed after prior success; retry worker will republish"
+        );
+    }
+    state.notify.notify_one();
+}
+
 /// Geyser account ingest (dedizierter Task-Fairness, siehe MARKET-DATA-ACCOUNT-INGEST-FAIRNESS).
 /// STOP-CHECK (PR165): **keine** RPC-Calls — weder direkt noch via `tokio::spawn` aus diesem Handler.
 #[allow(clippy::too_many_arguments)]
@@ -11667,27 +11853,13 @@ async fn handle_geyser_account(
         account_count.fetch_add(1, Ordering::Relaxed);
         record_market_data_tokio_progress();
         ironcrab::metrics::record_activity();
-
-        if parse_pump_amm_fee_config_account(&account_update.data).is_some() {
-            if let Some(nats) = ctx.nats() {
-                let payload = PumpAmmGlobalFeeConfigUpdate::new(
-                    "market-data",
-                    BUILD_VERSION,
-                    run_id,
-                    account_update.slot,
-                    account_update.data.clone(),
-                );
-                account_path_enqueue_jetstream(
-                    publish_tx,
-                    Some(nats),
-                    TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG.to_string(),
-                    &payload,
-                    "PumpAmmGlobalFeeConfigUpdate",
-                    false,
-                )
-                .await;
-            }
-        }
+        handle_pump_amm_global_fee_config_geyser_account(
+            run_id,
+            &account_update,
+            publish_tx,
+            ctx.nats(),
+        )
+        .await;
         return;
     }
 
@@ -12068,6 +12240,11 @@ async fn run_geyser_loop(
             );
             spawn_market_data_account_publish_runtime(Arc::clone(&ctx), template, n_workers)
         });
+
+    spawn_pump_amm_fee_config_jetstream_retry_task(
+        account_publish_tx.clone(),
+        ctx.nats.as_ref().map(NatsClient::clone_for_spawned_publish),
+    );
 
     // PR3: separate Geyser session for wallet TX status → JetStream WalletTxConfirmed (I-4).
     #[cfg(not(windows))]
@@ -21541,6 +21718,126 @@ mod pr_b_geyser_tracking_tests {
             creator: None,
             token_program: None,
         }));
+    }
+
+    fn test_pump_amm_fee_config_fixture_account_bytes() -> Vec<u8> {
+        use ironcrab::solana::dex::pumpfun_amm::PUMP_AMM_FEE_CONFIG_ACCOUNT_DISCRIMINATOR;
+        let mut data = Vec::with_capacity(128);
+        data.extend_from_slice(&PUMP_AMM_FEE_CONFIG_ACCOUNT_DISCRIMINATOR);
+        data.push(255);
+        data.extend_from_slice(&Pubkey::default().to_bytes());
+        for v in [25u64, 5, 0] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u128.to_le_bytes());
+        for v in [2u64, 93, 30] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        data
+    }
+
+    async fn drive_pump_amm_fee_config_handle(
+        data: Vec<u8>,
+        publish_tx: Option<AccountPublishSender>,
+    ) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let account_count = AtomicU64::new(0);
+        let md_state = test_spawn_md_state(&ctx);
+        let md_sidefx = test_spawn_md_sidefx(&ctx, &md_state, test_noop_track_worker_sender());
+        let update = GeyserAccountUpdate {
+            pubkey: pump_amm_global_fee_config_pubkey(),
+            owner: Pubkey::new_unique(),
+            slot: 99,
+            lamports: 0,
+            data,
+            grpc_recv_at: Instant::now(),
+        };
+        handle_geyser_account(
+            Arc::clone(&ctx),
+            "run-fee-config-test",
+            update,
+            &account_count,
+            Instant::now(),
+            publish_tx.as_ref(),
+            &md_state,
+            &md_sidefx.account,
+            AccountUpdateClass::ExecHot,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pump_amm_fee_config_parse_fail_retains_pending_snapshot() {
+        use ironcrab::metrics::{
+            MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_FAIL_TOTAL,
+            MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_OK_TOTAL,
+        };
+
+        test_reset_pump_amm_fee_config_jetstream_publish_state().await;
+        let valid = test_pump_amm_fee_config_fixture_account_bytes();
+        drive_pump_amm_fee_config_handle(valid, None).await;
+        let state = pump_amm_fee_config_jetstream_publish_state();
+        assert!(state.pending.lock().await.is_some());
+        let parse_ok_0 = MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_OK_TOTAL.load(Ordering::Relaxed);
+
+        let bad = vec![0u8; 16];
+        drive_pump_amm_fee_config_handle(bad, None).await;
+        assert!(MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_FAIL_TOTAL.load(Ordering::Relaxed) >= 1);
+        assert_eq!(
+            MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_OK_TOTAL.load(Ordering::Relaxed),
+            parse_ok_0
+        );
+        assert!(state.pending.lock().await.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pump_amm_fee_config_enqueue_ok_increments_publish_ok() {
+        use ironcrab::metrics::MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL;
+
+        test_reset_pump_amm_fee_config_jetstream_publish_state().await;
+        let (tx, mut rx) = mpsc::channel(4);
+        let ok0 = MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL.load(Ordering::Relaxed);
+        let data = test_pump_amm_fee_config_fixture_account_bytes();
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        drive_pump_amm_fee_config_handle(data, Some(tx)).await;
+        assert!(MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL.load(Ordering::Relaxed) > ok0);
+        let state = pump_amm_fee_config_jetstream_publish_state();
+        assert!(state.pending.lock().await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pump_amm_fee_config_enqueue_fail_retries_and_publish_ok() {
+        use ironcrab::metrics::{
+            MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_FAIL_TOTAL,
+            MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL,
+        };
+
+        test_reset_pump_amm_fee_config_jetstream_publish_state().await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let filler = AccountPathNatsJob::JetStream {
+            subject: "ironcrab.test.filler".to_string(),
+            payload: serde_json::Value::Null,
+            bump_market_events_published_total: false,
+        };
+        assert!(
+            tx.try_send(filler).is_ok(),
+            "prefill publish queue for enqueue-fail test"
+        );
+        let fail0 = MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_FAIL_TOTAL.load(Ordering::Relaxed);
+        let ok0 = MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL.load(Ordering::Relaxed);
+        let data = test_pump_amm_fee_config_fixture_account_bytes();
+        drive_pump_amm_fee_config_handle(data, Some(tx.clone())).await;
+        assert!(MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_FAIL_TOTAL.load(Ordering::Relaxed) > fail0);
+        let _ = rx.recv().await;
+        assert!(pump_amm_fee_config_jetstream_retry_pending_once(Some(&tx), None).await);
+        assert!(MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL.load(Ordering::Relaxed) > ok0);
+        assert!(rx.recv().await.is_some());
+        let state = pump_amm_fee_config_jetstream_publish_state();
+        assert!(state.pending.lock().await.is_none());
     }
 
     #[test]
