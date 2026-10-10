@@ -523,6 +523,21 @@ pub static MARKET_DATA_HOT_POOL_ACCOUNT_BOOTSTRAP_REJECTED_TOTAL: Lazy<AtomicU64
 /// DLMM bin-array publishes from stashed Geyser replay (post-register / post-sync).
 pub static MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
+/// Pump AMM global FeeConfig account updates observed on the Geyser account session (A.56).
+pub static MARKET_DATA_PUMP_AMM_FEE_CONFIG_ACCOUNT_SEEN_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Pump AMM global FeeConfig account bytes parsed successfully for JetStream publish.
+pub static MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_OK_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Pump AMM global FeeConfig account bytes rejected by parser (no publish, pending retained).
+pub static MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_FAIL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Pump AMM global FeeConfig JetStream publish succeeded (handler or retry worker).
+pub static MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
+/// Pump AMM global FeeConfig JetStream enqueue failed on the Geyser account handler path.
+pub static MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_FAIL_TOTAL: Lazy<AtomicU64> =
+    Lazy::new(|| AtomicU64::new(0));
 /// DLMM bin-array handler publishes on ExecHot lane.
 pub static MARKET_DATA_DLMM_BIN_PUBLISH_EXEC_HOT_TOTAL: Lazy<AtomicU64> =
     Lazy::new(|| AtomicU64::new(0));
@@ -1123,6 +1138,31 @@ pub fn inc_market_data_hot_pool_account_bootstrap_rejected_total() {
 #[inline]
 pub fn inc_market_data_dlmm_bin_replay_publish_total() {
     MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pump_amm_fee_config_account_seen_total() {
+    MARKET_DATA_PUMP_AMM_FEE_CONFIG_ACCOUNT_SEEN_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pump_amm_fee_config_parse_ok_total() {
+    MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pump_amm_fee_config_parse_fail_total() {
+    MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_FAIL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pump_amm_fee_config_publish_ok_total() {
+    MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn inc_market_data_pump_amm_fee_config_publish_fail_total() {
+    MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_FAIL_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 #[inline]
@@ -9899,6 +9939,26 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "market_data_dlmm_bin_replay_publish_total",
         MARKET_DATA_DLMM_BIN_REPLAY_PUBLISH_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pump_amm_fee_config_account_seen_total",
+        MARKET_DATA_PUMP_AMM_FEE_CONFIG_ACCOUNT_SEEN_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pump_amm_fee_config_parse_ok_total",
+        MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pump_amm_fee_config_parse_fail_total",
+        MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_FAIL_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pump_amm_fee_config_publish_ok_total",
+        MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL.load(Ordering::Relaxed)
+    );
+    line!(
+        "market_data_pump_amm_fee_config_publish_fail_total",
+        MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_FAIL_TOTAL.load(Ordering::Relaxed)
     );
     line!(
         "market_data_dlmm_bin_publish_exec_hot_total",
