@@ -21771,6 +21771,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn pump_amm_fee_config_parse_fail_retains_pending_snapshot() {
         use ironcrab::metrics::{
             MARKET_DATA_PUMP_AMM_FEE_CONFIG_PARSE_FAIL_TOTAL,
@@ -21795,6 +21796,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn pump_amm_fee_config_enqueue_ok_increments_publish_ok() {
         use ironcrab::metrics::MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_OK_TOTAL;
 
@@ -21810,6 +21812,7 @@ mod pr_b_geyser_tracking_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn pump_amm_fee_config_enqueue_fail_retries_and_publish_ok() {
         use ironcrab::metrics::{
             MARKET_DATA_PUMP_AMM_FEE_CONFIG_PUBLISH_FAIL_TOTAL,
