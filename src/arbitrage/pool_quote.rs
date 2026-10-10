@@ -15,8 +15,9 @@ use crate::execution::live_pool_cache::{CachedPoolState, MeteoraState};
 use crate::ipc::BinData;
 use crate::solana::dex::meteora_bin_walker::{dlmm_fee_bps, walker_from_bins};
 use crate::solana::dex::pumpfun_amm::{
-    pump_amm_executable_marginal_total_fee_bps, pump_amm_lookup_mint_supply,
-    pump_amm_lookup_pool_creator_by_base_mint, PumpAmmExecutableFeeInputs,
+    pump_amm_executable_marginal_total_fee_bps, pump_amm_global_fee_config_loaded,
+    pump_amm_lookup_mint_supply, pump_amm_lookup_pool_creator_by_base_mint,
+    PumpAmmExecutableFeeInputs,
 };
 use solana_sdk::pubkey::Pubkey;
 
@@ -367,6 +368,15 @@ pub enum NoFreshBuyQuoteSubreason {
     /// Legacy LastTradeMid quote failed freshness (metrics / parsing only).
     TradeStale,
     NotFreshAfterQuote,
+    OrcaTicksMissing,
+    OrcaWalkNone,
+    DlmmActiveBinMissing,
+    DlmmWalkerZero,
+    DlmmMarginalReject,
+    ReservesImplausible,
+    CpmmMathNone,
+    FeeConfigMissing,
+    UnsupportedDex,
 }
 
 impl NoFreshBuyQuoteSubreason {
@@ -376,7 +386,27 @@ impl NoFreshBuyQuoteSubreason {
             Self::StateStale => "state_stale",
             Self::TradeStale => "trade_stale",
             Self::NotFreshAfterQuote => "not_fresh_after_quote",
+            Self::OrcaTicksMissing => "orca_ticks_missing",
+            Self::OrcaWalkNone => "orca_walk_none",
+            Self::DlmmActiveBinMissing => "dlmm_active_bin_missing",
+            Self::DlmmWalkerZero => "dlmm_walker_zero",
+            Self::DlmmMarginalReject => "dlmm_marginal_reject",
+            Self::ReservesImplausible => "reserves_implausible",
+            Self::CpmmMathNone => "cpmm_math_none",
+            Self::FeeConfigMissing => "fee_config_missing",
+            Self::UnsupportedDex => "unsupported_dex",
         }
+    }
+}
+
+/// Meteora DLMM: whether the vault `active_id` bin is present in the subscribed bin map.
+pub fn dlmm_active_bin_in_map(vault: &QuoteVaultInput, dlmm_bins: Option<&DlmmBinArrays>) -> bool {
+    match (vault.active_id, dlmm_bins) {
+        (Some(active_id), Some(bins)) => {
+            let flat_bins = flatten_bins_for_walker(bins);
+            active_bin_present(active_id, &flat_bins)
+        }
+        _ => false,
     }
 }
 
@@ -420,12 +450,15 @@ pub(crate) fn diagnose_no_fresh_buy_quote_with_orca(
         freshness,
     );
     let Some(buy_quote) = buy_quote else {
-        if let Some(v) = vault {
-            if !state_fresh(v, now, freshness.state_ttl_ms) {
-                return NoFreshBuyQuoteSubreason::StateStale;
-            }
-        }
-        return NoFreshBuyQuoteSubreason::NoExecutableMarginal;
+        return diagnose_buy_quote_none_with_orca(
+            pool,
+            vault,
+            dlmm_bins,
+            orca,
+            probe_lamports,
+            freshness,
+            now,
+        );
     };
     if is_quote_fresh_with_orca(&buy_quote, freshness, vault, dlmm_bins, orca, now) {
         return NoFreshBuyQuoteSubreason::NotFreshAfterQuote;
@@ -445,6 +478,151 @@ pub(crate) fn diagnose_no_fresh_buy_quote_with_orca(
         }) => NoFreshBuyQuoteSubreason::StateStale,
         None => NoFreshBuyQuoteSubreason::NotFreshAfterQuote,
     }
+}
+
+fn diagnose_executable_marginal_none_buy(
+    pool: &QuotePoolInput,
+    vault: &QuoteVaultInput,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    orca: OrcaExecCtx<'_>,
+    amount_in: u64,
+    now: Instant,
+    freshness: &QuoteFreshnessConfig,
+) -> Option<NoFreshBuyQuoteSubreason> {
+    if !state_fresh(vault, now, freshness.state_ttl_ms) {
+        return Some(NoFreshBuyQuoteSubreason::StateStale);
+    }
+
+    if pool.dex == "meteora_dlmm" {
+        let active_id = vault.active_id?;
+        let bin_step = vault.bin_step?;
+        let bins = dlmm_bins?;
+        let sol_is_x = vault_dlmm_sol_is_x(vault);
+        let flat_bins = flatten_bins_for_walker(bins);
+        if !active_bin_present(active_id, &flat_bins) {
+            return Some(NoFreshBuyQuoteSubreason::DlmmActiveBinMissing);
+        }
+
+        let walker = walker_from_bins(active_id, bin_step, &flat_bins);
+        let fee_bps = dlmm_fee_bps(bin_step);
+        let amount_out = {
+            let (out, _, _) = if sol_is_x {
+                walker.quote_x_to_y(amount_in, fee_bps).ok()?
+            } else {
+                walker.quote_y_to_x(amount_in, fee_bps).ok()?
+            };
+            if out == 0 {
+                return Some(NoFreshBuyQuoteSubreason::DlmmWalkerZero);
+            }
+            out
+        };
+
+        let reserve_mid = reserves_plausible(
+            vault.reserve_base,
+            vault.reserve_quote,
+            pool.token_decimals,
+            &pool.token_mint,
+        )
+        .then(|| {
+            reserve_mid_sol_per_token(vault.reserve_base, vault.reserve_quote, pool.token_decimals)
+        })
+        .flatten();
+        let trade_mid = trade_mid_sol_per_token(pool)
+            .filter(|p| is_plausible_sol_per_token_price(&pool.token_mint, *p));
+        let marginal_price =
+            trade_implied_sol_per_token(amount_in, amount_out, pool.token_decimals);
+        let marginal_ok = dlmm_marginal_price_plausible(marginal_price, reserve_mid, trade_mid)
+            && is_plausible_sol_per_token_price(&pool.token_mint, marginal_price);
+        if !marginal_ok {
+            return Some(NoFreshBuyQuoteSubreason::DlmmMarginalReject);
+        }
+        return None;
+    }
+
+    if pool.dex == "orca" {
+        if orca.whirlpool.is_none() {
+            return Some(NoFreshBuyQuoteSubreason::UnsupportedDex);
+        }
+        if orca.ticks.is_none() {
+            return Some(NoFreshBuyQuoteSubreason::OrcaTicksMissing);
+        }
+        let whirlpool = orca.whirlpool?;
+        let ticks = orca.ticks?;
+        let out = orca_quote_exact_in(
+            whirlpool,
+            ticks,
+            NATIVE_SOL_MINT,
+            &pool.token_mint,
+            amount_in,
+        );
+        return match out {
+            None | Some(0) => Some(NoFreshBuyQuoteSubreason::OrcaWalkNone),
+            Some(_) => None,
+        };
+    }
+
+    if pool.dex == "pump_amm" && !pump_amm_global_fee_config_loaded() {
+        return Some(NoFreshBuyQuoteSubreason::FeeConfigMissing);
+    }
+
+    if !supports_cpmm(&pool.dex) {
+        return Some(NoFreshBuyQuoteSubreason::UnsupportedDex);
+    }
+    if !reserves_plausible(
+        vault.reserve_base,
+        vault.reserve_quote,
+        pool.token_decimals,
+        &pool.token_mint,
+    ) {
+        return Some(NoFreshBuyQuoteSubreason::ReservesImplausible);
+    }
+
+    let (reserve_in, reserve_out) = (vault.reserve_quote as u128, vault.reserve_base as u128);
+    let Some(fee_bps) = cpmm_fee_bps_for_pool(
+        &pool.dex,
+        &pool.token_mint,
+        vault.reserve_base,
+        vault.reserve_quote,
+        pump_amm_lookup_pool_creator_by_base_mint(
+            &Pubkey::from_str(&pool.token_mint).unwrap_or_default(),
+        ),
+    ) else {
+        return Some(NoFreshBuyQuoteSubreason::CpmmMathNone);
+    };
+    if cpmm_amount_out(reserve_in, reserve_out, amount_in, fee_bps).is_none() {
+        return Some(NoFreshBuyQuoteSubreason::CpmmMathNone);
+    }
+    None
+}
+
+/// Diagnose why a SOL→token buy quote returned `None` (no RPC; existing inputs only).
+pub fn diagnose_buy_quote_none_with_orca(
+    pool: &QuotePoolInput,
+    vault: Option<&QuoteVaultInput>,
+    dlmm_bins: Option<&DlmmBinArrays>,
+    orca: OrcaExecCtx<'_>,
+    sol_amount_in: u64,
+    freshness: &QuoteFreshnessConfig,
+    now: Instant,
+) -> NoFreshBuyQuoteSubreason {
+    if let Some(v) = vault {
+        if !state_fresh(v, now, freshness.state_ttl_ms) {
+            return NoFreshBuyQuoteSubreason::StateStale;
+        }
+        if let Some(sub) = diagnose_executable_marginal_none_buy(
+            pool,
+            v,
+            dlmm_bins,
+            orca,
+            sol_amount_in,
+            now,
+            freshness,
+        ) {
+            return sub;
+        }
+        return NoFreshBuyQuoteSubreason::NoExecutableMarginal;
+    }
+    NoFreshBuyQuoteSubreason::NoExecutableMarginal
 }
 
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -2467,7 +2645,8 @@ mod tests {
     use crate::solana::dex::pumpfun_amm::{
         pump_amm_canonical_pool_creator_for_base_mint, pump_amm_global_fee_config_loaded,
         pump_amm_lookup_mint_supply, pump_amm_register_mint_supply_for_quote,
-        pump_amm_register_pool_creator_for_quote, pump_amm_test_seed_fee_config_and_pool_context,
+        pump_amm_register_pool_creator_for_quote, pump_amm_test_reset_fee_quote_cache,
+        pump_amm_test_seed_fee_config_and_pool_context,
     };
 
     const SAMPLE_TOKEN_MINT: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
@@ -3734,6 +3913,78 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(sub, NoFreshBuyQuoteSubreason::StateStale);
+    }
+
+    #[test]
+    fn diagnose_buy_quote_none_orca_ticks_missing() {
+        let (pool, vault, wp, _ticks) =
+            sample_orca_executable_leg("orcaNoTicks", 1_000_000_000_000, 1_000_000_000);
+        let orca = OrcaExecCtx {
+            whirlpool: Some(&wp),
+            ticks: None,
+        };
+        let sub = diagnose_buy_quote_none_with_orca(
+            &pool,
+            Some(&vault),
+            None,
+            orca,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+        );
+        assert_eq!(sub, NoFreshBuyQuoteSubreason::OrcaTicksMissing);
+    }
+
+    #[test]
+    fn diagnose_buy_quote_none_dlmm_active_bin_missing() {
+        let pool = sample_pool("meteora_dlmm", "dlmmBuy");
+        let vault = QuoteVaultInput {
+            reserve_base: 1_000_000_000_000,
+            reserve_quote: 1_000_000_000,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(100),
+            bin_step: Some(100),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(pool.token_mint.clone()),
+        };
+        let bins: DlmmBinArrays = HashMap::new();
+        let sub = diagnose_buy_quote_none_with_orca(
+            &pool,
+            Some(&vault),
+            Some(&bins),
+            OrcaExecCtx::NONE,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+        );
+        assert_eq!(sub, NoFreshBuyQuoteSubreason::DlmmActiveBinMissing);
+    }
+
+    #[test]
+    fn diagnose_buy_quote_none_pump_amm_fee_config_missing() {
+        pump_amm_test_reset_fee_quote_cache();
+        let pool = QuotePoolInput {
+            pool_address: "pumpNoFee".to_string(),
+            dex: "pump_amm".to_string(),
+            token_mint: SAMPLE_TOKEN_MINT.to_string(),
+            trade_price_buy: None,
+            trade_price_sell: None,
+            trade_updated_at: Instant::now(),
+            has_reserve_data: true,
+            token_decimals: 6,
+        };
+        let vault = sample_vault(1_000_000_000_000, 1_000_000_000);
+        let sub = diagnose_buy_quote_none_with_orca(
+            &pool,
+            Some(&vault),
+            None,
+            OrcaExecCtx::NONE,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+        );
+        assert_eq!(sub, NoFreshBuyQuoteSubreason::FeeConfigMissing);
     }
 
     #[test]
