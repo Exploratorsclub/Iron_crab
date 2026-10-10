@@ -421,7 +421,7 @@ pub fn v2_executable_quote_inputs_complete(
         return vault.is_some() && pump_amm_global_fee_config_loaded();
     }
     if is_orca_dex(&pool.dex) {
-        return orca.whirlpool.is_some() && orca.ticks.is_some();
+        return vault.is_some() && orca.whirlpool.is_some() && orca.ticks.is_some();
     }
     if is_meteora_dlmm_dex(&pool.dex) {
         let Some(vault) = vault else {
