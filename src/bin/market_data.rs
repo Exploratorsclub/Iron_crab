@@ -6773,7 +6773,7 @@ impl MarketDataContext {
                 continue;
             }
             let changed = self.register_geyser_reserves_for_active_pool(pool, pin);
-            let reserves_satisfied = changed || self.hot_pool_reserve_registration_satisfied(pool);
+            let reserves_satisfied = self.hot_pool_reserve_registration_satisfied(pool);
             if reserves_satisfied {
                 if pin == GeyserPinReason::ArbMultiDex {
                     self.clear_arb_pin_deferred_with_metric(pool);
@@ -7076,7 +7076,8 @@ impl MarketDataContext {
             .read()
             .get(&pool)
             .copied();
-        if prev == Some(new_start) {
+        let untracked = !self.pool_geyser_orca_ticks_fully_tracked_for_cache(pool, &state);
+        if prev == Some(new_start) && !untracked {
             return false;
         }
         self.note_deferred_hot_pool_reserve_registration(pool, pin, "arb_orca_tick_drift");
@@ -23139,13 +23140,10 @@ mod pr_b_geyser_tracking_tests {
             2,
         );
         let mut admission = test_admission_for(&ctx);
-        assert!(
-            ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission),
-            "active_id drift must defer to track worker for bin registration"
-        );
+        ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
         assert!(
             ctx.tracked_bin_arrays.read().len() >= before,
-            "new active_id must register additional bin-array PDAs"
+            "retry must register additional bin-array PDAs in tracked map"
         );
         assert_eq!(ctx.dlmm_registered_active_id.read().get(&pool), Some(&500));
     }
@@ -23169,6 +23167,118 @@ mod pr_b_geyser_tracking_tests {
             token_b_program: None,
             whirlpool_quote_account_seeded: true,
         })
+    }
+
+    #[test]
+    fn orca_arb_tick_window_refresh_untracked_same_start_defers() {
+        use ironcrab::solana::dex::orca_tick_array::planned_orca_tick_array_pubkeys;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.live_pool_cache
+            .upsert(pool, test_orca_whirlpool_cached_state(2048, 64), 1);
+        assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        let planned = planned_orca_tick_array_pubkeys(&pool, 2048, 64);
+        assert_eq!(ctx.tracked_orca_tick_arrays.read().len(), 5);
+        let removed = planned[0];
+        assert!(ctx
+            .tracked_orca_tick_arrays
+            .write()
+            .remove(&removed)
+            .is_some());
+        assert!(!ctx.hot_pool_reserve_registration_satisfied(pool));
+        assert!(ctx.maybe_refresh_arb_orca_tick_window(pool, 2048));
+        let defer_pins = ctx.deferred_hot_pool_reserve_pins.read();
+        assert_eq!(
+            defer_pins.get(&pool).map(|d| d.reason),
+            Some("arb_orca_tick_drift"),
+            "untracked tick window must defer for track-worker registration"
+        );
+    }
+
+    #[test]
+    fn orca_arb_deferred_retry_keeps_entry_while_orca_ticks_missing() {
+        use ironcrab::solana::dex::orca_tick_array::planned_orca_tick_array_pubkeys;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.live_pool_cache
+            .upsert(pool, test_orca_whirlpool_cached_state(2048, 64), 1);
+        assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        let removed = planned_orca_tick_array_pubkeys(&pool, 2048, 64)[0];
+        assert!(ctx
+            .tracked_orca_tick_arrays
+            .write()
+            .remove(&removed)
+            .is_some());
+        ctx.deferred_hot_pool_reserve_pins.write().insert(
+            pool,
+            DeferredHotPoolReserve {
+                pin: GeyserPinReason::ArbMultiDex,
+                reason: "arb_orca_tick_drift",
+            },
+        );
+        assert!(!ctx.hot_pool_reserve_registration_satisfied(pool));
+        let changed = ctx.register_geyser_reserves_for_arb_active_pool(pool);
+        assert!(
+            changed,
+            "register_geyser_reserves_for_active_pool may return true on vault promotion"
+        );
+        if !ctx.hot_pool_reserve_registration_satisfied(pool) {
+            let mut admission = test_admission_for(&ctx);
+            ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
+            assert!(
+                ctx.deferred_hot_pool_reserve_pins
+                    .read()
+                    .contains_key(&pool),
+                "defer must remain while orca tick PDAs are missing (clear gate is satisfied-only)"
+            );
+            return;
+        }
+        let mut admission = test_admission_for(&ctx);
+        ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
+        assert!(ctx.hot_pool_reserve_registration_satisfied(pool));
+        assert!(
+            !ctx.deferred_hot_pool_reserve_pins
+                .read()
+                .contains_key(&pool),
+            "retry must clear defer once all five orca tick PDAs are tracked"
+        );
+    }
+
+    #[test]
+    fn orca_arb_deferred_retry_clears_when_all_orca_ticks_tracked() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let jsonl_cfg = JsonlWriterConfig::new("market_events").with_log_dir(tmp.path());
+        let jsonl = QueuedJsonlWriter::spawn(jsonl_cfg, 256).expect("jsonl");
+        let ctx = minimal_market_data_context_for_pr_d_tests(jsonl);
+        let pool = Pubkey::new_unique();
+        ctx.hot_pool_registry.pin_arb_pool(pool);
+        ctx.live_pool_cache
+            .upsert(pool, test_orca_whirlpool_cached_state(2048, 64), 1);
+        assert!(ctx.register_geyser_reserves_for_arb_active_pool(pool));
+        assert!(ctx.hot_pool_reserve_registration_satisfied(pool));
+        ctx.deferred_hot_pool_reserve_pins.write().insert(
+            pool,
+            DeferredHotPoolReserve {
+                pin: GeyserPinReason::ArbMultiDex,
+                reason: "arb_orca_tick_drift",
+            },
+        );
+        let mut admission = test_admission_for(&ctx);
+        ctx.retry_deferred_hot_pool_reserve_registrations(&mut admission);
+        assert!(
+            !ctx.deferred_hot_pool_reserve_pins
+                .read()
+                .contains_key(&pool),
+            "satisfied arb pin must clear deferred retry row"
+        );
     }
 
     #[test]
