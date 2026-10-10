@@ -2413,12 +2413,6 @@ pub fn select_round_trip_pools_with_orca(
     probe_lamports: u64,
     freshness: &QuoteFreshnessConfig,
 ) -> Result<RoundTripPoolSelection, RoundTripSelectFailure> {
-    if candidates.len() < 2 {
-        return Err(RoundTripSelectFailure::InsufficientPools(
-            RoundTripInsufficient::new(RoundTripInsufficientSubreason::CandidatesLt2),
-        ));
-    }
-
     let now = Instant::now();
     let token_decimals = candidates
         .first()
@@ -2443,6 +2437,11 @@ pub fn select_round_trip_pools_with_orca(
         })
         .collect();
     if pairing_candidates.len() < 2 {
+        if candidates.len() < 2 {
+            return Err(RoundTripSelectFailure::InsufficientPools(
+                RoundTripInsufficient::new(RoundTripInsufficientSubreason::CandidatesLt2),
+            ));
+        }
         let mut buy_fail_counts: HashMap<NoFreshBuyQuoteSubreason, usize> = HashMap::new();
         for candidate in candidates {
             let orca = orca_for(&candidate.pool.pool_address);
@@ -3136,12 +3135,15 @@ mod tests {
             &QuoteFreshnessConfig::default(),
         )
         .unwrap_err();
-        assert_eq!(
-            err,
-            RoundTripSelectFailure::InsufficientPools(RoundTripInsufficient::new(
+        if let RoundTripSelectFailure::InsufficientPools(insufficient) = err {
+            assert_eq!(
+                insufficient.subreason,
                 RoundTripInsufficientSubreason::CandidatesLt2
-            ))
-        );
+            );
+            assert!(insufficient.no_fresh_buy_quote_detail.is_none());
+        } else {
+            panic!("expected CandidatesLt2");
+        }
     }
 
     #[test]
