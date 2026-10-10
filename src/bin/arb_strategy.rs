@@ -37,7 +37,8 @@ use ironcrab::arbitrage::in_flight::{
     in_flight_key_from_intent_metadata, InFlightArbKey, InFlightArbRegistry,
 };
 use ironcrab::arbitrage::pool_quote::{
-    classify_cross_dex_sell_failure_with_orca, is_quote_fresh_with_orca, quote_exact_in_with_orca,
+    classify_cross_dex_sell_failure_with_orca, diagnose_buy_quote_none_with_orca,
+    dlmm_active_bin_in_map, is_quote_fresh_with_orca, quote_exact_in_with_orca,
     select_round_trip_pools_with_orca, OrcaExecCtx,
 };
 use ironcrab::arbitrage::{
@@ -76,9 +77,9 @@ use ironcrab::ipc::{
 use ironcrab::metrics::{
     arb_heartbeat_finished, arb_pool_cache_apply_batches_inc, arb_pool_cache_sync_fetch_empty_inc,
     arb_pool_cache_sync_messages_add, arb_pool_cache_updates_applied_add,
-    arb_strategy_bootstrap_skip_inc, arb_strategy_bootstrap_warmup_set,
-    arb_strategy_pool_cache_update_seeded_inc, arb_strategy_pool_cache_update_seen_inc,
-    arb_strategy_pool_cache_update_skip_no_seed_inc,
+    arb_pump_amm_fee_config_loaded_set, arb_strategy_bootstrap_skip_inc,
+    arb_strategy_bootstrap_warmup_set, arb_strategy_pool_cache_update_seeded_inc,
+    arb_strategy_pool_cache_update_seen_inc, arb_strategy_pool_cache_update_skip_no_seed_inc,
     arb_strategy_pool_cache_update_skip_non_arb_quote_inc, arb_subscriber_high_dropped_inc,
     arb_subscriber_high_processed_inc, arb_subscriber_high_queue_depth_set,
     arb_subscriber_low_coalesced_inc, arb_subscriber_low_dropped_inc,
@@ -149,6 +150,7 @@ use ironcrab::nats::{
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
+use ironcrab::solana::dex::pumpfun_amm::pump_amm_global_fee_config_loaded;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 use solana_sdk::pubkey::Pubkey;
 
@@ -2666,8 +2668,13 @@ struct PoolV2EligibilityRow {
     known: bool,
     has_vault: bool,
     has_dlmm_bins: bool,
+    has_whirlpool: bool,
+    has_orca_ticks: bool,
+    active_bin_in_map: bool,
+    fee_config_loaded: bool,
     buy_quote_ok: bool,
     buy_quote_fresh: bool,
+    buy_quote_none_reason: Option<String>,
     sell_quote_ok: bool,
     sell_quote_fresh: bool,
     sell_fail_reason: Option<String>,
@@ -2762,8 +2769,13 @@ impl ArbV2EligibilityForensics {
                         "known": row.known,
                         "has_vault": row.has_vault,
                         "has_dlmm_bins": row.has_dlmm_bins,
+                        "has_whirlpool": row.has_whirlpool,
+                        "has_orca_ticks": row.has_orca_ticks,
+                        "active_bin_in_map": row.active_bin_in_map,
+                        "fee_config_loaded": row.fee_config_loaded,
                         "buy_quote_ok": row.buy_quote_ok,
                         "buy_quote_fresh": row.buy_quote_fresh,
+                        "buy_quote_none_reason": row.buy_quote_none_reason,
                         "sell_quote_ok": row.sell_quote_ok,
                         "sell_quote_fresh": row.sell_quote_fresh,
                         "sell_fail_reason": row.sell_fail_reason,
@@ -3907,14 +3919,45 @@ impl TokenArbTracker {
                 .to_string()
             });
 
+            let has_whirlpool = orca.whirlpool.is_some();
+            let has_orca_ticks = orca.ticks.is_some();
+            let active_bin_in_map = candidate
+                .vault
+                .as_ref()
+                .map(|v| dlmm_active_bin_in_map(v, candidate.dlmm_bins))
+                .unwrap_or(false);
+            let fee_config_loaded = pump_amm_global_fee_config_loaded();
+            let buy_quote_none_reason = if buy_quote_ok {
+                None
+            } else {
+                Some(
+                    diagnose_buy_quote_none_with_orca(
+                        candidate.pool,
+                        candidate.vault,
+                        candidate.dlmm_bins,
+                        orca,
+                        probe,
+                        freshness,
+                        now,
+                    )
+                    .as_metric_label()
+                    .to_string(),
+                )
+            };
+
             pool_rows.push(PoolV2EligibilityRow {
                 pool_address: candidate.pool.pool_address.clone(),
                 dex: candidate.dex.to_string(),
                 known: known_pools.contains(&candidate.pool.pool_address),
                 has_vault: candidate.vault.is_some(),
                 has_dlmm_bins: candidate.dlmm_bins.is_some(),
+                has_whirlpool,
+                has_orca_ticks,
+                active_bin_in_map,
+                fee_config_loaded,
                 buy_quote_ok,
                 buy_quote_fresh,
+                buy_quote_none_reason,
                 sell_quote_ok,
                 sell_quote_fresh,
                 sell_fail_reason,
@@ -9395,6 +9438,10 @@ fn spawn_arb_pool_cache_sync_worker(ctx: Arc<ArbContext>, consumer: JetStreamPul
     });
 }
 
+fn sync_arb_pump_amm_fee_config_loaded_gauge() {
+    arb_pump_amm_fee_config_loaded_set(pump_amm_global_fee_config_loaded());
+}
+
 fn spawn_arb_pump_amm_global_fee_config_worker(consumer: JetStreamPullConsumer) {
     tokio::spawn(async move {
         loop {
@@ -9414,8 +9461,9 @@ fn spawn_arb_pump_amm_global_fee_config_worker(consumer: JetStreamPullConsumer) 
                                 &msg.payload,
                             ) {
                                 Ok(update) => {
-                                    let _ =
-                                        apply_pump_amm_global_fee_config_jetstream_update(&update);
+                                    if apply_pump_amm_global_fee_config_jetstream_update(&update) {
+                                        sync_arb_pump_amm_fee_config_loaded_gauge();
+                                    }
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "Failed to deserialize PumpAmmGlobalFeeConfigUpdate");
@@ -9813,6 +9861,7 @@ async fn main() -> Result<()> {
                 warn!(error = %e, "Arb Pump FeeConfig JetStream bootstrap failed");
             }
         }
+        sync_arb_pump_amm_fee_config_loaded_gauge();
 
         match create_pump_amm_global_fee_config_live_consumer(nats).await {
             Ok(Some(consumer)) => {
