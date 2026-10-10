@@ -205,6 +205,22 @@ pub async fn ensure_pump_amm_global_fee_config_stream(client: &async_nats::Clien
     }
 }
 
+/// Message count in `PUMP_AMM_GLOBAL_FEE_CONFIG` (0 = empty stream, cold-seed candidate).
+pub async fn pump_amm_global_fee_config_stream_message_count(
+    client: &async_nats::Client,
+) -> Result<u64> {
+    let jetstream = jetstream::new(client.clone());
+    let mut stream = jetstream
+        .get_stream(PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME)
+        .await
+        .context("get PUMP_AMM_GLOBAL_FEE_CONFIG stream")?;
+    let info = stream
+        .info()
+        .await
+        .context("PUMP_AMM_GLOBAL_FEE_CONFIG stream info")?;
+    Ok(info.state.messages)
+}
+
 /// Ephemeral bootstrap consumer: `Last` on the fixed subject (re-read stream tail every process start).
 pub fn pump_amm_global_fee_config_bootstrap_consumer_config() -> jetstream::consumer::pull::Config {
     jetstream::consumer::pull::Config {
