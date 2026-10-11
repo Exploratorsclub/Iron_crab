@@ -59,7 +59,7 @@ use ironcrab::arbitrage::{
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::bundle_auction::BundleAuctionParams;
 use ironcrab::execution::live_pool_cache::{
-    create_shared_cache, CachedPoolState, LivePoolCache, SharedLivePoolCache,
+    create_shared_cache, CachedPoolState, LivePoolCache, MeteoraState, SharedLivePoolCache,
 };
 use ironcrab::execution::pool_cache_sync::bootstrap_pool_cache_from_jetstream;
 use ironcrab::execution::pump_amm_fee_config_sync::{
@@ -519,6 +519,15 @@ fn vault_dlmm_sol_is_x(vault: &VaultBalanceCache) -> bool {
         .unwrap_or(vault.dlmm_sol_is_x)
 }
 
+/// DLMM bin price params only when the LB-pair account parse seeded them (not TX-layout zeros).
+fn meteora_dlmm_seeded_bin_params(s: &MeteoraState) -> (Option<i32>, Option<u16>) {
+    if s.dlmm_bin_params_account_seeded {
+        (Some(s.active_id), Some(s.bin_step))
+    } else {
+        (None, None)
+    }
+}
+
 /// Build vault row from SLAVE LivePoolCache entry (Geyser-only, SOL-quoted pools only).
 fn vault_balance_from_live_cache_state(
     state: &CachedPoolState,
@@ -598,7 +607,7 @@ fn resolve_dlmm_meta_for_pool_update(
         }
     };
     if let Some(CachedPoolState::Meteora(s)) = live_pool_cache.get(&pool_pk) {
-        return (Some(s.active_id), Some(s.bin_step));
+        return meteora_dlmm_seeded_bin_params(&s);
     }
     vault_cache
         .get(pool_address)
@@ -821,14 +830,15 @@ fn try_seed_dlmm_vault_on_bin_update(
     } else {
         return;
     };
+    let (active_id, bin_step) = meteora_dlmm_seeded_bin_params(&s);
     vault_cache.insert(
         pool_address.to_string(),
         VaultBalanceCache {
             reserve_base,
             reserve_quote,
             update_slot,
-            active_id: Some(s.active_id),
-            bin_step: Some(s.bin_step),
+            active_id,
+            bin_step,
             updated_at: Instant::now(),
             dlmm_sol_is_x,
             dlmm_token_x_mint,
@@ -1823,10 +1833,11 @@ fn common_quote_pool_seed(state: &CachedPoolState, quote_mint: &str) -> Option<S
             let y = s.token_y_mint.to_string();
             let rx = s.reserve_x_balance?;
             let ry = s.reserve_y_balance?;
+            let (active_id, bin_step) = meteora_dlmm_seeded_bin_params(s);
             if y == quote_mint {
-                Some((x, rx, ry, Some(s.active_id), Some(s.bin_step)))
+                Some((x, rx, ry, active_id, bin_step))
             } else if x == quote_mint {
-                Some((y, ry, rx, Some(s.active_id), Some(s.bin_step)))
+                Some((y, ry, rx, active_id, bin_step))
             } else {
                 None
             }
@@ -1980,10 +1991,11 @@ fn sol_quoted_pool_seed(state: &CachedPoolState) -> Option<SolQuotedPoolSeed> {
             let y = s.token_y_mint.to_string();
             let rx = s.reserve_x_balance?;
             let ry = s.reserve_y_balance?;
+            let (active_id, bin_step) = meteora_dlmm_seeded_bin_params(s);
             if y == NATIVE_SOL_MINT {
-                Some((x, rx, ry, Some(s.active_id), Some(s.bin_step)))
+                Some((x, rx, ry, active_id, bin_step))
             } else if x == NATIVE_SOL_MINT {
-                Some((y, ry, rx, Some(s.active_id), Some(s.bin_step)))
+                Some((y, ry, rx, active_id, bin_step))
             } else {
                 None
             }
@@ -12547,6 +12559,52 @@ mod two_hop_price_tests {
         assert_eq!(vault.active_id, Some(42));
         assert_eq!(vault.bin_step, Some(25));
         assert!(vault.updated_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bin_array_update_tx_layout_seed_omits_unseeded_dlmm_bin_params() {
+        use ironcrab::execution::live_pool_cache::meteora_dlmm_tx_layout_seed;
+
+        let cache = create_shared_cache();
+        let pool_pk = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol = Pubkey::from_str(NATIVE_SOL_MINT).unwrap();
+        let state = meteora_dlmm_tx_layout_seed(
+            token_mint,
+            sol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        cache.upsert(pool_pk, CachedPoolState::Meteora(state), 10);
+        let ctx = test_arb_context(cache);
+        let pool_addr = pool_pk.to_string();
+
+        ctx.handle_bin_array_update(
+            &pool_addr,
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 1_000_000,
+                amount_y: 2_000_000_000,
+            }],
+            11,
+        );
+
+        let quote_vault = {
+            let vault_cache = ctx.vault_balances.read();
+            let vault = vault_cache.get(&pool_addr).expect("vault seeded");
+            assert_eq!(vault.active_id, None);
+            assert_eq!(vault.bin_step, None);
+            vault_fingerprint_quote_input(vault)
+        };
+        let pool_state = sample_pool("meteora_dlmm", &pool_addr, None, None);
+        let quote_pool = pool_state_to_quote_input(&pool_state, &token_mint.to_string(), 6);
+        assert!(!v2_executable_quote_inputs_complete(
+            &quote_pool,
+            Some(&quote_vault),
+            None,
+            OrcaExecCtx::NONE,
+        ));
     }
 
     #[test]

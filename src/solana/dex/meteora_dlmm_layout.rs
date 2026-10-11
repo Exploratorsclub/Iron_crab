@@ -13,11 +13,11 @@ pub struct DlmmPool {
     pub discriminator: [u8; 8],
 
     /// Bin step - price step between bins (basis points)
-    /// At offset 0x20 (32 decimal)
+    /// At offset 0x50 (80 decimal) — not protocol share at 0x20
     pub bin_step: u16,
 
     /// Active bin ID - current price bin
-    /// At offset 0x30 (48 decimal) - signed i32
+    /// At offset 0x4C (76 decimal) — not volatility index_reference at 0x30
     pub active_id: i32,
 
     /// Token X mint (32 bytes)
@@ -58,11 +58,11 @@ impl DlmmPool {
         // Discriminator (8 bytes)
         let discriminator = data[0..8].try_into().unwrap();
 
-        // Bin step at offset 0x20 (32) - u16 little endian
-        let bin_step = u16::from_le_bytes(data[0x20..0x22].try_into().unwrap());
+        // Active ID at offset 0x4C (76) - i32 little endian
+        let active_id = i32::from_le_bytes(data[0x4C..0x50].try_into().unwrap());
 
-        // Active ID at offset 0x30 (48) - i32 little endian
-        let active_id = i32::from_le_bytes(data[0x30..0x34].try_into().unwrap());
+        // Bin step at offset 0x50 (80) - u16 little endian
+        let bin_step = u16::from_le_bytes(data[0x50..0x52].try_into().unwrap());
 
         // Token X mint at offset 0x58 (88)
         let token_x_bytes: [u8; 32] = data[0x58..0x78].try_into().unwrap();
@@ -111,6 +111,11 @@ mod tests {
 
         let pool = DlmmPool::parse(data).expect("Failed to parse pool");
 
+        let expected_active_id = i32::from_le_bytes(data[0x4C..0x50].try_into().unwrap());
+        let expected_bin_step = u16::from_le_bytes(data[0x50..0x52].try_into().unwrap());
+        assert_eq!(pool.active_id, expected_active_id);
+        assert_eq!(pool.bin_step, expected_bin_step);
+
         // Verify token mints
         assert_eq!(
             pool.token_x_mint.to_string(),
@@ -129,9 +134,6 @@ mod tests {
             pool.bin_step > 0 && pool.bin_step < 10000,
             "bin_step should be 1-10000"
         );
-
-        // Verify active_id is set (non-zero for active pool)
-        assert_ne!(pool.active_id, 0, "active_id should be non-zero");
 
         // Verify reserve pubkeys are valid (not all zeros)
         assert_ne!(
@@ -152,5 +154,18 @@ mod tests {
         println!("   Active ID: {}", pool.active_id);
         println!("   Reserve X: {}", pool.reserve_x);
         println!("   Reserve Y: {}", pool.reserve_y);
+    }
+
+    #[test]
+    fn parse_lb_pair_reads_active_id_and_bin_step_at_correct_offsets() {
+        let mut data = vec![0u8; DlmmPool::ACCOUNT_SIZE];
+        data[0x20..0x22].copy_from_slice(&1000u16.to_le_bytes());
+        data[0x30..0x34].copy_from_slice(&(-530i32).to_le_bytes());
+        data[0x4C..0x50].copy_from_slice(&(-400i32).to_le_bytes());
+        data[0x50..0x52].copy_from_slice(&80u16.to_le_bytes());
+
+        let pool = DlmmPool::parse(&data).expect("parse synthetic LB pair");
+        assert_eq!(pool.active_id, -400);
+        assert_eq!(pool.bin_step, 80);
     }
 }
