@@ -399,6 +399,14 @@ impl NoFreshBuyQuoteSubreason {
     }
 }
 
+fn dlmm_bin_params_quote_ready(active_id: Option<i32>, bin_step: Option<u16>) -> bool {
+    matches!((active_id, bin_step), (Some(_), Some(bs)) if bs > 0)
+}
+
+fn dlmm_bin_params_missing_for_quote(active_id: Option<i32>, bin_step: Option<u16>) -> bool {
+    active_id.is_none() || bin_step.is_none() || bin_step == Some(0)
+}
+
 /// Meteora DLMM: whether the vault `active_id` bin is present in the subscribed bin map.
 pub fn dlmm_active_bin_in_map(vault: &QuoteVaultInput, dlmm_bins: Option<&DlmmBinArrays>) -> bool {
     match (vault.active_id, dlmm_bins) {
@@ -427,8 +435,7 @@ pub fn v2_executable_quote_inputs_complete(
         let Some(vault) = vault else {
             return false;
         };
-        return vault.active_id.is_some()
-            && vault.bin_step.is_some()
+        return dlmm_bin_params_quote_ready(vault.active_id, vault.bin_step)
             && dlmm_active_bin_in_map(vault, dlmm_bins);
     }
     if supports_cpmm(&pool.dex) {
@@ -521,8 +528,11 @@ fn diagnose_executable_marginal_none_buy(
     }
 
     if pool.dex == "meteora_dlmm" {
-        let active_id = vault.active_id?;
-        let bin_step = vault.bin_step?;
+        if dlmm_bin_params_missing_for_quote(vault.active_id, vault.bin_step) {
+            return Some(NoFreshBuyQuoteSubreason::DlmmActiveBinMissing);
+        }
+        let active_id = vault.active_id.unwrap();
+        let bin_step = vault.bin_step.unwrap();
         let bins = dlmm_bins?;
         let sol_is_x = vault_dlmm_sol_is_x(vault);
         let flat_bins = flatten_bins_for_walker(bins);
@@ -802,7 +812,7 @@ pub fn dlmm_token_output_from_bins(
     bin_arrays: &HashMap<i64, Vec<BinData>>,
     sol_is_x: bool,
 ) -> Option<u64> {
-    if bin_arrays.is_empty() || sol_in_lamports == 0 {
+    if bin_step == 0 || bin_arrays.is_empty() || sol_in_lamports == 0 {
         return None;
     }
 
@@ -832,7 +842,7 @@ pub fn dlmm_sol_output_from_bins(
     bin_arrays: &HashMap<i64, Vec<BinData>>,
     sol_is_x: bool,
 ) -> Option<u64> {
-    if bin_arrays.is_empty() || token_in == 0 {
+    if bin_step == 0 || bin_arrays.is_empty() || token_in == 0 {
         return None;
     }
 
@@ -1089,8 +1099,11 @@ fn executable_marginal_quote(
     let fingerprint = state_fingerprint_for_executable(vault, dlmm_bins, orca);
 
     if pool.dex == "meteora_dlmm" {
-        let active_id = vault.active_id?;
-        let bin_step = vault.bin_step?;
+        if dlmm_bin_params_missing_for_quote(vault.active_id, vault.bin_step) {
+            return None;
+        }
+        let active_id = vault.active_id.unwrap();
+        let bin_step = vault.bin_step.unwrap();
         let bins = dlmm_bins?;
         let sol_is_x = vault_dlmm_sol_is_x(vault);
         let amount_out = match side {
@@ -1942,8 +1955,11 @@ fn diagnose_executable_marginal_none(
     }
 
     if pool.dex == "meteora_dlmm" {
-        let active_id = vault.active_id?;
-        let bin_step = vault.bin_step?;
+        if dlmm_bin_params_missing_for_quote(vault.active_id, vault.bin_step) {
+            return Some(SellQuoteNoneDetailReason::DlmmActiveBinMissing);
+        }
+        let active_id = vault.active_id.unwrap();
+        let bin_step = vault.bin_step.unwrap();
         let bins = dlmm_bins?;
         let sol_is_x = vault_dlmm_sol_is_x(vault);
         let flat_bins = flatten_bins_for_walker(bins);
@@ -4156,6 +4172,160 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(sub, NoFreshBuyQuoteSubreason::DlmmActiveBinMissing);
+    }
+
+    #[test]
+    fn diagnose_buy_quote_none_dlmm_zero_bin_step_is_active_bin_missing() {
+        let pool = sample_pool("meteora_dlmm", "dlmmBuyZeroStep");
+        let vault = QuoteVaultInput {
+            reserve_base: 1_000_000_000_000,
+            reserve_quote: 1_000_000_000,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(0),
+            bin_step: Some(0),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(pool.token_mint.clone()),
+        };
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 10_000_000_000_000,
+                amount_y: 10_000_000_000,
+            }],
+        );
+        let sub = diagnose_buy_quote_none_with_orca(
+            &pool,
+            Some(&vault),
+            Some(&bins),
+            OrcaExecCtx::NONE,
+            DLMM_PROBE_SOL_LAMPORTS,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+        );
+        assert_eq!(sub, NoFreshBuyQuoteSubreason::DlmmActiveBinMissing);
+    }
+
+    #[test]
+    fn diagnose_sell_quote_none_dlmm_zero_bin_step_is_active_bin_missing() {
+        let pool = sample_pool("meteora_dlmm", "dlmmSellZeroStep");
+        let vault = QuoteVaultInput {
+            reserve_base: 1_000_000_000_000,
+            reserve_quote: 1_000_000_000,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(0),
+            bin_step: Some(0),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(pool.token_mint.clone()),
+        };
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 10_000_000_000_000,
+                amount_y: 10_000_000_000,
+            }],
+        );
+        let reason = diagnose_sell_quote_none(
+            &pool,
+            Some(&vault),
+            Some(&bins),
+            6_785_921_302,
+            &QuoteFreshnessConfig::default(),
+            Instant::now(),
+        );
+        assert_eq!(reason, SellQuoteNoneDetailReason::DlmmActiveBinMissing);
+    }
+
+    #[test]
+    fn dlmm_sol_output_from_bins_rejects_zero_bin_step() {
+        let active_id = 0i32;
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 10_000_000_000_000,
+                amount_y: 10_000_000_000,
+            }],
+        );
+        let token_in = 6_785_921_302u64;
+        assert!(dlmm_sol_output_from_bins(active_id, 0, token_in, &bins, false).is_none());
+    }
+
+    #[test]
+    fn v2_executable_quote_inputs_incomplete_when_bin_step_zero() {
+        let pool = sample_pool("meteora_dlmm", "dlmmZeroStep");
+        let vault = QuoteVaultInput {
+            reserve_base: 1_000_000_000_000,
+            reserve_quote: 1_000_000_000,
+            update_slot: 1,
+            updated_at: Instant::now(),
+            active_id: Some(0),
+            bin_step: Some(0),
+            dlmm_sol_is_x: false,
+            dlmm_token_x_mint: Some(pool.token_mint.clone()),
+        };
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 1,
+                amount_y: 1,
+            }],
+        );
+        assert!(!v2_executable_quote_inputs_complete(
+            &pool,
+            Some(&vault),
+            Some(&bins),
+            OrcaExecCtx::NONE,
+        ));
+    }
+
+    #[test]
+    fn dlmm_sell_quote_uses_real_bin_step_not_identity_price() {
+        let active_id = -530i32;
+        let bin_step = 80u16;
+        let token_in = 6_785_921_302u64;
+        let array_index = active_id.div_euclid(70) as i64;
+        let offset = active_id.rem_euclid(70) as u8;
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            array_index,
+            vec![BinData {
+                offset,
+                amount_x: token_in.saturating_mul(2),
+                amount_y: 500_000_000_000,
+            }],
+        );
+        let out = dlmm_sol_output_from_bins(active_id, bin_step, token_in, &bins, false)
+            .expect("walker sell");
+        assert!(out > 50_000_000 && out < 200_000_000, "out={out}");
+        assert_ne!(out, token_in * 9990 / 10000);
+    }
+
+    #[test]
+    fn dlmm_active_id_zero_with_positive_bin_step_still_quotes() {
+        let active_id = 0i32;
+        let bin_step = 10u16;
+        let sol_in = 100_000_000u64;
+        let mut bins: DlmmBinArrays = HashMap::new();
+        bins.insert(
+            0,
+            vec![BinData {
+                offset: 0,
+                amount_x: 10_000_000_000_000,
+                amount_y: 10_000_000_000,
+            }],
+        );
+        let out = dlmm_token_output_from_bins(active_id, bin_step, sol_in, &bins, false)
+            .expect("price=1 at active_id 0 is valid when bin_step > 0");
+        assert!(out > 0);
     }
 
     #[test]
