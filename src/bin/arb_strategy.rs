@@ -8675,6 +8675,20 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
         return None;
     }
 
+    let min_profit_lamports = config.bundle_auction.min_profit_for_landing();
+    if opp.estimated_profit_lamports < min_profit_lamports {
+        trace!(
+            mint = %opp.base_mint,
+            spread_bps = opp.spread_bps,
+            profit_lamports = opp.estimated_profit_lamports,
+            min_profit_lamports,
+            reason = "BUNDLE_PROFIT_INSUFFICIENT",
+            "Skipping arb intent: estimated profit below bundle landing minimum"
+        );
+        record_arb_bundle_profit_insufficient();
+        return None;
+    }
+
     let priority_cost = config.bundle_auction.assumed_priority_lamports();
     let tip_bps = config.bundle_auction.tip_default_bps;
     if matches!(
