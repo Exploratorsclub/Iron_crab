@@ -55,7 +55,8 @@ use uuid::Uuid;
 use ironcrab::config::Config as AppConfig;
 // cache_geyser removed - execution-engine now subscribes to PoolCacheUpdates from market-data via NATS
 use ironcrab::execution::bundle_auction::{
-    estimate_priority_fee_lamports, max_auction_spend_lamports, BundleAuctionParams,
+    cross_dex_effective_bundle_tip_lamports, estimate_priority_fee_lamports, BundleAuctionParams,
+    CrossDexBundleTipOutcome,
 };
 use ironcrab::execution::error_detection::is_6005_bonding_curve_complete;
 use ironcrab::execution::live_pool_cache::{
@@ -10860,34 +10861,25 @@ fn effective_bundle_tip_lamports(
                 .get("bundle_tip_bps")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(auction.tip_default_bps);
-            let profit_tip = (profit as u128 * tip_bps as u128 / 10_000) as u64;
-            let max_auction_spend =
-                max_auction_spend_lamports(profit, auction.auction_max_spend_bps);
-            let max_tip = max_auction_spend.saturating_sub(priority_cost);
-            let raw_tip = profit_tip.min(max_tip);
-            let upper = auction.tip_max_lamports.min(profit);
-            let lower = if max_tip >= auction.tip_min_lamports {
-                auction.tip_min_lamports
-            } else if max_tip >= auction.jito_tip_floor_lamports {
-                auction.jito_tip_floor_lamports
-            } else {
-                return EffectiveBundleTip::AuctionBudgetInsufficient {
-                    estimated_profit: profit,
+            return match cross_dex_effective_bundle_tip_lamports(
+                profit,
+                tip_bps,
+                priority_cost,
+                auction,
+            ) {
+                CrossDexBundleTipOutcome::Ok(tip) => EffectiveBundleTip::Ok(tip),
+                CrossDexBundleTipOutcome::Rejected {
+                    estimated_profit,
                     priority_cost,
                     max_auction_spend,
-                    computed_tip: raw_tip,
-                };
+                    computed_tip,
+                } => EffectiveBundleTip::AuctionBudgetInsufficient {
+                    estimated_profit,
+                    priority_cost,
+                    max_auction_spend,
+                    computed_tip,
+                },
             };
-            let tip = raw_tip.clamp(lower, upper);
-            if tip < auction.jito_tip_floor_lamports {
-                return EffectiveBundleTip::AuctionBudgetInsufficient {
-                    estimated_profit: profit,
-                    priority_cost,
-                    max_auction_spend,
-                    computed_tip: tip,
-                };
-            }
-            return EffectiveBundleTip::Ok(tip);
         }
     }
     let tip = intent
@@ -17631,7 +17623,7 @@ mod execution_engine_tests {
             "452000".to_string(),
         );
 
-        // 10% of 452k = 45.2k; 15% auction cap (67.8k) below competitive min tip → cap wins
+        // 10% of 452k = 45.2k (Jito floor 1k, not tip_min_lamports)
         let tip = match effective_bundle_tip_lamports(&intent, &config, 0, 400_000) {
             EffectiveBundleTip::Ok(t) => t,
             other => panic!("expected Ok tip, got {other:?}"),
@@ -17668,8 +17660,8 @@ mod execution_engine_tests {
             other => panic!("expected Ok tip for prod edge case, got {other:?}"),
         };
         assert!(tip >= 1_000, "tip must meet Jito floor, got {tip}");
-        // max_auction=90750, priority≈54800, max_tip≈35950
-        assert_eq!(tip, 35_950);
+        // 10% of 605k; priority no longer subtracted from auction tip cap
+        assert_eq!(tip, 60_500);
     }
 
     #[test]
@@ -17684,17 +17676,9 @@ mod execution_engine_tests {
             "605000".to_string(),
         );
 
-        // priority_cost = 137k * 1M / 1M = 137k > max_auction_spend 90750 → max_tip=0
+        // priority > 15% of profit but tip budget still allows Jito floor + profit share
         let result = effective_bundle_tip_lamports(&intent, &config, 137_000, 1_000_000);
-        assert!(matches!(
-            result,
-            EffectiveBundleTip::AuctionBudgetInsufficient {
-                estimated_profit: 605_000,
-                priority_cost: 137_000,
-                max_auction_spend: 90_750,
-                computed_tip: 0,
-            }
-        ));
+        assert!(matches!(result, EffectiveBundleTip::Ok(tip) if tip > 0));
     }
 
     #[test]
@@ -17708,12 +17692,14 @@ mod execution_engine_tests {
             .metadata
             .insert("estimated_profit_lamports".to_string(), "50000".to_string());
 
-        // max_auction=7500, priority=5000 → max_tip=2500 (above floor) → Ok(2500)
         let ok = effective_bundle_tip_lamports(&intent, &config, 5_000, 1_000_000);
-        assert!(matches!(ok, EffectiveBundleTip::Ok(2_500)));
+        assert!(matches!(ok, EffectiveBundleTip::Ok(5_000)));
 
-        // max_auction=7500, priority=7000 → max_tip=500 (< jito floor 1000)
-        let reject = effective_bundle_tip_lamports(&intent, &config, 7_000, 1_000_000);
+        // Jito floor exceeds 15% tip budget (profit too small)
+        intent
+            .metadata
+            .insert("estimated_profit_lamports".to_string(), "5000".to_string());
+        let reject = effective_bundle_tip_lamports(&intent, &config, 0, 400_000);
         assert!(matches!(
             reject,
             EffectiveBundleTip::AuctionBudgetInsufficient { .. }
