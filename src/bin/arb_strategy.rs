@@ -57,7 +57,9 @@ use ironcrab::arbitrage::{
     TrackPoolReadiness, TrackSelectionConfig, DLMM_PROBE_SOL_LAMPORTS,
 };
 use ironcrab::config::Config as AppConfig;
-use ironcrab::execution::bundle_auction::BundleAuctionParams;
+use ironcrab::execution::bundle_auction::{
+    cross_dex_effective_bundle_tip_lamports, BundleAuctionParams, CrossDexBundleTipOutcome,
+};
 use ironcrab::execution::live_pool_cache::{
     create_shared_cache, CachedPoolState, LivePoolCache, MeteoraState, SharedLivePoolCache,
 };
@@ -8673,15 +8675,38 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
         return None;
     }
 
-    let min_bundle_profit = config.bundle_auction.min_profit_for_landing();
-    if opp.estimated_profit_lamports < min_bundle_profit {
+    let min_profit_lamports = config.bundle_auction.min_profit_for_landing();
+    if opp.estimated_profit_lamports < min_profit_lamports {
         trace!(
             mint = %opp.base_mint,
             spread_bps = opp.spread_bps,
             profit_lamports = opp.estimated_profit_lamports,
-            min_bundle_profit_lamports = min_bundle_profit,
+            min_profit_lamports,
             reason = "BUNDLE_PROFIT_INSUFFICIENT",
-            "Skipping arb intent: estimated profit below bundle auction minimum"
+            "Skipping arb intent: estimated profit below bundle landing minimum"
+        );
+        record_arb_bundle_profit_insufficient();
+        return None;
+    }
+
+    let priority_cost = config.bundle_auction.assumed_priority_lamports();
+    let tip_bps = config.bundle_auction.tip_default_bps;
+    if matches!(
+        cross_dex_effective_bundle_tip_lamports(
+            opp.estimated_profit_lamports,
+            tip_bps,
+            priority_cost,
+            &config.bundle_auction,
+        ),
+        CrossDexBundleTipOutcome::Rejected { .. }
+    ) {
+        trace!(
+            mint = %opp.base_mint,
+            spread_bps = opp.spread_bps,
+            profit_lamports = opp.estimated_profit_lamports,
+            priority_cost_lamports = priority_cost,
+            reason = "BUNDLE_PROFIT_INSUFFICIENT",
+            "Skipping arb intent: bundle tip budget cannot land (profit vs base+priority+tip)"
         );
         record_arb_bundle_profit_insufficient();
         return None;
@@ -17328,7 +17353,7 @@ mod pool_accounts_coverage_tests {
             sell_price: Decimal::ONE,
             spread_bps: 47,
             trade_amount_lamports: 100_000_000,
-            estimated_profit_lamports: 423_802,
+            estimated_profit_lamports: 49_000,
             buy_token_out: None,
         };
 
