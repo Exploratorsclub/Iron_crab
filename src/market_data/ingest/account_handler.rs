@@ -8,8 +8,8 @@ use super::account_filter::{
 use super::account_host::{AccountBinArrayView, AccountIngestHost};
 use super::account_parse::{
     account_publish_segment, try_parse_mint_account, try_parse_token_account_balance,
-    wallet_geyser_snapshots_to_publish, wsol_ata_balance_lamports_from_geyser_data,
-    WalletGeyserUpdateSource,
+    try_parse_token_account_mint, wallet_geyser_snapshots_to_publish,
+    wsol_ata_balance_lamports_from_geyser_data, WalletGeyserUpdateSource,
 };
 use super::dlmm_bin_publish::filter_dlmm_bins_for_publish;
 use crate::ipc::{MarketEvent, MarketEventKind, NATIVE_SOL_MINT};
@@ -463,12 +463,17 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
     {
         // Phase-R-R4: vault pairing + publish off hot path (`md-sidefx`; no `tracked_vaults` read here).
         if let Some(balance) = try_parse_token_account_balance(&account_update.data) {
+            let (mint, token_program) = try_parse_token_account_mint(&account_update.data)
+                .map(|mint| (mint, account_update.owner))
+                .unwrap_or((Pubkey::default(), Pubkey::default()));
             md_account_sidefx_try_enqueue_classed(
                 md_sidefx,
                 sidefx_class,
                 MdSidefxCommand::VaultBalanceTick {
                     run_id: run_id.to_string(),
                     vault_pubkey: account_update.pubkey,
+                    mint,
+                    token_program,
                     balance,
                     slot: account_update.slot,
                     grpc_recv_at: account_update.grpc_recv_at,

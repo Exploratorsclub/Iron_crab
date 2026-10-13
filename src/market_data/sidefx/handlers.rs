@@ -43,9 +43,62 @@ use crate::nats::jetstream::pool_subject;
 use crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use crate::solana::dex_parser::DexType;
 use solana_sdk::pubkey::Pubkey;
+use spl_token;
+use spl_token_2022;
 use std::str::FromStr;
 use std::time::Instant;
 use tracing::{debug, info, warn};
+
+fn is_observed_spl_token_program(owner: &Pubkey) -> bool {
+    owner.to_bytes() == spl_token::ID.to_bytes()
+        || owner.to_bytes() == spl_token_2022::ID.to_bytes()
+}
+
+/// Publish TokenMintInfo from vault account owner when mint program was not yet on MASTER cache.
+fn md_sidefx_maybe_publish_vault_observed_token_program(
+    host: &dyn SidefxWorkerHost,
+    run_id: &str,
+    mint: Pubkey,
+    token_program: Pubkey,
+    slot: u64,
+    grpc_recv_at: Instant,
+) {
+    if mint == Pubkey::default() || !is_observed_spl_token_program(&token_program) {
+        return;
+    }
+    if host.live_pool_cache().get_mint_program(&mint) == Some(token_program) {
+        return;
+    }
+    host.live_pool_cache()
+        .update_mint_program(&mint, token_program);
+    let mint_event = MarketEvent::new(
+        "market-data",
+        host.build_version(),
+        run_id,
+        host.next_event_id(),
+        "geyser_vault",
+        Some(slot),
+        MarketEventKind::TokenMintInfo {
+            mint: mint.to_string(),
+            token_program: token_program.to_string(),
+            decimals: 0,
+            supply: 0,
+            mint_authority: None,
+            freeze_authority: None,
+        },
+    );
+    host.write_market_event_jsonl(&mint_event);
+    if host.nats_enabled() {
+        host.enqueue_core_market_event(
+            mint_event,
+            Some(MarketEventCorePublishTrace {
+                recv_at: grpc_recv_at,
+                cold_path: false,
+                segment: MarketDataLatencySegment::Other,
+            }),
+        );
+    }
+}
 
 fn sidefx_host_enqueue_jetstream<T: serde::Serialize>(
     host: &dyn SidefxWorkerHost,
@@ -1994,6 +2047,8 @@ pub fn md_sidefx_process_vault_balance_tick(
     let MdSidefxCommand::VaultBalanceTick {
         run_id,
         vault_pubkey,
+        mint,
+        token_program,
         balance,
         slot,
         grpc_recv_at,
@@ -2006,6 +2061,14 @@ pub fn md_sidefx_process_vault_balance_tick(
         inc_market_data_vault_tick_dropped("membership_miss");
         return;
     };
+    md_sidefx_maybe_publish_vault_observed_token_program(
+        host,
+        run_id,
+        *mint,
+        *token_program,
+        *slot,
+        *grpc_recv_at,
+    );
     if vault_view.dex == "restored" {
         let cache_has_quotable_dex = host
             .live_pool_cache()

@@ -1332,11 +1332,6 @@ struct MarketDataContext {
     /// Pools for which we've already emitted DexPoolAccounts from trade parsing.
     known_trade_dex_pools: parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
 
-    /// Pump.fun pool discovery: emit `TokenMintInfo` at most once per base mint (Geyser reconnect
-    /// or duplicate discovery must not spam `mint_info_tx`).
-    pumpfun_pool_discovery_mint_info_emitted:
-        parking_lot::RwLock<std::collections::HashSet<Pubkey>>,
-
     /// Vault account tracking for PoolStateUpdate events (Geyser-based reserve balances).
     /// Maps vault_address → VaultInfo (pool context).
     tracked_vaults: parking_lot::RwLock<std::collections::HashMap<Pubkey, VaultInfo>>,
@@ -9955,9 +9950,6 @@ async fn main() -> Result<()> {
         explicit_admitted_arb_pools: parking_lot::RwLock::new(HashSet::new()),
         known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
         known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
-        pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
-            std::collections::HashSet::new(),
-        ),
         tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
         tracked_vaults_tx,
         tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -11444,11 +11436,10 @@ async fn account_path_enqueue_core_market_event(
 }
 
 /// PR162: pool discovery handler (dedicated task; not in main `select!`).
-/// STOP-CHECK: keine neuen RPC-Calls; Pump.fun TokenMintInfo nutzt bekannte Decimals.
 async fn handle_pool_discovery_market_event(
     ctx: &Arc<MarketDataContext>,
     run_id: &str,
-    mint_info_tx: &mpsc::UnboundedSender<MarketEvent>,
+    _mint_info_tx: &mpsc::UnboundedSender<MarketEvent>,
     account_publish_tx: Option<&mpsc::Sender<AccountPathNatsJob>>,
     pool_event: PoolDiscoveryEvent,
 ) {
@@ -11472,36 +11463,6 @@ async fn handle_pool_discovery_market_event(
         liquidity_lamports = pool_event.liquidity_estimate_lamports,
         "Pool discovered via Geyser"
     );
-
-    if matches!(pool_event.dex_type, PoolDexType::PumpFun) {
-        let emit_mint_info = ctx
-            .pumpfun_pool_discovery_mint_info_emitted
-            .write()
-            .insert(pool_event.base_mint);
-        if emit_mint_info {
-            let mint_event = MarketEvent::new(
-                "market-data",
-                BUILD_VERSION,
-                run_id,
-                ctx.next_event_id(),
-                "geyser_known",
-                Some(pool_event.slot),
-                MarketEventKind::TokenMintInfo {
-                    mint: pool_event.base_mint.to_string(),
-                    token_program: spl_token::ID.to_string(),
-                    decimals: 6,
-                    supply: 0,
-                    mint_authority: None,
-                    freeze_authority: None,
-                },
-            );
-            let _ = mint_info_tx.send(mint_event);
-            debug!(
-                mint = %pool_event.base_mint,
-                "Emitted TokenMintInfo for pump.fun token (decimals=6, no RPC)"
-            );
-        }
-    }
 
     let event = MarketEvent::new(
         "market-data",
@@ -15086,9 +15047,6 @@ mod wallet_snapshot_stale_cleanup_tests {
             explicit_admitted_arb_pools: parking_lot::RwLock::new(HashSet::new()),
             known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
-                std::collections::HashSet::new(),
-            ),
             tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_vaults_tx,
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -15326,9 +15284,6 @@ mod wallet_tx_meta_balance_tests {
             explicit_admitted_arb_pools: parking_lot::RwLock::new(HashSet::new()),
             known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
-                std::collections::HashSet::new(),
-            ),
             tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_vaults_tx,
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -16704,6 +16659,8 @@ mod pr_b_geyser_tracking_tests {
             .map(|i| MdSidefxCommand::VaultBalanceTick {
                 run_id: "test".into(),
                 vault_pubkey: vault,
+                mint: Pubkey::default(),
+                token_program: Pubkey::default(),
                 balance: i + 1,
                 slot: i + 1,
                 grpc_recv_at: Instant::now(),
@@ -17150,9 +17107,6 @@ mod pr_b_geyser_tracking_tests {
             explicit_admitted_arb_pools: parking_lot::RwLock::new(HashSet::new()),
             known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
-                std::collections::HashSet::new(),
-            ),
             tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_vaults_tx,
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -17243,9 +17197,6 @@ mod pr_b_geyser_tracking_tests {
             explicit_admitted_arb_pools: parking_lot::RwLock::new(HashSet::new()),
             known_pump_amm_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
             known_trade_dex_pools: parking_lot::RwLock::new(std::collections::HashSet::new()),
-            pumpfun_pool_discovery_mint_info_emitted: parking_lot::RwLock::new(
-                std::collections::HashSet::new(),
-            ),
             tracked_vaults: parking_lot::RwLock::new(std::collections::HashMap::new()),
             tracked_vaults_tx,
             tracked_bin_arrays: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -23600,6 +23551,8 @@ mod pr_b_geyser_tracking_tests {
             &MdSidefxCommand::VaultBalanceTick {
                 run_id: "test".into(),
                 vault_pubkey: base_vault,
+                mint: Pubkey::default(),
+                token_program: Pubkey::default(),
                 balance: 10_000,
                 slot: 42,
                 grpc_recv_at: Instant::now(),
@@ -23748,6 +23701,8 @@ mod pr_b_geyser_tracking_tests {
                 &MdSidefxCommand::VaultBalanceTick {
                     run_id: "test".into(),
                     vault_pubkey: unknown_vault,
+                    mint: Pubkey::default(),
+                    token_program: Pubkey::default(),
                     balance: 1,
                     slot: 1,
                     grpc_recv_at: Instant::now(),
@@ -23793,6 +23748,8 @@ mod pr_b_geyser_tracking_tests {
                 &MdSidefxCommand::VaultBalanceTick {
                     run_id: "test".into(),
                     vault_pubkey: base_vault,
+                    mint: Pubkey::default(),
+                    token_program: Pubkey::default(),
                     balance: 100,
                     slot: 1,
                     grpc_recv_at: Instant::now(),
@@ -23845,6 +23802,8 @@ mod pr_b_geyser_tracking_tests {
             &MdSidefxCommand::VaultBalanceTick {
                 run_id: "test".into(),
                 vault_pubkey: base_vault,
+                mint: Pubkey::default(),
+                token_program: Pubkey::default(),
                 balance: 0,
                 slot: 1,
                 grpc_recv_at: Instant::now(),
@@ -23909,6 +23868,8 @@ mod pr_b_geyser_tracking_tests {
                 &MdSidefxCommand::VaultBalanceTick {
                     run_id: "test".into(),
                     vault_pubkey: base_vault,
+                    mint: Pubkey::default(),
+                    token_program: Pubkey::default(),
                     balance: 10_000,
                     slot: 1,
                     grpc_recv_at: Instant::now(),
@@ -23998,6 +23959,8 @@ mod pr_b_geyser_tracking_tests {
                 &MdSidefxCommand::VaultBalanceTick {
                     run_id: "test".into(),
                     vault_pubkey: base_vault,
+                    mint: Pubkey::default(),
+                    token_program: Pubkey::default(),
                     balance: 10_000,
                     slot: 42,
                     grpc_recv_at: Instant::now(),
@@ -24052,6 +24015,8 @@ mod pr_b_geyser_tracking_tests {
                 &MdSidefxCommand::VaultBalanceTick {
                     run_id: "test".into(),
                     vault_pubkey: base_vault,
+                    mint: Pubkey::default(),
+                    token_program: Pubkey::default(),
                     balance: 10_000,
                     slot: 42,
                     grpc_recv_at: Instant::now(),
@@ -24106,6 +24071,8 @@ mod pr_b_geyser_tracking_tests {
                 &MdSidefxCommand::VaultBalanceTick {
                     run_id: "test".into(),
                     vault_pubkey: base_vault,
+                    mint: Pubkey::default(),
+                    token_program: Pubkey::default(),
                     balance: 100,
                     slot: 10,
                     grpc_recv_at: Instant::now(),
@@ -24176,6 +24143,8 @@ mod pr_b_geyser_tracking_tests {
             &MdSidefxCommand::VaultBalanceTick {
                 run_id: "test".into(),
                 vault_pubkey: base_vault,
+                mint: Pubkey::default(),
+                token_program: Pubkey::default(),
                 balance: 10_000,
                 slot: 40,
                 grpc_recv_at: Instant::now(),
@@ -24196,6 +24165,8 @@ mod pr_b_geyser_tracking_tests {
             &MdSidefxCommand::VaultBalanceTick {
                 run_id: "test".into(),
                 vault_pubkey: quote_vault,
+                mint: Pubkey::default(),
+                token_program: Pubkey::default(),
                 balance: 5_000,
                 slot: 42,
                 grpc_recv_at: Instant::now(),
@@ -24250,6 +24221,8 @@ mod pr_b_geyser_tracking_tests {
                 &MdSidefxCommand::VaultBalanceTick {
                     run_id: "test".into(),
                     vault_pubkey: base_vault,
+                    mint: Pubkey::default(),
+                    token_program: Pubkey::default(),
                     balance: 10_000,
                     slot: 42,
                     grpc_recv_at: Instant::now(),
@@ -24315,6 +24288,8 @@ mod pr_b_geyser_tracking_tests {
                 &MdSidefxCommand::VaultBalanceTick {
                     run_id: "test".into(),
                     vault_pubkey: base_vault,
+                    mint: Pubkey::default(),
+                    token_program: Pubkey::default(),
                     balance: 10_000,
                     slot: 42,
                     grpc_recv_at: Instant::now(),

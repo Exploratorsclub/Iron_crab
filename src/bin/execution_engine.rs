@@ -9852,11 +9852,19 @@ async fn main() -> Result<()> {
                                 ..
                             } => {
                                 if let Ok(mint_pk) = Pubkey::from_str(mint) {
-                                    cache.set_mint_decimals(mint_pk, *decimals);
+                                    if *decimals > 0 {
+                                        cache.set_mint_decimals(mint_pk, *decimals);
+                                    }
 
                                     // Also cache token_program (needed for ATA creation)
                                     if let Ok(program_pk) = Pubkey::from_str(token_program) {
-                                        cache.update_mint_program(&mint_pk, program_pk);
+                                        let spl =
+                                            Pubkey::new_from_array(spl_token::id().to_bytes());
+                                        let spl22 =
+                                            Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+                                        if program_pk == spl || program_pk == spl22 {
+                                            cache.update_mint_program(&mint_pk, program_pk);
+                                        }
                                     }
 
                                     mint_info_count += 1;

@@ -40,6 +40,18 @@ pub fn try_parse_mint_account(
     }
 }
 
+/// SPL token account layout: mint pubkey at offset 0 (32 bytes).
+pub fn try_parse_token_account_mint(data: &[u8]) -> Option<Pubkey> {
+    if data.len() < 32 {
+        return None;
+    }
+    let mint = Pubkey::try_from(&data[0..32]).ok()?;
+    if mint == Pubkey::default() {
+        return None;
+    }
+    Some(mint)
+}
+
 /// Parse a Token Account to extract the balance (amount).
 /// Works with both spl-token and spl-token-2022 accounts.
 pub fn try_parse_token_account_balance(data: &[u8]) -> Option<u64> {
