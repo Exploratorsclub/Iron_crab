@@ -5499,6 +5499,8 @@ pub static ARB_TRIANGLE_PROFITABLE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::ne
 pub static ARB_TRIANGLE_OPPORTUNITIES: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 /// Count of arb opportunities rejected due to missing DexPoolAccounts for pump_amm
 pub static ARB_REJECTED_MISSING_ACCOUNTS: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+/// Arb intents rejected: base mint token program not observed (non-WSOL).
+pub static ARB_REJECTED_TOKEN_PROGRAM_UNKNOWN: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 /// DexPoolAccounts backfill into arb tracker from SLAVE LivePoolCache (Geyser-only).
 pub static ARB_POOL_ACCOUNTS_BACKFILL_LIVE_CACHE: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -12094,6 +12096,10 @@ async fn metrics_response() -> Response<Body> {
     line!(
         "arb_rejected_missing_accounts_total",
         ARB_REJECTED_MISSING_ACCOUNTS.load(Ordering::Relaxed)
+    );
+    line!(
+        "arb_rejected_token_program_unknown_total",
+        ARB_REJECTED_TOKEN_PROGRAM_UNKNOWN.load(Ordering::Relaxed)
     );
     line!(
         "arb_pool_accounts_backfill_total{source=\"live_cache\"}",

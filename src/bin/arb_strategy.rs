@@ -135,12 +135,13 @@ use ironcrab::metrics::{
     ArbTwoHopV2NoCrossDexSellDetail, ArbTwoHopV2RejectReason, ArbTwoHopV2ScreenSkipReason,
     ArbTwoHopV2SellQuoteNoneDetail, ArbWriterLockKind, MetricsComponent,
     ARB_HEARTBEAT_SECONDS_SINCE_LAST_FINISH, ARB_REJECTED_MISSING_ACCOUNTS,
-    ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL, ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH,
-    ARB_TRACKER_WRITE_COALESCER_PENDING, ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS,
-    ARB_TRACKER_WRITE_CURRENT_JOB_TYPE, ARB_TRACKER_WRITE_QUEUE_DEPTH,
-    ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH, ARB_TRIANGLE_OPPORTUNITIES,
-    INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL, NATS_MESSAGES_PUBLISHED_TOTAL,
-    NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE, TOKENS_TRACKED_GAUGE,
+    ARB_REJECTED_TOKEN_PROGRAM_UNKNOWN, ARB_SUBSCRIBER_HIGH_PROCESSED_TOTAL,
+    ARB_SUBSCRIBER_HIGH_QUEUE_DEPTH, ARB_TRACKER_WRITE_COALESCER_PENDING,
+    ARB_TRACKER_WRITE_CURRENT_JOB_STARTED_UNIX_MS, ARB_TRACKER_WRITE_CURRENT_JOB_TYPE,
+    ARB_TRACKER_WRITE_QUEUE_DEPTH, ARB_TRACKER_WRITE_SECONDS_SINCE_LAST_FINISH,
+    ARB_TRIANGLE_OPPORTUNITIES, INTENTS_GENERATED_TOTAL, MARKET_EVENTS_CONSUMED_TOTAL,
+    NATS_MESSAGES_PUBLISHED_TOTAL, NATS_MESSAGES_RECEIVED_TOTAL, POOLS_TRACKED_GAUGE,
+    TOKENS_TRACKED_GAUGE,
 };
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
@@ -8763,6 +8764,19 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     // Get token program from cache (from TokenMintInfo event)
     // This avoids IncorrectProgramId errors when creating ATAs for Token-2022 tokens
     let token_program = ctx.get_token_program_for_mint(&opp.base_mint);
+    const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+    if token_program.is_none() && opp.base_mint != WSOL_MINT {
+        warn!(
+            mint = %opp.base_mint,
+            buy_pool = %opp.buy_pool,
+            sell_pool = %opp.sell_pool,
+            buy_dex = %opp.buy_dex,
+            sell_dex = %opp.sell_dex,
+            "Rejecting arb: token program unknown (GEYSER-FIRST)"
+        );
+        ARB_REJECTED_TOKEN_PROGRAM_UNKNOWN.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
 
     // =========================================================================
     // OPTION D: Calculate expected_token_output from pool reserves / bin walker
@@ -17226,6 +17240,7 @@ mod pool_accounts_coverage_tests {
 
         let mut tracker = TokenArbTracker::new(USDC_MINT);
         tracker.token_decimals = Some(6);
+        tracker.token_program = Some(spl_token::ID.to_string());
         tracker.upsert_pool(pool_state("meteora_dlmm", &meteora_pool.to_string()));
         tracker.upsert_pool(pool_state("orca", &orca_pool.to_string()));
         ctx.trackers.write().insert(USDC_MINT.to_string(), tracker);
@@ -17282,6 +17297,7 @@ mod pool_accounts_coverage_tests {
 
         let mut tracker = TokenArbTracker::new(USDC_MINT);
         tracker.token_decimals = Some(6);
+        tracker.token_program = Some(spl_token::ID.to_string());
         tracker.upsert_pool(pool_state("orca", &orca_pool.to_string()));
         tracker.upsert_pool(pool_state("meteora_dlmm", &meteora_pool.to_string()));
         ctx.trackers.write().insert(USDC_MINT.to_string(), tracker);
@@ -17316,6 +17332,48 @@ mod pool_accounts_coverage_tests {
     }
 
     #[test]
+    fn arb_rejects_when_token_program_unknown_for_non_wsol_base() {
+        let meteora_pool = Pubkey::new_unique();
+        let orca_pool = Pubkey::new_unique();
+        let cache = usdc_meteora_orca_cache(meteora_pool, orca_pool);
+        let ctx = test_arb_context(cache);
+
+        let mut tracker = TokenArbTracker::new(USDC_MINT);
+        tracker.token_decimals = Some(6);
+        tracker.upsert_pool(pool_state("meteora_dlmm", &meteora_pool.to_string()));
+        tracker.upsert_pool(pool_state("orca", &orca_pool.to_string()));
+        ctx.trackers.write().insert(USDC_MINT.to_string(), tracker);
+
+        let opp = ArbOpportunity {
+            base_mint: USDC_MINT.to_string(),
+            buy_dex: "meteora_dlmm".to_string(),
+            buy_pool: meteora_pool.to_string(),
+            buy_price: Decimal::ONE,
+            sell_dex: "orca".to_string(),
+            sell_pool: orca_pool.to_string(),
+            sell_price: Decimal::ONE,
+            spread_bps: 72,
+            trade_amount_lamports: 10_000_000,
+            estimated_profit_lamports: 673_000,
+            buy_token_out: None,
+        };
+
+        let before = ARB_REJECTED_TOKEN_PROGRAM_UNKNOWN.load(Ordering::Relaxed);
+        assert!(create_arb_intent(&ctx, &opp).is_none());
+        assert_eq!(
+            ARB_REJECTED_TOKEN_PROGRAM_UNKNOWN.load(Ordering::Relaxed),
+            before + 1
+        );
+
+        ctx.trackers
+            .write()
+            .get_mut(USDC_MINT)
+            .expect("tracker")
+            .token_program = Some(spl_token::ID.to_string());
+        assert!(create_arb_intent(&ctx, &opp).is_some());
+    }
+
+    #[test]
     fn arb_skips_publish_when_profit_below_bundle_minimum() {
         let meteora_pool = Pubkey::new_unique();
         let orca_pool = Pubkey::new_unique();
@@ -17339,6 +17397,7 @@ mod pool_accounts_coverage_tests {
 
         let mut tracker = TokenArbTracker::new(USDC_MINT);
         tracker.token_decimals = Some(6);
+        tracker.token_program = Some(spl_token::ID.to_string());
         tracker.upsert_pool(pool_state("meteora_dlmm", &meteora_pool.to_string()));
         tracker.upsert_pool(pool_state("orca", &orca_pool.to_string()));
         ctx.trackers.write().insert(USDC_MINT.to_string(), tracker);

@@ -158,6 +158,8 @@ pub enum MdSidefxCommand {
     VaultBalanceTick {
         run_id: String,
         vault_pubkey: Pubkey,
+        mint: Pubkey,
+        token_program: Pubkey,
         balance: u64,
         slot: u64,
         grpc_recv_at: Instant,
@@ -1034,6 +1036,8 @@ mod tests {
         MdSidefxCommand::VaultBalanceTick {
             run_id: "r".into(),
             vault_pubkey: Pubkey::new_unique(),
+            mint: Pubkey::default(),
+            token_program: Pubkey::default(),
             balance: 1,
             slot: 1,
             grpc_recv_at: Instant::now(),

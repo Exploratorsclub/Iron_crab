@@ -77,62 +77,40 @@ fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> In
 /// SOL mint address
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
-/// Determine the token program for a given mint.
-/// Priority order:
-/// 1. Intent-provided token_program (from TradeResources) - highest trust
-/// 2. LivePoolCache (from Geyser TokenMintInfo) - cached from Geyser
-/// 3. DEX hint (pump.fun always uses SPL Token) - static knowledge
-/// 4. Default to SPL Token (most common case)
+fn is_observed_token_program(prog: &Pubkey) -> bool {
+    let token_2022_id = Pubkey::from_str(TOKEN_2022_PROGRAM_ID).unwrap_or_default();
+    prog.to_bytes() == spl_token::id().to_bytes() || *prog == token_2022_id
+}
+
+fn to_spl_prog_pubkey(prog: Pubkey) -> spl_token::solana_program::pubkey::Pubkey {
+    spl_token::solana_program::pubkey::Pubkey::new_from_array(prog.to_bytes())
+}
+
+/// Observed token program only (Geyser LivePoolCache or intent); no DEX hints or defaults.
 fn get_token_program_for_mint_cached(
     cache: Option<&crate::execution::live_pool_cache::LivePoolCache>,
     mint: &Pubkey,
-    dex_hint: Option<&str>,
     intent_token_program: Option<&str>,
-) -> spl_token::solana_program::pubkey::Pubkey {
-    let token_2022_id = Pubkey::from_str(TOKEN_2022_PROGRAM_ID).unwrap_or_default();
-
-    // Priority 1: Use intent-provided token_program (GEYSER-FIRST: arb-strategy already has this info)
-    if let Some(prog_str) = intent_token_program {
-        if let Ok(prog) = Pubkey::from_str(prog_str) {
-            if prog == token_2022_id {
-                info!(
-                    mint = %mint,
-                    token_program = %prog_str,
-                    "Using Token-2022 program from Intent"
-                );
-                return spl_token::solana_program::pubkey::Pubkey::new_from_array(
-                    token_2022_id.to_bytes(),
-                );
-            } else {
-                debug!(mint = %mint, "Using SPL Token program from Intent");
-                return spl_token::id();
-            }
-        }
-    }
-
-    // Priority 2: Try cache (Geyser-populated)
+) -> Option<spl_token::solana_program::pubkey::Pubkey> {
     if let Some(c) = cache {
         if let Some(prog) = c.get_mint_program(mint) {
-            if prog == token_2022_id {
-                debug!(mint = %mint, "Mint uses Token-2022 program (from cache)");
-                return spl_token::solana_program::pubkey::Pubkey::new_from_array(
-                    token_2022_id.to_bytes(),
-                );
-            } else {
-                return spl_token::id();
+            if is_observed_token_program(&prog) {
+                debug!(mint = %mint, token_program = %prog, "Token program from Geyser cache");
+                return Some(to_spl_prog_pubkey(prog));
             }
         }
     }
 
-    if let Some(dex) = dex_hint {
-        if dex == "pump_amm" {
-            return spl_token::id();
+    if let Some(prog_str) = intent_token_program {
+        if let Ok(prog) = Pubkey::from_str(prog_str) {
+            if is_observed_token_program(&prog) {
+                debug!(mint = %mint, token_program = %prog_str, "Token program from intent");
+                return Some(to_spl_prog_pubkey(prog));
+            }
         }
     }
 
-    // Priority 4: Default to SPL Token (most common case)
-    debug!(mint = %mint, "Token program not in cache and not in Intent, defaulting to SPL Token");
-    spl_token::id()
+    None
 }
 
 /// Token program for `mint` on an Orca whirlpool from LivePoolCache (no RPC).
@@ -149,12 +127,11 @@ fn orca_token_program_for_mint_from_cache(
     };
     let to_prog =
         |p: Pubkey| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes());
-    let default_spl = spl_token::id();
     if orca.token_mint_a == *mint {
-        return Some(orca.token_a_program.map(to_prog).unwrap_or(default_spl));
+        return orca.token_a_program.map(to_prog);
     }
     if orca.token_mint_b == *mint {
-        return Some(orca.token_b_program.map(to_prog).unwrap_or(default_spl));
+        return orca.token_b_program.map(to_prog);
     }
     None
 }
@@ -1521,15 +1498,23 @@ impl CrossDexHandler {
             orca_pool_for_mint_program,
             &token_mint_pk,
         )
-        .unwrap_or_else(|| {
+        .or_else(|| {
             get_token_program_for_mint_cached(
                 self.pool_cache.as_deref(),
                 &token_mint_pk,
-                Some(&buy_dex),
                 intent.resources.token_program.as_deref(),
             )
         });
-        let token_program_sdk = Pubkey::new_from_array(token_program.to_bytes());
+        let sol_mint_pk =
+            Pubkey::from_str(SOL_MINT).map_err(|_| anyhow!("Invalid SOL mint constant"))?;
+        let token_program_sdk = if token_mint_pk == sol_mint_pk {
+            Pubkey::new_from_array(spl_token::id().to_bytes())
+        } else if let Some(prog) = token_program {
+            Pubkey::new_from_array(prog.to_bytes())
+        } else {
+            return Err(anyhow!("token_program_unknown"));
+        };
+        let token_program = to_spl_prog_pubkey(token_program_sdk);
 
         // ====================================================================
         // Create Token ATA (idempotent) - only when wallet ATA is not yet known
