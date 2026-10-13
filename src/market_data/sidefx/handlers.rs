@@ -69,8 +69,6 @@ fn md_sidefx_maybe_publish_vault_observed_token_program(
     if host.live_pool_cache().get_mint_program(&mint) == Some(token_program) {
         return;
     }
-    host.live_pool_cache()
-        .update_mint_program(&mint, token_program);
     let mint_event = MarketEvent::new(
         "market-data",
         host.build_version(),
@@ -89,7 +87,7 @@ fn md_sidefx_maybe_publish_vault_observed_token_program(
     );
     host.write_market_event_jsonl(&mint_event);
     if host.nats_enabled() {
-        host.enqueue_core_market_event(
+        let enqueued = host.enqueue_core_market_event(
             mint_event,
             Some(MarketEventCorePublishTrace {
                 recv_at: grpc_recv_at,
@@ -97,6 +95,13 @@ fn md_sidefx_maybe_publish_vault_observed_token_program(
                 segment: MarketDataLatencySegment::Other,
             }),
         );
+        if enqueued {
+            host.live_pool_cache()
+                .update_mint_program(&mint, token_program);
+        }
+    } else {
+        host.live_pool_cache()
+            .update_mint_program(&mint, token_program);
     }
 }
 
