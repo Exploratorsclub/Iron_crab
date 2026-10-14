@@ -172,7 +172,7 @@ fn test_build_swap_ix_with_cached_accounts() {
         100_000,
         user,
         &pool_accounts,
-        None,
+        Some(Pubkey::new_from_array(spl_token::id().to_bytes())),
         false,
         None,
     );
