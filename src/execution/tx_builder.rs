@@ -2500,6 +2500,7 @@ mod tests {
         intent.resources.output_mint = NATIVE_SOL_MINT.to_string();
         intent.resources.pools = vec![pool_market.to_string()];
         intent.resources.accounts = stale_intent_accounts;
+        intent.resources.token_program = Some(spl_token::id().to_string());
         intent.execution = Some(TradeExecutionConstraints {
             min_out: Some(ExplicitAmount::new(1, 9)),
         });
@@ -2515,7 +2516,13 @@ mod tests {
             panic!("expected Planned outcome, got {outcome:?}");
         };
         assert!(!plan.instructions.is_empty());
-        let sell_ix = &plan.instructions[plan.instructions.len() - 1];
+        let pump_prog =
+            Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").expect("pump program");
+        let sell_ix = plan
+            .instructions
+            .iter()
+            .find(|ix| ix.program_id == pump_prog)
+            .expect("pump_amm sell swap ix");
         assert!(
             sell_ix.accounts.len() > 21,
             "expected extended SELL metas, got len={}",
@@ -2632,6 +2639,7 @@ mod tests {
         intent.resources.output_mint = NATIVE_SOL_MINT.to_string();
         intent.resources.pools = vec![pool_target.to_string()];
         intent.resources.accounts = stale_intent_accounts;
+        intent.resources.token_program = Some(spl_token::id().to_string());
         intent.execution = Some(TradeExecutionConstraints {
             min_out: Some(ExplicitAmount::new(1, 9)),
         });
@@ -2646,7 +2654,13 @@ mod tests {
         let super::TxPlanOutcome::Planned(plan) = outcome else {
             panic!("expected Planned outcome, got {outcome:?}");
         };
-        let sell_ix = &plan.instructions[plan.instructions.len() - 1];
+        let pump_prog =
+            Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").expect("pump program");
+        let sell_ix = plan
+            .instructions
+            .iter()
+            .find(|ix| ix.program_id == pump_prog)
+            .expect("pump_amm sell swap ix");
         assert_eq!(sell_ix.accounts.last().unwrap().pubkey, third_target);
         assert_ne!(sell_ix.accounts.last().unwrap().pubkey, third_other);
     }

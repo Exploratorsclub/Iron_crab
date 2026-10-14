@@ -1979,6 +1979,63 @@ pub struct PumpFunAmmDex {
     bounded_tx_fallback_rpc: Option<Arc<SolanaRpc>>,
 }
 
+/// When extended SELL/BUY trailing metas use intent-user-derived volume quote ATA (not validated cache tails).
+pub(crate) struct PumpAmmVolumeQuoteAtaCreate {
+    pub wallet_payer: Pubkey,
+    pub volume_owner: Pubkey,
+    pub quote_mint: Pubkey,
+    pub quote_token_program: Pubkey,
+}
+
+fn pump_amm_sdk_pubkey_to_spl_prog(pk: &Pubkey) -> SplProgramPubkey {
+    SplProgramPubkey::new_from_array(pk.to_bytes())
+}
+
+fn pump_amm_prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> Instruction {
+    Instruction {
+        program_id: Pubkey::new_from_array(ix.program_id.to_bytes()),
+        accounts: ix
+            .accounts
+            .into_iter()
+            .map(|m| AccountMeta {
+                pubkey: Pubkey::new_from_array(m.pubkey.to_bytes()),
+                is_signer: m.is_signer,
+                is_writable: m.is_writable,
+            })
+            .collect(),
+        data: ix.data,
+    }
+}
+
+fn pump_amm_ix_create_idempotent_volume_quote_ata(
+    create: &PumpAmmVolumeQuoteAtaCreate,
+) -> Instruction {
+    pump_amm_prog_ix_to_sdk(
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            &pump_amm_sdk_pubkey_to_spl_prog(&create.wallet_payer),
+            &pump_amm_sdk_pubkey_to_spl_prog(&create.volume_owner),
+            &pump_amm_sdk_pubkey_to_spl_prog(&create.quote_mint),
+            &pump_amm_sdk_pubkey_to_spl_prog(&create.quote_token_program),
+        ),
+    )
+}
+
+fn pump_amm_prepend_volume_quote_ata_create_if_needed(
+    create: Option<PumpAmmVolumeQuoteAtaCreate>,
+    swap_ix: Instruction,
+) -> Vec<Instruction> {
+    let mut ixs = Vec::new();
+    if let Some(c) = create {
+        ixs.push(pump_amm_ix_create_idempotent_volume_quote_ata(&c));
+    }
+    ixs.push(swap_ix);
+    ixs
+}
+
+fn resolve_pump_amm_base_token_program(base_token_program: Option<Pubkey>) -> Result<Pubkey> {
+    base_token_program.ok_or_else(|| anyhow!("token_program_unknown"))
+}
+
 impl PumpFunAmmDex {
     pub fn new(rpc: Arc<SolanaRpc>) -> Self {
         Self {
@@ -3672,7 +3729,7 @@ impl PumpFunAmmDex {
         cached_observed_volume_tail_0: Option<Pubkey>,
         cached_observed_volume_tail_1: Option<Pubkey>,
         cold_path_prefer_derived_on_mismatch: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<PumpAmmVolumeQuoteAtaCreate>> {
         let (derived_vol_wsol_ata, derived_vol) =
             Self::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_token_program);
         let observed_t0 = cached_observed_volume_tail_0.filter(|p| *p != Pubkey::default());
@@ -3685,7 +3742,7 @@ impl PumpFunAmmDex {
                     pump_amm_push_sell_trailing_account_meta(metas, t0, tier24.pool_v2_writable);
                     pump_amm_push_sell_trailing_account_meta(metas, t1, tier24.tail_1_writable);
                     pump_amm_push_sell_trailing_account_meta(metas, third, tier24.third_writable);
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
@@ -3746,7 +3803,7 @@ impl PumpFunAmmDex {
             } else {
                 (derived_vol_wsol_ata, derived_vol, "derived_for_intent_user")
             };
-        let _ = sell_extended_tail_source;
+        let needs_volume_quote_ata_create = sell_extended_tail_source != "validated_cache";
         if sell_requires_pre_fee_metas {
             metas.push(AccountMeta::new(user_vol_wsol_ata, false));
             metas.push(AccountMeta::new(user_vol, false));
@@ -3785,7 +3842,16 @@ impl PumpFunAmmDex {
                 }
             }
         }
-        Ok(())
+        Ok(if needs_volume_quote_ata_create {
+            Some(PumpAmmVolumeQuoteAtaCreate {
+                wallet_payer: user,
+                volume_owner: user_vol,
+                quote_mint,
+                quote_token_program,
+            })
+        } else {
+            None
+        })
     }
 
     async fn rpc_get_account_owner_and_executable(
@@ -7099,11 +7165,11 @@ impl Dex for PumpFunAmmDex {
             .get(&(pool.pool_market, user))
             .map(|v| v.clone());
         // Get token program from cache for correct ATA derivation (Token-2022 support)
-        let base_token_program = self
-            .cached_data
-            .get(&format!("token_program:{}", pool.base_mint))
-            .and_then(|v| Pubkey::from_str(&v).ok())
-            .unwrap_or_else(|| Pubkey::new_from_array(spl_token::id().to_bytes()));
+        let base_token_program = resolve_pump_amm_base_token_program(
+            self.cached_data
+                .get(&format!("token_program:{}", pool.base_mint))
+                .and_then(|v| Pubkey::from_str(&v).ok()),
+        )?;
         let quote_token_program = Pubkey::new_from_array(spl_token::id().to_bytes()); // WSOL always uses SPL Token
 
         let user_base_ta = user_acc
@@ -7250,6 +7316,7 @@ impl Dex for PumpFunAmmDex {
                 sell_fee_config,
                 sell_fee_program,
             )?;
+            let mut volume_quote_ata_create: Option<PumpAmmVolumeQuoteAtaCreate> = None;
             if sell_requires_cashback_remaining {
                 let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
                 else {
@@ -7257,7 +7324,7 @@ impl Dex for PumpFunAmmDex {
                         "pump_amm SELL: extended layout required but sell_cashback_third_meta missing (authoritative observation required)"
                     ));
                 };
-                Self::push_pump_amm_sell_extended_trailing_metas(
+                volume_quote_ata_create = Self::push_pump_amm_sell_extended_trailing_metas(
                     &mut metas,
                     pool.pool_market,
                     pool.base_mint,
@@ -7274,6 +7341,15 @@ impl Dex for PumpFunAmmDex {
                     false,
                 )?;
             }
+            let swap_ix = Instruction {
+                program_id,
+                accounts: metas,
+                data,
+            };
+            return Ok(pump_amm_prepend_volume_quote_ata_create_if_needed(
+                volume_quote_ata_create,
+                swap_ix,
+            ));
         }
 
         Ok(vec![Instruction {
@@ -7317,7 +7393,7 @@ impl PumpFunAmmDex {
     ///
     /// `base_token_program` - Optional token program override for the base token.
     /// Use `Some(TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb)` for Token-2022 tokens.
-    /// Defaults to SPL Token if None.
+    /// Returns `token_program_unknown` if None (no SPL default for non-observed base mint).
     ///
     /// Stable public API (Eval / external callers): extended SELL without observed ix tail #21/#22
     /// uses the legacy derived first-two metas + `sell_cashback_third_meta`. For the Scope 61
@@ -7462,11 +7538,11 @@ impl PumpFunAmmDex {
             ));
         }
 
-        // Resolve token programs: use override for base token (Token-2022 support),
-        // WSOL always uses SPL Token.
-        let base_tp = base_token_program
-            .unwrap_or_else(|| Pubkey::new_from_array(spl_token::id().to_bytes()));
+        // Resolve token programs: base mint requires observed override (Token-2022); quote is WSOL → SPL Token.
+        let base_tp = resolve_pump_amm_base_token_program(base_token_program)?;
         let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes()); // WSOL always SPL Token
+
+        let mut volume_quote_ata_create: Option<PumpAmmVolumeQuoteAtaCreate> = None;
 
         let parsed_pfr = pool_accounts.get(6).copied().unwrap_or_default();
         let parsed_pfr_ta = pool_accounts.get(7).copied().unwrap_or_default();
@@ -7550,7 +7626,7 @@ impl PumpFunAmmDex {
                 metas.push(AccountMeta::new_readonly(buy_pre_fee_1, false)); // 20 pre_fee_1
                 metas.push(AccountMeta::new_readonly(buy_fee_config, false)); // 21
                 metas.push(AccountMeta::new_readonly(buy_fee_program, false)); // 22
-                Self::push_pump_amm_sell_extended_trailing_metas(
+                volume_quote_ata_create = Self::push_pump_amm_sell_extended_trailing_metas(
                     &mut metas,
                     pool_market,
                     base_mint,
@@ -7580,7 +7656,7 @@ impl PumpFunAmmDex {
                 metas.push(AccountMeta::new(coin_creator_vault_ata, false)); // 18
                 metas.push(AccountMeta::new_readonly(buy_fee_config, false)); // 19
                 metas.push(AccountMeta::new_readonly(buy_fee_program, false)); // 20
-                Self::push_pump_amm_sell_extended_trailing_metas(
+                volume_quote_ata_create = Self::push_pump_amm_sell_extended_trailing_metas(
                     &mut metas,
                     pool_market,
                     base_mint,
@@ -7659,7 +7735,7 @@ impl PumpFunAmmDex {
                         "pump_amm SELL: extended layout required but sell_cashback_third_meta missing (MASTER/Geyser observation required)"
                     ));
                 };
-                Self::push_pump_amm_sell_extended_trailing_metas(
+                volume_quote_ata_create = Self::push_pump_amm_sell_extended_trailing_metas(
                     &mut metas,
                     pool_market,
                     base_mint,
@@ -7679,11 +7755,15 @@ impl PumpFunAmmDex {
             metas
         };
 
-        Ok(vec![Instruction {
+        let swap_ix = Instruction {
             program_id,
             accounts: metas,
             data,
-        }])
+        };
+        Ok(pump_amm_prepend_volume_quote_ata_create_if_needed(
+            volume_quote_ata_create,
+            swap_ix,
+        ))
     }
 
     /// Prime discovery caches for a base mint (static pool) and a user (user-specific accounts).
@@ -7714,6 +7794,17 @@ mod tests {
     use serde_json::json;
     use std::str::FromStr;
     use std::sync::Arc;
+
+    fn test_spl_token_program() -> Pubkey {
+        Pubkey::new_from_array(spl_token::id().to_bytes())
+    }
+
+    fn pump_amm_swap_ix_from_build(ixs: &[Instruction]) -> &Instruction {
+        let pump_prog = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).unwrap();
+        ixs.iter()
+            .find(|ix| ix.program_id == pump_prog)
+            .expect("pump_amm swap instruction in build result")
+    }
 
     /// `global_config` prefix from mainnet (643 bytes); only bytes [0..96) needed for offset-57 check.
     /// Cross-check: finalized swap `3QBRgEPpPcXLEPSD8NXQFALrUwrMkdhSWHg3SpC4HR13uQS78gUeYK36bcKcbjhQqnTA83xL1KiRXvzJJRM4hCPD`
@@ -8446,7 +8537,7 @@ mod tests {
             100_000,
             user,
             &pool_accounts,
-            None,
+            Some(test_spl_token_program()),
             false,
             None,
         );
@@ -8455,10 +8546,10 @@ mod tests {
         let ixs = result.unwrap();
         assert!(!ixs.is_empty());
         assert_eq!(
-            ixs[0].program_id,
+            pump_amm_swap_ix_from_build(&ixs).program_id,
             Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).unwrap()
         );
-        assert!(!ixs[0].data.is_empty());
+        assert!(!pump_amm_swap_ix_from_build(&ixs).data.is_empty());
     }
 
     /// SELL path: instruction account #2 must be the canonical global_config (not pool_accounts[1]).
@@ -8527,14 +8618,17 @@ mod tests {
             1,
             user,
             &pool_accounts,
-            None,
+            Some(test_spl_token_program()),
             false,
             None,
         )
         .expect("SELL build");
 
-        assert_eq!(ixs[0].accounts.len(), 21);
-        assert_eq!(ixs[0].accounts[2].pubkey, canonical_gc);
+        assert_eq!(pump_amm_swap_ix_from_build(&ixs).accounts.len(), 21);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[2].pubkey,
+            canonical_gc
+        );
     }
 
     /// SELL path: instruction account #15 must be the canonical `__event_authority` PDA (not pool_accounts[8]).
@@ -8572,14 +8666,17 @@ mod tests {
             1,
             user,
             &pool_accounts,
-            None,
+            Some(test_spl_token_program()),
             false,
             None,
         )
         .expect("SELL build");
 
-        assert_eq!(ixs[0].accounts.len(), 21);
-        assert_eq!(ixs[0].accounts[15].pubkey, canonical_ea);
+        assert_eq!(pump_amm_swap_ix_from_build(&ixs).accounts.len(), 21);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[15].pubkey,
+            canonical_ea
+        );
     }
 
     /// Known-pool parse: singleton `global_volume_accumulator` PDA must match mainnet fixture (see `tests/pump_amm_market_parse_offsets.rs`).
@@ -8939,7 +9036,7 @@ mod tests {
             1,
             user,
             &pool_accounts,
-            None,
+            Some(test_spl_token_program()),
             true,
             Some(third_meta),
             false,
@@ -8953,26 +9050,44 @@ mod tests {
         )
         .expect("extended SELL");
 
-        assert_eq!(ixs[0].accounts.len(), 24);
-        assert_eq!(ixs[0].accounts[9].pubkey, auth_pfr);
-        assert_eq!(ixs[0].accounts[10].pubkey, auth_pfr_ta);
+        assert_eq!(pump_amm_swap_ix_from_build(&ixs).accounts.len(), 24);
         assert_eq!(
-            ixs[0].accounts[19].pubkey,
+            pump_amm_swap_ix_from_build(&ixs).accounts[9].pubkey,
+            auth_pfr
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[10].pubkey,
+            auth_pfr_ta
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[19].pubkey,
             Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap()
         );
-        assert_eq!(ixs[0].accounts[20].pubkey, fee_program);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[20].pubkey,
+            fee_program
+        );
         let quote_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
         let (derived_21, derived_22) =
             PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(user, wsol, quote_tp);
-        assert_eq!(ixs[0].accounts[21].pubkey, derived_21);
-        assert_eq!(ixs[0].accounts[22].pubkey, derived_22);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[21].pubkey,
+            derived_21
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[22].pubkey,
+            derived_22
+        );
         assert_ne!(derived_21, ref_tail_0);
         assert_ne!(derived_22, ref_tail_1);
-        assert_eq!(ixs[0].accounts[23].pubkey, third_meta);
-        assert!(ixs[0].accounts[21].is_writable);
-        assert!(ixs[0].accounts[22].is_writable);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[23].pubkey,
+            third_meta
+        );
+        assert!(pump_amm_swap_ix_from_build(&ixs).accounts[21].is_writable);
+        assert!(pump_amm_swap_ix_from_build(&ixs).accounts[22].is_writable);
         assert!(
-            !ixs[0].accounts[23].is_writable,
+            !pump_amm_swap_ix_from_build(&ixs).accounts[23].is_writable,
             "derived-user extended SELL: #23 third_meta must be readonly"
         );
     }
@@ -9114,15 +9229,21 @@ mod tests {
             1,
             user,
             &pool_accounts,
-            None,
+            Some(test_spl_token_program()),
             false,
             None,
         )
         .expect("SELL build");
 
-        assert_eq!(ixs[0].accounts.len(), 21);
-        assert_eq!(ixs[0].accounts[9].pubkey, observed_pfr);
-        assert_eq!(ixs[0].accounts[10].pubkey, observed_pfr_ta);
+        assert_eq!(pump_amm_swap_ix_from_build(&ixs).accounts.len(), 21);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[9].pubkey,
+            observed_pfr
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[10].pubkey,
+            observed_pfr_ta
+        );
     }
 
     /// Extended SELL (24 accounts): meta #19 must be global `PUMPFUN_AMM_FEE_CONFIG` even when v14[12]
@@ -9169,20 +9290,26 @@ mod tests {
             1,
             user,
             &pool_accounts,
-            None,
+            Some(test_spl_token_program()),
             true,
             Some(third_meta),
         )
         .expect("extended SELL build");
 
-        assert_eq!(ixs[0].accounts.len(), 24);
+        assert_eq!(pump_amm_swap_ix_from_build(&ixs).accounts.len(), 24);
         assert_eq!(
-            ixs[0].accounts[19].pubkey,
+            pump_amm_swap_ix_from_build(&ixs).accounts[19].pubkey,
             Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
             "SELL ix meta #19 must use global FeeConfig constant, not v14[12]"
         );
-        assert_eq!(ixs[0].accounts[20].pubkey, fee_program);
-        assert_eq!(ixs[0].accounts[23].pubkey, third_meta);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[20].pubkey,
+            fee_program
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[23].pubkey,
+            third_meta
+        );
     }
 
     /// Regression guard (Scope 58): using `pool_accounts[12]` as SELL `fee_config` meta caused
@@ -9225,7 +9352,7 @@ mod tests {
             1,
             our_user,
             &pool_accounts,
-            None,
+            Some(test_spl_token_program()),
             true,
             Some(third_meta),
             false,
@@ -9240,12 +9367,18 @@ mod tests {
         .expect("extended SELL");
         let (expected_21, expected_22) =
             PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(our_user, wsol, quote_tp);
-        assert_eq!(ixs[0].accounts[21].pubkey, expected_21);
-        assert_eq!(ixs[0].accounts[22].pubkey, expected_22);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[21].pubkey,
+            expected_21
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[22].pubkey,
+            expected_22
+        );
         assert_ne!(expected_21, foreign_tail_0);
         assert_ne!(expected_22, foreign_tail_1);
         assert!(
-            !ixs[0].accounts[23].is_writable,
+            !pump_amm_swap_ix_from_build(&ixs).accounts[23].is_writable,
             "derived-user extended SELL: #23 third_meta must be readonly"
         );
     }
@@ -9290,7 +9423,10 @@ mod tests {
         )
         .expect("SELL build Token-2022");
 
-        assert_eq!(ixs[0].accounts[11].pubkey, token_2022);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[11].pubkey,
+            token_2022
+        );
         let owner_spl = SplProgramPubkey::new_from_array(user.to_bytes());
         let mint_spl = SplProgramPubkey::new_from_array(base_mint.to_bytes());
         let token_program_spl = SplProgramPubkey::new_from_array(token_2022.to_bytes());
@@ -9301,7 +9437,10 @@ mod tests {
                 &token_program_spl,
             );
         let expected_user_base = Pubkey::new_from_array(expected_user_base.to_bytes());
-        assert_eq!(ixs[0].accounts[5].pubkey, expected_user_base);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[5].pubkey,
+            expected_user_base
+        );
     }
 
     /// Cached/sync `build_swap_ix`: ix #9/#10 follow `PumpAmmPoolStatic.protocol_fee_*` from cache.
@@ -9345,14 +9484,22 @@ mod tests {
             last_parse_diagnostics: None,
         };
         dex.pools_by_base.insert(base_mint, pool);
+        dex.cached_data
+            .insert(format!("token_program:{}", base_mint), quote_tp.to_string());
 
         let ixs = dex
             .build_swap_ix(&base_mint.to_string(), WSOL_MINT, 1_000_000, 1)
             .expect("SELL build_swap_ix");
 
-        assert_eq!(ixs[0].accounts.len(), 21);
-        assert_eq!(ixs[0].accounts[9].pubkey, cached_pfr);
-        assert_eq!(ixs[0].accounts[10].pubkey, cached_pfr_ta);
+        assert_eq!(pump_amm_swap_ix_from_build(&ixs).accounts.len(), 21);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[9].pubkey,
+            cached_pfr
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[10].pubkey,
+            cached_pfr_ta
+        );
     }
 
     /// Both fee pubkeys default → error (no global recipient substitution).
@@ -9389,7 +9536,7 @@ mod tests {
             1,
             user,
             &pool_accounts,
-            None,
+            Some(test_spl_token_program()),
             false,
             None,
         )
@@ -9411,14 +9558,17 @@ mod tests {
             1,
             user,
             &pool_accounts,
-            None,
+            Some(test_spl_token_program()),
             false,
             None,
         )
         .expect("SELL build partial fee");
-        assert_eq!(ixs[0].accounts[9].pubkey, observed);
         assert_eq!(
-            ixs[0].accounts[10].pubkey,
+            pump_amm_swap_ix_from_build(&ixs).accounts[9].pubkey,
+            observed
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[10].pubkey,
             PumpFunAmmDex::derive_ata_with_program(observed, wsol, quote_tp)
         );
     }
@@ -9663,7 +9813,7 @@ mod tests {
             1,
             user,
             &v14,
-            None,
+            Some(test_spl_token_program()),
             true,
             Some(tail2),
             false,
@@ -9677,12 +9827,14 @@ mod tests {
         )
         .expect("26-account SELL");
         assert_eq!(
-            ixs[0].accounts.len(),
+            pump_amm_swap_ix_from_build(&ixs).accounts.len(),
             PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
         );
-        let (fee_cfg_ix, _) = pump_amm_sell_ix_uses_global_fee_at(ixs[0].accounts.len()).unwrap();
+        let (fee_cfg_ix, _) =
+            pump_amm_sell_ix_uses_global_fee_at(pump_amm_swap_ix_from_build(&ixs).accounts.len())
+                .unwrap();
         assert_eq!(
-            ixs[0].accounts[fee_cfg_ix].pubkey,
+            pump_amm_swap_ix_from_build(&ixs).accounts[fee_cfg_ix].pubkey,
             Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap()
         );
     }
@@ -9766,7 +9918,7 @@ mod tests {
             1,
             user,
             &v14,
-            None,
+            Some(test_spl_token_program()),
             true,
             Some(third),
             true,
@@ -9781,14 +9933,22 @@ mod tests {
         .expect("27-account BUY build");
 
         assert_eq!(
-            ixs[0].accounts.len(),
+            pump_amm_swap_ix_from_build(&ixs).accounts.len(),
             PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
         );
-        let program_ix = pump_amm_buy_program_ix_index(ixs[0].accounts.len()).expect("program ix");
-        assert_eq!(ixs[0].accounts[program_ix].pubkey, program_id);
-        assert_ne!(ixs[0].accounts[program_ix].pubkey, singleton_gva);
+        let program_ix =
+            pump_amm_buy_program_ix_index(pump_amm_swap_ix_from_build(&ixs).accounts.len())
+                .expect("program ix");
         assert_eq!(
-            ixs[0].accounts[PUMPFUN_AMM_SELL_PRE_FEE_0_IX_V2].pubkey,
+            pump_amm_swap_ix_from_build(&ixs).accounts[program_ix].pubkey,
+            program_id
+        );
+        assert_ne!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[program_ix].pubkey,
+            singleton_gva
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[PUMPFUN_AMM_SELL_PRE_FEE_0_IX_V2].pubkey,
             singleton_gva
         );
     }
@@ -9830,7 +9990,7 @@ mod tests {
             1,
             user,
             &v14,
-            None,
+            Some(test_spl_token_program()),
             true,
             Some(third),
             false,
@@ -9845,18 +10005,99 @@ mod tests {
         .expect("26-account BUY cashback extended");
 
         assert_eq!(
-            ixs[0].accounts.len(),
+            pump_amm_swap_ix_from_build(&ixs).accounts.len(),
             PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
         );
-        let program_ix = pump_amm_buy_program_ix_index(ixs[0].accounts.len()).expect("program ix");
-        assert_eq!(ixs[0].accounts[program_ix].pubkey, program_id);
+        let program_ix =
+            pump_amm_buy_program_ix_index(pump_amm_swap_ix_from_build(&ixs).accounts.len())
+                .expect("program ix");
         assert_eq!(
-            ixs[0].accounts[PUMPFUN_AMM_BUY_EXT_FEE_CONFIG_IX].pubkey,
+            pump_amm_swap_ix_from_build(&ixs).accounts[program_ix].pubkey,
+            program_id
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[PUMPFUN_AMM_BUY_EXT_FEE_CONFIG_IX].pubkey,
             fee0
         );
         assert_eq!(
-            ixs[0].accounts[PUMPFUN_AMM_BUY_EXT_FEE_PROGRAM_IX].pubkey,
+            pump_amm_swap_ix_from_build(&ixs).accounts[PUMPFUN_AMM_BUY_EXT_FEE_PROGRAM_IX].pubkey,
             fee1
+        );
+    }
+
+    /// Task 3007: mismatched cached volume tails → derived quote ATA needs CreateIdempotent before swap (buy leg).
+    #[test]
+    fn pump_amm_buy_cashback_derived_volume_quote_ata_create_idempotent_before_swap() {
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let base_mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let third = Pubkey::new_unique();
+        let foreign_tail_0 = Pubkey::new_unique();
+        let foreign_tail_1 = Pubkey::new_unique();
+        let quote_tp = test_spl_token_program();
+        let (derived_vol_ata, derived_vol) =
+            PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(user, wsol, quote_tp);
+
+        let v14 = vec![
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            wsol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+        ];
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            WSOL_MINT,
+            &base_mint.to_string(),
+            1,
+            1,
+            user,
+            &v14,
+            Some(test_spl_token_program()),
+            true,
+            Some(third),
+            false,
+            None,
+            Some(foreign_tail_0),
+            Some(foreign_tail_1),
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("extended BUY with derived volume tails");
+
+        assert_eq!(ixs.len(), 2, "CreateIdempotent + swap");
+        let ata_prog = Pubkey::new_from_array(spl_associated_token_account::id().to_bytes());
+        assert_eq!(ixs[0].program_id, ata_prog);
+        assert!(
+            ixs[0].accounts.iter().any(|m| m.pubkey == derived_vol),
+            "create ix owner must be user volume PDA"
+        );
+        assert!(
+            ixs[0].accounts.iter().any(|m| m.pubkey == wsol),
+            "create ix mint must be quote (WSOL)"
+        );
+        assert!(
+            ixs[0].accounts.iter().any(|m| m.pubkey == quote_tp),
+            "create ix token program must be SPL Token for WSOL"
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[21].pubkey,
+            derived_vol_ata
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[22].pubkey,
+            derived_vol
         );
     }
 
@@ -9895,7 +10136,7 @@ mod tests {
             1,
             user,
             &v14,
-            None,
+            Some(test_spl_token_program()),
             true,
             Some(third),
             false,
@@ -9910,11 +10151,16 @@ mod tests {
         .expect("24-account BUY cashback extended");
 
         assert_eq!(
-            ixs[0].accounts.len(),
+            pump_amm_swap_ix_from_build(&ixs).accounts.len(),
             PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS
         );
-        let program_ix = pump_amm_buy_program_ix_index(ixs[0].accounts.len()).expect("program ix");
-        assert_eq!(ixs[0].accounts[program_ix].pubkey, program_id);
+        let program_ix =
+            pump_amm_buy_program_ix_index(pump_amm_swap_ix_from_build(&ixs).accounts.len())
+                .expect("program ix");
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[program_ix].pubkey,
+            program_id
+        );
     }
 
     /// Missing third_meta must surface layout-not-ready error, not partial-flag error.
@@ -9947,7 +10193,7 @@ mod tests {
             1,
             user,
             &v14,
-            None,
+            Some(test_spl_token_program()),
             true,
             None,
             false,
@@ -10130,7 +10376,7 @@ mod tests {
             1,
             user,
             &v14,
-            None,
+            Some(test_spl_token_program()),
             true,
             Some(third),
             true,
@@ -10144,15 +10390,15 @@ mod tests {
         )
         .expect("build");
         assert_eq!(
-            ixs[0].accounts.len(),
+            pump_amm_swap_ix_from_build(&ixs).accounts.len(),
             PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
         );
         assert_eq!(
-            ixs[0].accounts[PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2].pubkey,
+            pump_amm_swap_ix_from_build(&ixs).accounts[PUMPFUN_AMM_SELL_EXT_TAIL_0_IX_V2].pubkey,
             derived0
         );
         assert_eq!(
-            ixs[0].accounts[PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2].pubkey,
+            pump_amm_swap_ix_from_build(&ixs).accounts[PUMPFUN_AMM_SELL_EXT_TAIL_1_IX_V2].pubkey,
             derived1
         );
     }
@@ -10553,17 +10799,17 @@ mod tests {
         )
         .expect("build 26-account sell");
         assert_eq!(
-            ixs[0].accounts.len(),
+            pump_amm_swap_ix_from_build(&ixs).accounts.len(),
             PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
         );
-        let built_trailing_writable: Vec<bool> = ixs[0].accounts
+        let built_trailing_writable: Vec<bool> = pump_amm_swap_ix_from_build(&ixs).accounts
             [PUMPFUN_AMM_SELL_EXT_TAIL_0_IX..=PUMPFUN_AMM_SELL_FEE_TAIL_1_IX]
             .iter()
             .map(|m| m.is_writable)
             .collect();
         assert_eq!(built_trailing_writable, ref_trailing_writable);
         assert!(
-            ixs[0].accounts[PUMPFUN_AMM_SELL_FEE_TAIL_1_IX].is_writable,
+            pump_amm_swap_ix_from_build(&ixs).accounts[PUMPFUN_AMM_SELL_FEE_TAIL_1_IX].is_writable,
             "fee_tail_1 (#25) must be writable on tier-26 (PrivilegeEscalation if readonly)"
         );
     }
@@ -10633,22 +10879,28 @@ mod tests {
         .expect("post-upgrade pool-v2 SELL");
 
         assert_eq!(
-            ixs[0].accounts.len(),
+            pump_amm_swap_ix_from_build(&ixs).accounts.len(),
             PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS
         );
-        assert_eq!(ixs[0].accounts[21].pubkey, tail_0);
-        assert_eq!(ixs[0].accounts[22].pubkey, tail_1);
-        assert_eq!(ixs[0].accounts[23].pubkey, third);
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[21].pubkey,
+            tail_0
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[22].pubkey,
+            tail_1
+        );
+        assert_eq!(pump_amm_swap_ix_from_build(&ixs).accounts[23].pubkey, third);
         assert!(
-            !ixs[0].accounts[21].is_writable,
+            !pump_amm_swap_ix_from_build(&ixs).accounts[21].is_writable,
             "pool-v2 (#21) must be readonly"
         );
         assert!(
-            !ixs[0].accounts[22].is_writable,
+            !pump_amm_swap_ix_from_build(&ixs).accounts[22].is_writable,
             "post-upgrade fee meta #22 must be readonly"
         );
         assert!(
-            ixs[0].accounts[23].is_writable,
+            pump_amm_swap_ix_from_build(&ixs).accounts[23].is_writable,
             "post-upgrade fee meta #23 must be writable"
         );
     }

@@ -77,6 +77,25 @@ fn prog_ix_to_sdk(ix: spl_token::solana_program::instruction::Instruction) -> In
 /// SOL mint address
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
+/// Orca whirlpool token program for a mint: pool field, then LivePoolCache mint observation, then WSOL → SPL Token only.
+fn orca_resolve_token_program_for_mint(
+    cache: &LivePoolCache,
+    mint: &Pubkey,
+    on_pool_state: Option<Pubkey>,
+) -> Option<Pubkey> {
+    if let Some(p) = on_pool_state {
+        return Some(p);
+    }
+    if let Some(p) = cache.get_mint_program(mint) {
+        return Some(p);
+    }
+    let sol_mint = Pubkey::from_str(SOL_MINT).unwrap_or_default();
+    if *mint == sol_mint {
+        return Some(Pubkey::new_from_array(spl_token::id().to_bytes()));
+    }
+    None
+}
+
 fn is_observed_token_program(prog: &Pubkey) -> bool {
     let token_2022_id = Pubkey::from_str(TOKEN_2022_PROGRAM_ID).unwrap_or_default();
     prog.to_bytes() == spl_token::id().to_bytes() || *prog == token_2022_id
@@ -525,7 +544,7 @@ impl CrossDexHandler {
             )
         })?;
 
-        if let Some(ix) = ixs.first() {
+        if let Some(ix) = ixs.last() {
             let account_count = ix.accounts.len();
             let canonical_gc = pump_amm_canonical_global_config();
             if ix.accounts.len() <= 2 || ix.accounts[2].pubkey != canonical_gc {
@@ -697,11 +716,19 @@ impl CrossDexHandler {
                     format!("tick_current_index:{}", orca_state.tick_current_index),
                     format!("tick_spacing:{}", orca_state.tick_spacing),
                 ];
-                // CRITICAL: Pass cached token programs to avoid RPC in hot path!
-                if let Some(prog_a) = orca_state.token_a_program {
+                // CRITICAL: Pass observed token programs (pool row or mint cache); never default Tokenkeg for unknown mints.
+                if let Some(prog_a) = orca_resolve_token_program_for_mint(
+                    cache,
+                    &orca_state.token_mint_a,
+                    orca_state.token_a_program,
+                ) {
                     accounts.push(format!("token_a_program:{}", prog_a));
                 }
-                if let Some(prog_b) = orca_state.token_b_program {
+                if let Some(prog_b) = orca_resolve_token_program_for_mint(
+                    cache,
+                    &orca_state.token_mint_b,
+                    orca_state.token_b_program,
+                ) {
                     accounts.push(format!("token_b_program:{}", prog_b));
                 }
                 if connector
@@ -831,12 +858,20 @@ impl CrossDexHandler {
             orca_state.tick_current_index
         ));
         merged.push(format!("tick_spacing:{}", orca_state.tick_spacing));
-        if let Some(prog_a) = orca_state.token_a_program {
+        if let Some(prog_a) = orca_resolve_token_program_for_mint(
+            cache,
+            &orca_state.token_mint_a,
+            orca_state.token_a_program,
+        ) {
             if !merged.iter().any(|a| a.starts_with("token_a_program:")) {
                 merged.push(format!("token_a_program:{}", prog_a));
             }
         }
-        if let Some(prog_b) = orca_state.token_b_program {
+        if let Some(prog_b) = orca_resolve_token_program_for_mint(
+            cache,
+            &orca_state.token_mint_b,
+            orca_state.token_b_program,
+        ) {
             if !merged.iter().any(|a| a.starts_with("token_b_program:")) {
                 merged.push(format!("token_b_program:{}", prog_b));
             }
@@ -2292,7 +2327,7 @@ mod tests {
     #[tokio::test]
     async fn cross_dex_meteora_pump_bundle_fits_1232_with_ata_skip_and_alt() {
         let (plan, wallet, _) = build_prod_pattern_cross_dex_plan(true).await;
-        let sell_ix = plan.sell_instructions.first().expect("sell leg present");
+        let sell_ix = pump_amm_swap_ix_from_plan_instructions(&plan.sell_instructions);
         assert_eq!(
             sell_ix.accounts.len(),
             PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
@@ -2413,7 +2448,7 @@ mod tests {
             .await
             .expect("build_swap_plan with wrong pool_accounts[1] must succeed after normalization");
 
-        let sell_ix = plan.sell_instructions.first().expect("sell leg");
+        let sell_ix = pump_amm_swap_ix_from_plan_instructions(&plan.sell_instructions);
         assert_eq!(
             sell_ix.accounts.len(),
             PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
@@ -2424,7 +2459,7 @@ mod tests {
         let alt = prod_on_chain_alt_fixture();
         let (tx, _, _, _, plan_ixs) = compile_cross_dex_bundle_tx_prod_alt(&wallet, &plan);
         // Bundle: CU limit, CU price, Meteora buy, Pump sell, tip → sell at index 3.
-        assert_pump_global_config_prod_alt_compile(&tx, &plan_ixs, &alt, 3, wrong_gc, canonical_gc);
+        assert_pump_global_config_prod_alt_compile(&tx, &plan_ixs, &alt, 4, wrong_gc, canonical_gc);
     }
 
     /// Prod pattern: pump BUY leg (meteora sell) with wrong v14 `pool_accounts[1]`.
@@ -2546,13 +2581,13 @@ mod tests {
             .await
             .expect("pump buy cross-dex plan");
 
-        let buy_ix = plan.buy_instructions.first().expect("pump buy leg");
+        let buy_ix = pump_amm_swap_ix_from_plan_instructions(&plan.buy_instructions);
         assert_eq!(buy_ix.accounts[2].pubkey, canonical_gc);
 
         let alt = prod_on_chain_alt_fixture();
         let (tx, _, _, _, plan_ixs) = compile_cross_dex_bundle_tx_prod_alt(&wallet, &plan);
         // Bundle: CU limit, CU price, Pump buy, Meteora sell, tip → buy at index 2.
-        assert_pump_global_config_prod_alt_compile(&tx, &plan_ixs, &alt, 2, wrong_gc, canonical_gc);
+        assert_pump_global_config_prod_alt_compile(&tx, &plan_ixs, &alt, 3, wrong_gc, canonical_gc);
     }
 
     #[tokio::test]
@@ -2635,6 +2670,7 @@ mod tests {
             .with_pool_cache(cache);
         handler.init_dexes().await.expect("init_dexes");
 
+        let spl_tp = Pubkey::new_from_array(spl_token::id().to_bytes());
         let ixs = handler
             .build_pump_amm_arb_swap_ixs(
                 SOL_MINT,
@@ -2643,17 +2679,18 @@ mod tests {
                 1,
                 &buy_pool.to_string(),
                 None,
-                None,
+                Some(spl_tp),
                 true,
             )
             .expect("pump_amm BUY leg must build with extended cashback layout");
 
+        let buy_swap_ix = pump_amm_swap_ix_from_plan_instructions(&ixs);
         assert_eq!(
-            ixs[0].accounts.len(),
+            buy_swap_ix.accounts.len(),
             PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
             "cashback-only BUY must use 26-account extended layout"
         );
-        assert!(pump_amm_buy_program_ix_index(ixs[0].accounts.len()).is_some());
+        assert!(pump_amm_buy_program_ix_index(buy_swap_ix.accounts.len()).is_some());
     }
 
     #[tokio::test]
@@ -2714,7 +2751,7 @@ mod tests {
                 tick_spacing: 8,
                 vault_a_balance: Some(1_000_000_000_000),
                 vault_b_balance: Some(50_000_000_000),
-                token_a_program: None,
+                token_a_program: Some(Pubkey::new_from_array(spl_token::id().to_bytes())),
                 token_b_program: None,
                 whirlpool_quote_account_seeded: true,
             }),
@@ -3096,6 +3133,7 @@ mod tests {
     }
 
     fn orca_whirlpool_cache_state(token_mint: Pubkey, sol_mint: Pubkey) -> OrcaWhirlpoolState {
+        let spl_token_prog = Pubkey::new_from_array(spl_token::id().to_bytes());
         OrcaWhirlpoolState {
             token_mint_a: token_mint,
             token_mint_b: sol_mint,
@@ -3109,10 +3147,17 @@ mod tests {
             tick_spacing: 8,
             vault_a_balance: Some(1_000_000_000_000),
             vault_b_balance: Some(50_000_000_000),
-            token_a_program: None,
+            token_a_program: Some(spl_token_prog),
             token_b_program: None,
             whirlpool_quote_account_seeded: true,
         }
+    }
+
+    fn pump_amm_swap_ix_from_plan_instructions(ixs: &[Instruction]) -> &Instruction {
+        let pump_prog = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID_STR).unwrap();
+        ixs.iter()
+            .find(|ix| ix.program_id == pump_prog)
+            .expect("pump_amm swap instruction in plan leg")
     }
 
     fn orca_pool_accounts_without_tick(
@@ -3136,9 +3181,11 @@ mod tests {
         tick: i32,
         spacing: u16,
     ) -> Vec<String> {
+        let spl_token_prog = spl_token::id();
         let mut accounts = orca_pool_accounts_without_tick(pool, token_mint, sol_mint);
         accounts.push(format!("tick_current_index:{tick}"));
         accounts.push(format!("tick_spacing:{spacing}"));
+        accounts.push(format!("token_a_program:{}", spl_token_prog));
         accounts
     }
 

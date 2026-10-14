@@ -20,6 +20,23 @@ pub const WHIRLPOOL_ACCOUNT_MAX_SIZE: usize = 653; // exact size
 /// Key used by cross_dex_handler via [`Dex::cache_extra_data`] to pin the active whirlpool.
 pub const POOL_ADDRESS_HINT_KEY: &str = "pool_address_hint";
 
+const WSOL_MINT_STR: &str = "So11111111111111111111111111111111111111112";
+
+/// Resolve token program for a whirlpool mint: cached pool field, else WSOL → SPL Token, else error.
+pub(crate) fn orca_resolve_token_program_for_mint(
+    mint: &Pubkey,
+    cached_on_pool: Option<Pubkey>,
+) -> Result<Pubkey> {
+    if let Some(p) = cached_on_pool {
+        return Ok(p);
+    }
+    let wsol = Pubkey::from_str(WSOL_MINT_STR)?;
+    if *mint == wsol {
+        return Ok(Pubkey::new_from_array(spl_token::id().to_bytes()));
+    }
+    Err(anyhow!("token_program_unknown"))
+}
+
 use super::orca_whirlpool_layout as layout;
 use dashmap::DashMap;
 use solana_sdk::pubkey::Pubkey;
@@ -1305,35 +1322,23 @@ impl Dex for Orca {
         let a_to_b = forward;
 
         // CRITICAL: Use CACHED token programs from LivePoolCache - NO RPC IN HOT PATH!
-        // Token programs (SPL Token vs Token-2022) are immutable per mint - cache them once.
-        let spl_token_sdk = spl_token::id();
+        let token_a_program_sdk =
+            orca_resolve_token_program_for_mint(&pool.base_mint, pool.base_mint_program)?;
+        let token_b_program_sdk =
+            orca_resolve_token_program_for_mint(&pool.quote_mint, pool.quote_mint_program)?;
+        let token_a_program = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+            token_a_program_sdk.to_bytes(),
+        );
+        let token_b_program = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+            token_b_program_sdk.to_bytes(),
+        );
 
-        // Use cached token programs if available, otherwise default to SPL Token
-        // (Token-2022 is rare, most mints use SPL Token)
-        let token_a_program = pool
-            .base_mint_program
-            .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
-            .unwrap_or(spl_token_sdk);
-
-        let token_b_program = pool
-            .quote_mint_program
-            .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
-            .unwrap_or(spl_token_sdk);
-
-        // Log if we're using cached vs default programs
-        if pool.base_mint_program.is_some() || pool.quote_mint_program.is_some() {
-            tracing::debug!(
-                pool = %pool_id,
-                token_a_program = %token_a_program,
-                token_b_program = %token_b_program,
-                "Orca: using CACHED token programs (no RPC)"
-            );
-        } else {
-            tracing::warn!(
-                pool = %pool_id,
-                "Orca: token programs not cached, defaulting to SPL Token (potential Token-2022 issue!)"
-            );
-        }
+        tracing::debug!(
+            pool = %pool_id,
+            token_a_program = %token_a_program,
+            token_b_program = %token_b_program,
+            "Orca: resolved token programs from cache (no RPC)"
+        );
 
         // Derive ATAs with correct token programs
         let owner_spl =
@@ -1995,6 +2000,7 @@ mod tests {
         let vault_a = Pubkey::new_unique();
         let vault_b = Pubkey::new_unique();
 
+        let spl_token_prog = spl_token::id();
         orca.set_pool_from_accounts(
             &pool_pk.to_string(),
             &[
@@ -2005,6 +2011,7 @@ mod tests {
                 vault_b.to_string(),
                 "tick_current_index:0".to_string(),
                 "tick_spacing:64".to_string(),
+                format!("token_b_program:{}", spl_token_prog),
             ],
         )
         .expect("set_pool_from_accounts");
@@ -2064,6 +2071,7 @@ mod tests {
                 vault_b.to_string(),
                 "tick_current_index:2800".to_string(),
                 "tick_spacing:64".to_string(),
+                format!("token_a_program:{}", spl_token::id()),
             ],
         )
         .expect("set_pool_from_accounts");
