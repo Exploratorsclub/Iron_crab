@@ -21,14 +21,30 @@ pub const WHIRLPOOL_ACCOUNT_MAX_SIZE: usize = 653; // exact size
 pub const POOL_ADDRESS_HINT_KEY: &str = "pool_address_hint";
 
 const WSOL_MINT_STR: &str = "So11111111111111111111111111111111111111112";
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
-/// Resolve token program for a whirlpool mint: cached pool field, else WSOL → SPL Token, else error.
+fn is_observed_token_program(prog: &Pubkey) -> bool {
+    let token_2022 = Pubkey::from_str(TOKEN_2022_PROGRAM_ID).unwrap_or_default();
+    prog.to_bytes() == spl_token::id().to_bytes() || *prog == token_2022
+}
+
+/// Resolve token program for a whirlpool mint: pool field, connector extra cache, WSOL, else error.
 pub(crate) fn orca_resolve_token_program_for_mint(
     mint: &Pubkey,
     cached_on_pool: Option<Pubkey>,
+    cached_extra: Option<&str>,
 ) -> Result<Pubkey> {
     if let Some(p) = cached_on_pool {
-        return Ok(p);
+        if is_observed_token_program(&p) {
+            return Ok(p);
+        }
+    }
+    if let Some(extra) = cached_extra {
+        if let Ok(p) = Pubkey::from_str(extra) {
+            if is_observed_token_program(&p) {
+                return Ok(p);
+            }
+        }
     }
     let wsol = Pubkey::from_str(WSOL_MINT_STR)?;
     if *mint == wsol {
@@ -1321,11 +1337,27 @@ impl Dex for Orca {
 
         let a_to_b = forward;
 
-        // CRITICAL: Use CACHED token programs from LivePoolCache - NO RPC IN HOT PATH!
-        let token_a_program_sdk =
-            orca_resolve_token_program_for_mint(&pool.base_mint, pool.base_mint_program)?;
-        let token_b_program_sdk =
-            orca_resolve_token_program_for_mint(&pool.quote_mint, pool.quote_mint_program)?;
+        // CRITICAL: Use CACHED token programs (pool + cross-DEX connector extras) — NO RPC IN HOT PATH!
+        let token_program_extra_key_a = format!("token_program:{}", pool.base_mint);
+        let token_program_extra_key_b = format!("token_program:{}", pool.quote_mint);
+        let cached_extra_a = self
+            .cached_data
+            .get(&token_program_extra_key_a)
+            .map(|e| e.value().clone());
+        let cached_extra_b = self
+            .cached_data
+            .get(&token_program_extra_key_b)
+            .map(|e| e.value().clone());
+        let token_a_program_sdk = orca_resolve_token_program_for_mint(
+            &pool.base_mint,
+            pool.base_mint_program,
+            cached_extra_a.as_deref(),
+        )?;
+        let token_b_program_sdk = orca_resolve_token_program_for_mint(
+            &pool.quote_mint,
+            pool.quote_mint_program,
+            cached_extra_b.as_deref(),
+        )?;
         let token_a_program = spl_token::solana_program::pubkey::Pubkey::new_from_array(
             token_a_program_sdk.to_bytes(),
         );
@@ -2105,6 +2137,124 @@ mod tests {
         assert!(
             start0 > start1 && start1 > start2,
             "token→SOL (a_to_b) sell leg must be monotonic decreasing"
+        );
+    }
+
+    /// USDC without pool token programs: cross-DEX `token_program:{mint}` extra data must resolve Tokenkeg.
+    #[tokio::test]
+    async fn test_build_swap_ix_async_uses_cached_token_program_extra_data() {
+        use super::POOL_ADDRESS_HINT_KEY;
+        use crate::solana::dex::Dex;
+
+        const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+        const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let orca = Orca::new(rpc);
+        orca.set_skip_tick_array_rpc_validation(true);
+        let authority = Pubkey::new_unique();
+        orca.set_user_authority(authority);
+
+        let pool_pk = Pubkey::new_unique();
+        let usdc_mint = Pubkey::from_str(USDC_MINT).unwrap();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let vault_a = Pubkey::new_unique();
+        let vault_b = Pubkey::new_unique();
+
+        orca.set_pool_from_accounts(
+            &pool_pk.to_string(),
+            &[
+                pool_pk.to_string(),
+                usdc_mint.to_string(),
+                sol_mint.to_string(),
+                vault_a.to_string(),
+                vault_b.to_string(),
+                "tick_current_index:0".to_string(),
+                "tick_spacing:64".to_string(),
+            ],
+        )
+        .expect("set_pool_from_accounts");
+
+        orca.cache_extra_data(POOL_ADDRESS_HINT_KEY, &pool_pk.to_string());
+        orca.cache_extra_data(
+            &format!("token_program:{}", USDC_MINT),
+            &spl_token::id().to_string(),
+        );
+
+        let ixs = orca
+            .build_swap_ix_async(USDC_MINT, SOL_MINT, 1_000_000, 1)
+            .await
+            .expect("build_swap_ix_async with token_program extra");
+
+        assert_eq!(ixs.len(), 1);
+        let spl_token_prog =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(spl_token::id().to_bytes());
+        let owner_spl =
+            spl_token::solana_program::pubkey::Pubkey::new_from_array(authority.to_bytes());
+        let usdc_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_spl,
+            &spl_token::solana_program::pubkey::Pubkey::new_from_array(usdc_mint.to_bytes()),
+            &spl_token_prog,
+        );
+        let sol_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &owner_spl,
+            &spl_token::solana_program::pubkey::Pubkey::new_from_array(sol_mint.to_bytes()),
+            &spl_token_prog,
+        );
+        let usdc_ata_sdk = Pubkey::new_from_array(usdc_ata.to_bytes());
+        let sol_ata_sdk = Pubkey::new_from_array(sol_ata.to_bytes());
+        assert!(
+            ixs[0].accounts.iter().any(|a| a.pubkey == usdc_ata_sdk),
+            "swap ix must use Tokenkeg-derived USDC ATA"
+        );
+        assert!(
+            ixs[0].accounts.iter().any(|a| a.pubkey == sol_ata_sdk),
+            "swap ix must use Tokenkeg-derived WSOL ATA"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_swap_ix_async_token_program_unknown_without_extra_cache() {
+        use super::POOL_ADDRESS_HINT_KEY;
+        use crate::solana::dex::Dex;
+
+        const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+        const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let orca = Orca::new(rpc);
+        orca.set_skip_tick_array_rpc_validation(true);
+        orca.set_user_authority(Pubkey::new_unique());
+
+        let pool_pk = Pubkey::new_unique();
+        let usdc_mint = Pubkey::from_str(USDC_MINT).unwrap();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+
+        orca.set_pool_from_accounts(
+            &pool_pk.to_string(),
+            &[
+                pool_pk.to_string(),
+                usdc_mint.to_string(),
+                sol_mint.to_string(),
+                Pubkey::new_unique().to_string(),
+                Pubkey::new_unique().to_string(),
+                "tick_current_index:0".to_string(),
+                "tick_spacing:64".to_string(),
+            ],
+        )
+        .expect("set_pool_from_accounts");
+
+        orca.cache_extra_data(POOL_ADDRESS_HINT_KEY, &pool_pk.to_string());
+
+        let err = orca
+            .build_swap_ix_async(USDC_MINT, SOL_MINT, 1_000_000, 1)
+            .await
+            .expect_err("expected token_program_unknown");
+
+        assert!(
+            err.to_string().contains("token_program_unknown"),
+            "unexpected error: {}",
+            err
         );
     }
 }
