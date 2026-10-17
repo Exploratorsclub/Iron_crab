@@ -617,6 +617,7 @@ pub const PUMPFUN_AMM_SELL_24_POST_UPGRADE_TRAILING_MUTABILITY:
 };
 
 /// Post-upgrade migrated pools: extended 24-account `sell` with `pool-v2` PDA at ix #21 (not user volume metas).
+/// Buys ignore this path via `apply_post_upgrade_pool_v2_tail` on [`PumpFunAmmDex::push_pump_amm_sell_extended_trailing_metas`].
 #[must_use]
 pub fn pump_amm_sell_trailing_is_post_upgrade_pool_v2(base_mint: &Pubkey, tail_0: Pubkey) -> bool {
     if tail_0 == Pubkey::default() {
@@ -3729,13 +3730,14 @@ impl PumpFunAmmDex {
         cached_observed_volume_tail_0: Option<Pubkey>,
         cached_observed_volume_tail_1: Option<Pubkey>,
         cold_path_prefer_derived_on_mismatch: bool,
+        apply_post_upgrade_pool_v2_tail: bool,
     ) -> Result<Option<PumpAmmVolumeQuoteAtaCreate>> {
         let (derived_vol_wsol_ata, derived_vol) =
             Self::pump_amm_sell_cashback_first_two_metas(user, quote_mint, quote_token_program);
         let observed_t0 = cached_observed_volume_tail_0.filter(|p| *p != Pubkey::default());
         let observed_t1 = cached_observed_volume_tail_1.filter(|p| *p != Pubkey::default());
 
-        if !sell_requires_pre_fee_metas {
+        if !sell_requires_pre_fee_metas && apply_post_upgrade_pool_v2_tail {
             if let (Some(t0), Some(t1)) = (observed_t0, observed_t1) {
                 if pump_amm_sell_trailing_is_post_upgrade_pool_v2(&base_mint, t0) {
                     let tier24 = PUMPFUN_AMM_SELL_24_POST_UPGRADE_TRAILING_MUTABILITY;
@@ -7339,6 +7341,7 @@ impl Dex for PumpFunAmmDex {
                     cached_observed_volume_tail_0,
                     cached_observed_volume_tail_1,
                     false,
+                    true,
                 )?;
             }
             let swap_ix = Instruction {
@@ -7641,6 +7644,7 @@ impl PumpFunAmmDex {
                     sell_extended_tail_0,
                     sell_extended_tail_1,
                     cold_path_prefer_derived_on_mismatch,
+                    false,
                 )?;
                 metas
             } else if sell_requires_cashback_remaining {
@@ -7671,6 +7675,7 @@ impl PumpFunAmmDex {
                     sell_extended_tail_0,
                     sell_extended_tail_1,
                     cold_path_prefer_derived_on_mismatch,
+                    false,
                 )?;
                 metas
             } else if sell_requires_pre_fee_metas {
@@ -7750,6 +7755,7 @@ impl PumpFunAmmDex {
                     sell_extended_tail_0,
                     sell_extended_tail_1,
                     cold_path_prefer_derived_on_mismatch,
+                    true,
                 )?;
             }
             metas
@@ -8899,6 +8905,7 @@ mod tests {
             None,
             None,
             false,
+            true,
         );
         assert!(
             err.is_err(),
@@ -10101,6 +10108,80 @@ mod tests {
         );
     }
 
+    /// Buy must not reuse SELL post-upgrade `pool-v2` tail at #21; derived volume WSOL ATA + CreateIdempotent.
+    #[test]
+    fn pump_amm_buy_cashback_ignores_sell_pool_v2_tail_for_derived_volume_ata() {
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let base_mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let third = Pubkey::new_unique();
+        let tail_1 = Pubkey::new_unique();
+        let quote_tp = test_spl_token_program();
+        let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).unwrap();
+        let pool_v2 = pump_amm_pool_v2_pda(&base_mint, &program_id);
+        assert!(pump_amm_sell_trailing_is_post_upgrade_pool_v2(
+            &base_mint, pool_v2
+        ));
+        let (derived_vol_ata, derived_vol) =
+            PumpFunAmmDex::pump_amm_sell_cashback_first_two_metas(user, wsol, quote_tp);
+        assert_ne!(derived_vol_ata, pool_v2);
+
+        let v14 = vec![
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            wsol,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+        ];
+
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            WSOL_MINT,
+            &base_mint.to_string(),
+            1,
+            1,
+            user,
+            &v14,
+            Some(test_spl_token_program()),
+            true,
+            Some(third),
+            false,
+            None,
+            Some(pool_v2),
+            Some(tail_1),
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("24-account BUY with sell pool-v2 tail in cache");
+
+        assert_eq!(ixs.len(), 2, "CreateIdempotent + swap");
+        let ata_prog = Pubkey::new_from_array(spl_associated_token_account::id().to_bytes());
+        assert_eq!(ixs[0].program_id, ata_prog);
+        assert!(
+            ixs[0].accounts.iter().any(|m| m.pubkey == derived_vol),
+            "create ix owner must be user volume PDA"
+        );
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[21].pubkey,
+            derived_vol_ata,
+            "buy #21 must be derived volume WSOL ATA, not pool-v2 PDA"
+        );
+        assert_ne!(
+            pump_amm_swap_ix_from_build(&ixs).accounts[21].pubkey,
+            pool_v2
+        );
+    }
+
     /// Cashback-only extended `buy_exact_quote_in` without fee tail (24 accounts).
     #[test]
     fn pump_amm_build_swap_24_account_buy_cashback_extended_no_fee_tail() {
@@ -10248,6 +10329,7 @@ mod tests {
             Some(observed0),
             Some(observed1),
             false,
+            true,
         )
         .expect("trailing metas");
         assert_eq!(metas.len(), 4);
@@ -10545,6 +10627,7 @@ mod tests {
             Some(derived0),
             Some(derived1),
             false,
+            true,
         )
         .expect("validated-cache trailing metas");
         assert_eq!(metas_validated_cache[0].pubkey, derived0);
@@ -10568,6 +10651,7 @@ mod tests {
             Some(foreign0),
             Some(foreign1),
             false,
+            true,
         )
         .expect("hot stuck trailing");
         assert_eq!(metas_hot_stuck[0].pubkey, derived0);
@@ -10590,6 +10674,7 @@ mod tests {
             None,
             None,
             true,
+            true,
         )
         .expect("stripped-cache trailing");
         assert_eq!(metas_stripped_cache[0].pubkey, derived0);
@@ -10611,6 +10696,7 @@ mod tests {
             None,
             Some(foreign0),
             Some(foreign1),
+            true,
             true,
         )
         .expect("foreign trailing");
