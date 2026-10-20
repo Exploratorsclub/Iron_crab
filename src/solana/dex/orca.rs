@@ -1426,24 +1426,63 @@ impl Dex for Orca {
             )
         })? as i32;
 
-        let (tick_array_0, tick_array_1, tick_array_2, start0, start1, start2) =
-            whirlpool_swap_tick_array_pdas_for_cached_swap(&pool_id, tick_now, spacing, a_to_b);
+        const TICK_ARRAY_CACHE_KEYS: [&str; 3] = ["tick_array_0", "tick_array_1", "tick_array_2"];
+        let mut cached_tick_pubkeys: [Option<Pubkey>; 3] = [None, None, None];
+        let mut any_tick_array_cached = false;
+        for (idx, key) in TICK_ARRAY_CACHE_KEYS.iter().enumerate() {
+            if let Some(entry) = self.cached_data.get(*key) {
+                any_tick_array_cached = true;
+                let pk = Pubkey::from_str(entry.value().as_str())
+                    .map_err(|_| anyhow!("orca tick arrays missing"))?;
+                cached_tick_pubkeys[idx] = Some(pk);
+            }
+        }
 
-        tracing::debug!(
-            pool = %pool_id,
-            tick_spacing = spacing,
-            tick_current = tick_now,
-            cached_tick = ?pool.tick_current_index,
-            start0 = start0,
-            start1 = start1,
-            start2 = start2,
-            a_to_b = a_to_b,
-            "orca: derived tick array PDAs (async with cached tick)"
-        );
+        let (tick_array_0, tick_array_1, tick_array_2, _start0, _start1, _start2) =
+            if any_tick_array_cached {
+                if cached_tick_pubkeys.iter().any(|pk| pk.is_none()) {
+                    return Err(anyhow!("orca tick arrays missing"));
+                }
+                (
+                    cached_tick_pubkeys[0].unwrap(),
+                    cached_tick_pubkeys[1].unwrap(),
+                    cached_tick_pubkeys[2].unwrap(),
+                    0i32,
+                    0i32,
+                    0i32,
+                )
+            } else {
+                let derived = whirlpool_swap_tick_array_pdas_for_cached_swap(
+                    &pool_id, tick_now, spacing, a_to_b,
+                );
+                tracing::debug!(
+                    pool = %pool_id,
+                    tick_spacing = spacing,
+                    tick_current = tick_now,
+                    cached_tick = ?pool.tick_current_index,
+                    start0 = derived.3,
+                    start1 = derived.4,
+                    start2 = derived.5,
+                    a_to_b = a_to_b,
+                    "orca: derived tick array PDAs (async with cached tick)"
+                );
+                derived
+            };
+
+        if any_tick_array_cached {
+            tracing::debug!(
+                pool = %pool_id,
+                tick_array_0 = %tick_array_0,
+                tick_array_1 = %tick_array_1,
+                tick_array_2 = %tick_array_2,
+                a_to_b = a_to_b,
+                "orca: using quote-bound tick array PDAs from cached_data"
+            );
+        }
 
         // Validate tick arrays exist to avoid InvalidTickArraySequence (6023)
         // Hot Path: skip RPC to avoid get_multiple_accounts (I-4, I-7)
-        if !self.skip_tick_array_rpc_validation.load(Ordering::Relaxed) {
+        if !any_tick_array_cached && !self.skip_tick_array_rpc_validation.load(Ordering::Relaxed) {
             match self
                 .rpc
                 .rpc
@@ -2256,5 +2295,167 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[tokio::test]
+    async fn test_build_swap_ix_async_uses_quote_bound_tick_array_pubkeys() {
+        use super::POOL_ADDRESS_HINT_KEY;
+        use crate::solana::dex::Dex;
+
+        const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let orca = Orca::new(rpc);
+        orca.set_skip_tick_array_rpc_validation(true);
+        orca.set_user_authority(Pubkey::new_unique());
+
+        let pool_pk = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+
+        orca.set_pool_from_accounts(
+            &pool_pk.to_string(),
+            &[
+                pool_pk.to_string(),
+                sol_mint.to_string(),
+                token_mint.to_string(),
+                Pubkey::new_unique().to_string(),
+                Pubkey::new_unique().to_string(),
+                "tick_current_index:2800".to_string(),
+                "tick_spacing:64".to_string(),
+                format!("token_b_program:{}", spl_token::id()),
+            ],
+        )
+        .expect("set_pool_from_accounts");
+
+        orca.cache_extra_data(POOL_ADDRESS_HINT_KEY, &pool_pk.to_string());
+
+        let bound_0 = Pubkey::new_unique();
+        let bound_1 = Pubkey::new_unique();
+        let bound_2 = Pubkey::new_unique();
+        orca.cache_extra_data("tick_array_0", &bound_0.to_string());
+        orca.cache_extra_data("tick_array_1", &bound_1.to_string());
+        orca.cache_extra_data("tick_array_2", &bound_2.to_string());
+
+        let (derived_0, _, _, _, _, _) =
+            super::whirlpool_swap_tick_array_pdas_for_cached_swap(&pool_pk, 2800, 64, true);
+        assert_ne!(
+            bound_0, derived_0,
+            "bound tick arrays must differ from derivation"
+        );
+
+        let ixs = orca
+            .build_swap_ix_async(SOL_MINT, &token_mint.to_string(), 1_000_000, 1)
+            .await
+            .expect("build with quote-bound tick arrays");
+
+        let tick_accounts: Vec<Pubkey> = ixs[0]
+            .accounts
+            .iter()
+            .skip(7)
+            .take(3)
+            .map(|a| a.pubkey)
+            .collect();
+        assert_eq!(tick_accounts, vec![bound_0, bound_1, bound_2]);
+    }
+
+    #[tokio::test]
+    async fn test_build_swap_ix_async_rejects_partial_tick_array_cache() {
+        use super::POOL_ADDRESS_HINT_KEY;
+        use crate::solana::dex::Dex;
+
+        const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let orca = Orca::new(rpc);
+        orca.set_skip_tick_array_rpc_validation(true);
+        orca.set_user_authority(Pubkey::new_unique());
+
+        let pool_pk = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+
+        orca.set_pool_from_accounts(
+            &pool_pk.to_string(),
+            &[
+                pool_pk.to_string(),
+                sol_mint.to_string(),
+                token_mint.to_string(),
+                Pubkey::new_unique().to_string(),
+                Pubkey::new_unique().to_string(),
+                "tick_current_index:0".to_string(),
+                "tick_spacing:64".to_string(),
+                format!("token_b_program:{}", spl_token::id()),
+            ],
+        )
+        .expect("set_pool_from_accounts");
+
+        orca.cache_extra_data(POOL_ADDRESS_HINT_KEY, &pool_pk.to_string());
+        orca.cache_extra_data("tick_array_0", &Pubkey::new_unique().to_string());
+
+        let err = orca
+            .build_swap_ix_async(SOL_MINT, &token_mint.to_string(), 1_000_000, 1)
+            .await
+            .expect_err("partial tick array cache must fail");
+
+        assert!(
+            err.to_string().contains("orca tick arrays missing"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_swap_ix_async_derives_tick_arrays_when_cache_empty() {
+        use super::POOL_ADDRESS_HINT_KEY;
+        use crate::solana::dex::Dex;
+
+        const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+        let rpc = Arc::new(SolanaRpc::new("https://dummy"));
+        let orca = Orca::new(rpc);
+        orca.set_skip_tick_array_rpc_validation(true);
+        orca.set_user_authority(Pubkey::new_unique());
+
+        let pool_pk = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let tick_now = 2800;
+        let spacing = 64;
+
+        orca.set_pool_from_accounts(
+            &pool_pk.to_string(),
+            &[
+                pool_pk.to_string(),
+                sol_mint.to_string(),
+                token_mint.to_string(),
+                Pubkey::new_unique().to_string(),
+                Pubkey::new_unique().to_string(),
+                format!("tick_current_index:{tick_now}"),
+                format!("tick_spacing:{spacing}"),
+                format!("token_b_program:{}", spl_token::id()),
+            ],
+        )
+        .expect("set_pool_from_accounts");
+
+        orca.cache_extra_data(POOL_ADDRESS_HINT_KEY, &pool_pk.to_string());
+
+        let ixs = orca
+            .build_swap_ix_async(SOL_MINT, &token_mint.to_string(), 1_000_000, 1)
+            .await
+            .expect("build without tick array cache");
+
+        let (expected_0, expected_1, expected_2, _, _, _) =
+            super::whirlpool_swap_tick_array_pdas_for_cached_swap(
+                &pool_pk, tick_now, spacing, true,
+            );
+        let tick_accounts: Vec<Pubkey> = ixs[0]
+            .accounts
+            .iter()
+            .skip(7)
+            .take(3)
+            .map(|a| a.pubkey)
+            .collect();
+        assert_eq!(tick_accounts, vec![expected_0, expected_1, expected_2]);
     }
 }

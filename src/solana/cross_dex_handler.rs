@@ -155,6 +155,24 @@ fn orca_token_program_for_mint_from_cache(
     None
 }
 
+fn cache_orca_tick_arrays_from_leg_accounts(
+    connector: &dyn Dex,
+    pool: &str,
+    accounts: &[String],
+) -> Result<()> {
+    const PREFIXES: [&str; 3] = ["tick_array_0:", "tick_array_1:", "tick_array_2:"];
+    const KEYS: [&str; 3] = ["tick_array_0", "tick_array_1", "tick_array_2"];
+    for (prefix, key) in PREFIXES.iter().zip(KEYS.iter()) {
+        let Some(rest) = accounts.iter().find_map(|entry| entry.strip_prefix(prefix)) else {
+            return Err(anyhow!("orca tick arrays missing (pool={})", pool));
+        };
+        let pk = Pubkey::from_str(rest)
+            .map_err(|_| anyhow!("orca tick arrays missing (pool={})", pool))?;
+        connector.cache_extra_data(key, &pk.to_string());
+    }
+    Ok(())
+}
+
 /// Orca whirlpool swaps always reference user token ATAs A and B; never omit CreateIdempotent.
 fn cross_dex_route_includes_orca(buy_dex: &str, sell_dex: &str) -> bool {
     buy_dex == "orca" || sell_dex == "orca"
@@ -1659,6 +1677,13 @@ impl CrossDexHandler {
                 &token_program_sdk.to_string(),
             );
 
+            if buy_dex == "orca" {
+                let accts = buy_accounts
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("orca tick arrays missing (pool={})", buy_pool))?;
+                cache_orca_tick_arrays_from_leg_accounts(buy_connector.as_ref(), &buy_pool, accts)?;
+            }
+
             buy_connector
                 .build_swap_ix_async(SOL_MINT, token_mint, buy_amount_in, buy_min_out)
                 .await?
@@ -1759,6 +1784,17 @@ impl CrossDexHandler {
                         sell_pool
                     ));
                 }
+            }
+
+            if sell_dex == "orca" {
+                let accts = sell_accounts
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("orca tick arrays missing (pool={})", sell_pool))?;
+                cache_orca_tick_arrays_from_leg_accounts(
+                    sell_connector.as_ref(),
+                    &sell_pool,
+                    accts,
+                )?;
             }
 
             sell_connector
@@ -2774,10 +2810,35 @@ mod tests {
         );
     }
 
+    fn orca_buy_pool_accounts_with_tick(
+        pool: Pubkey,
+        mint_a: Pubkey,
+        mint_b: Pubkey,
+        tick: i32,
+        spacing: u16,
+        mint_in: Pubkey,
+    ) -> Vec<String> {
+        let spl_token_prog = spl_token::id();
+        let mut accounts = vec![
+            pool.to_string(),
+            mint_a.to_string(),
+            mint_b.to_string(),
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+        ];
+        accounts.push(format!("tick_current_index:{tick}"));
+        accounts.push(format!("tick_spacing:{spacing}"));
+        accounts.push(format!("token_a_program:{}", spl_token_prog));
+        append_orca_tick_array_prefixes_for_leg(pool, &mut accounts, tick, spacing, mint_in);
+        accounts
+    }
+
     fn orca_meteora_cross_dex_intent(
         token_mint: &Pubkey,
         buy_pool: &Pubkey,
         sell_pool: &Pubkey,
+        buy_accounts: Vec<String>,
+        sell_accounts: Vec<String>,
     ) -> TradeIntent {
         let mut metadata = HashMap::new();
         metadata.insert("buy_dex".to_string(), "orca".to_string());
@@ -2813,7 +2874,14 @@ mod tests {
                 input_mint: SOL_MINT.to_string(),
                 output_mint: token_mint.to_string(),
                 pools: vec![buy_pool.to_string(), sell_pool.to_string()],
-                accounts: vec![],
+                accounts: {
+                    let mut accounts = Vec::new();
+                    accounts.push(format!("buy_pool_accounts_start:{}", buy_accounts.len()));
+                    accounts.extend(buy_accounts);
+                    accounts.push(format!("sell_pool_accounts_start:{}", sell_accounts.len()));
+                    accounts.extend(sell_accounts);
+                    accounts
+                },
                 token_program: Some(spl_token::id().to_string()),
             },
             expected_roi_bps: 50,
@@ -2849,7 +2917,25 @@ mod tests {
         let mut handler = CrossDexHandler::new(rpc, Some(wallet.pubkey())).with_pool_cache(cache);
         handler.init_dexes().await.expect("init_dexes");
 
-        let intent = orca_meteora_cross_dex_intent(&token_mint, &buy_pool, &sell_pool);
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let buy_accounts =
+            orca_buy_pool_accounts_with_tick(buy_pool, token_mint, sol_mint, -624, 8, sol_mint);
+        let sell_accounts = vec![
+            sell_pool.to_string(),
+            token_mint.to_string(),
+            sol_mint.to_string(),
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+            "active_id:-281".to_string(),
+            "bin_step:10".to_string(),
+        ];
+        let intent = orca_meteora_cross_dex_intent(
+            &token_mint,
+            &buy_pool,
+            &sell_pool,
+            buy_accounts,
+            sell_accounts,
+        );
         let validation = cross_dex_validation_fixture(&token_mint);
         let plan = handler
             .build_swap_plan(
@@ -2935,7 +3021,24 @@ mod tests {
         let mut handler = CrossDexHandler::new(rpc, Some(wallet.pubkey())).with_pool_cache(cache);
         handler.init_dexes().await.expect("init_dexes");
 
-        let intent = orca_meteora_cross_dex_intent(&token_mint, &buy_pool, &sell_pool);
+        let buy_accounts =
+            orca_buy_pool_accounts_with_tick(buy_pool, sol_mint, token_mint, -624, 8, sol_mint);
+        let sell_accounts = vec![
+            sell_pool.to_string(),
+            token_mint.to_string(),
+            sol_mint.to_string(),
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+            "active_id:-281".to_string(),
+            "bin_step:10".to_string(),
+        ];
+        let intent = orca_meteora_cross_dex_intent(
+            &token_mint,
+            &buy_pool,
+            &sell_pool,
+            buy_accounts,
+            sell_accounts,
+        );
         let validation = cross_dex_validation_fixture(&token_mint);
         let plan = handler
             .build_swap_plan(
@@ -3174,6 +3277,24 @@ mod tests {
         ]
     }
 
+    fn append_orca_tick_array_prefixes_for_leg(
+        pool: Pubkey,
+        accounts: &mut Vec<String>,
+        tick: i32,
+        spacing: u16,
+        mint_in: Pubkey,
+    ) {
+        use crate::solana::dex::orca_tick_array::{
+            derive_tick_array_pda, swap_direction_tick_array_starts,
+        };
+        let mint_a = Pubkey::from_str(&accounts[1]).expect("orca mint A");
+        let a_to_b = mint_in == mint_a;
+        let (s0, s1, s2) = swap_direction_tick_array_starts(tick, spacing as i32, a_to_b);
+        accounts.push(format!("tick_array_0:{}", derive_tick_array_pda(&pool, s0)));
+        accounts.push(format!("tick_array_1:{}", derive_tick_array_pda(&pool, s1)));
+        accounts.push(format!("tick_array_2:{}", derive_tick_array_pda(&pool, s2)));
+    }
+
     fn orca_pool_accounts_with_tick(
         pool: Pubkey,
         token_mint: Pubkey,
@@ -3186,6 +3307,7 @@ mod tests {
         accounts.push(format!("tick_current_index:{tick}"));
         accounts.push(format!("tick_spacing:{spacing}"));
         accounts.push(format!("token_a_program:{}", spl_token_prog));
+        append_orca_tick_array_prefixes_for_leg(pool, &mut accounts, tick, spacing, token_mint);
         accounts
     }
 
@@ -3320,7 +3442,8 @@ mod tests {
             "active_id:-281".to_string(),
             "bin_step:10".to_string(),
         ];
-        let sell_accounts = orca_pool_accounts_without_tick(sell_pool, token_mint, sol_mint);
+        let mut sell_accounts = orca_pool_accounts_without_tick(sell_pool, token_mint, sol_mint);
+        append_orca_tick_array_prefixes_for_leg(sell_pool, &mut sell_accounts, -624, 8, token_mint);
 
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
         let mut handler = CrossDexHandler::new(rpc, Some(wallet.pubkey())).with_pool_cache(cache);
