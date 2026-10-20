@@ -153,6 +153,9 @@ use ironcrab::nats::{
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
+use ironcrab::solana::dex::orca_tick_array::{
+    derive_tick_array_pda, swap_direction_tick_array_starts,
+};
 use ironcrab::solana::dex::pumpfun_amm::pump_amm_global_fee_config_loaded;
 use ironcrab::storage::{JsonlWriter, JsonlWriterConfig};
 use solana_sdk::pubkey::Pubkey;
@@ -8619,6 +8622,125 @@ fn pump_amm_pool_accounts_valid_for_swap(pool_address: &str, accounts: &[String]
     accounts.len() == 14 && accounts.first().map(|s| s.as_str()) == Some(pool_address)
 }
 
+fn parse_orca_leg_prefix_i32(accounts: &[String], prefix: &str) -> Option<i32> {
+    accounts
+        .iter()
+        .find_map(|entry| entry.strip_prefix(prefix).and_then(|v| v.parse().ok()))
+}
+
+fn parse_orca_leg_prefix_u16(accounts: &[String], prefix: &str) -> Option<u16> {
+    accounts
+        .iter()
+        .find_map(|entry| entry.strip_prefix(prefix).and_then(|v| v.parse().ok()))
+}
+
+/// Bind Orca swap tick-array PDAs to the same starts as the V2 quote (`ctx.orca_tick_arrays`).
+fn append_orca_tick_array_accounts_for_arb_leg(
+    leg_accounts: &mut Vec<String>,
+    pool_addr: &str,
+    dex: &str,
+    base_mint: &str,
+    is_buy_leg: bool,
+    orca_tick_arrays: &HashMap<String, HashMap<i32, OrcaTickArrayCache>>,
+) -> bool {
+    const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+    let tick = parse_orca_leg_prefix_i32(leg_accounts, "tick_current_index:");
+    let spacing = parse_orca_leg_prefix_u16(leg_accounts, "tick_spacing:");
+    if tick.is_none() || spacing.is_none() {
+        warn!(
+            pool = %pool_addr,
+            dex = %dex,
+            reason = "orca_tick_arrays_missing_for_swap",
+            "Rejecting arb: Orca leg missing tick_current_index or tick_spacing for tick-array bind"
+        );
+        ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let tick = tick.unwrap();
+    let spacing = spacing.unwrap();
+
+    if leg_accounts.len() < 3 {
+        warn!(
+            pool = %pool_addr,
+            dex = %dex,
+            reason = "orca_tick_arrays_missing_for_swap",
+            "Rejecting arb: Orca leg missing mint accounts for swap direction"
+        );
+        ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let mint_a = &leg_accounts[1];
+    let mint_b = &leg_accounts[2];
+    let mint_in = if is_buy_leg { WSOL_MINT } else { base_mint };
+    let a_to_b = if mint_in == mint_a {
+        true
+    } else if mint_in == mint_b {
+        false
+    } else {
+        warn!(
+            pool = %pool_addr,
+            dex = %dex,
+            mint_in = %mint_in,
+            mint_a = %mint_a,
+            mint_b = %mint_b,
+            reason = "orca_tick_arrays_missing_for_swap",
+            "Rejecting arb: Orca leg mint_in does not match pool mint A or B"
+        );
+        ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+
+    let pool_pk = match Pubkey::from_str(pool_addr) {
+        Ok(pk) => pk,
+        Err(_) => {
+            warn!(
+                pool = %pool_addr,
+                dex = %dex,
+                reason = "orca_tick_arrays_missing_for_swap",
+                "Rejecting arb: invalid Orca pool address for tick-array bind"
+            );
+            ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    };
+
+    let (s0, s1, s2) = swap_direction_tick_array_starts(tick, spacing as i32, a_to_b);
+    let tick_map = orca_tick_arrays.get(pool_addr);
+    let starts_present =
+        tick_map.is_some_and(|m| m.contains_key(&s0) && m.contains_key(&s1) && m.contains_key(&s2));
+    if !starts_present {
+        warn!(
+            pool = %pool_addr,
+            dex = %dex,
+            tick_current_index = tick,
+            tick_spacing = spacing,
+            a_to_b,
+            start0 = s0,
+            start1 = s1,
+            start2 = s2,
+            reason = "orca_tick_arrays_missing_for_swap",
+            "Rejecting arb: Orca tick-array cache missing required start indices for swap"
+        );
+        ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+
+    leg_accounts.push(format!(
+        "tick_array_0:{}",
+        derive_tick_array_pda(&pool_pk, s0)
+    ));
+    leg_accounts.push(format!(
+        "tick_array_1:{}",
+        derive_tick_array_pda(&pool_pk, s1)
+    ));
+    leg_accounts.push(format!(
+        "tick_array_2:{}",
+        derive_tick_array_pda(&pool_pk, s2)
+    ));
+    true
+}
+
 /// Creates an arb intent from the opportunity.
 /// Returns None if required DexPoolAccounts are missing for ANY pool.
 ///
@@ -8714,8 +8836,8 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
     }
 
     // Both pools have accounts - safe to proceed
-    let buy_accts = buy_accounts.unwrap();
-    let sell_accts = sell_accounts.unwrap();
+    let mut buy_accts = buy_accounts.unwrap();
+    let mut sell_accts = sell_accounts.unwrap();
 
     if opp.buy_dex == "pump_amm"
         && !pump_amm_pool_accounts_valid_for_swap(&opp.buy_pool, &buy_accts)
@@ -8745,6 +8867,32 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
             "Rejecting arb: sell pool has incomplete PumpSwap DexPoolAccounts (need 14 + accounts[0]==pool)"
         );
         ARB_REJECTED_MISSING_ACCOUNTS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+
+    let orca_tick_arrays = ctx.orca_tick_arrays.read();
+    if opp.buy_dex == "orca"
+        && !append_orca_tick_array_accounts_for_arb_leg(
+            &mut buy_accts,
+            &opp.buy_pool,
+            &opp.buy_dex,
+            &opp.base_mint,
+            true,
+            &orca_tick_arrays,
+        )
+    {
+        return None;
+    }
+    if opp.sell_dex == "orca"
+        && !append_orca_tick_array_accounts_for_arb_leg(
+            &mut sell_accts,
+            &opp.sell_pool,
+            &opp.sell_dex,
+            &opp.base_mint,
+            false,
+            &orca_tick_arrays,
+        )
+    {
         return None;
     }
 
@@ -12053,6 +12201,55 @@ mod event_pipeline_tests {
 #[cfg(test)]
 fn empty_orca_tick_arrays_snapshot() -> HashMap<String, HashMap<i32, OrcaTickArrayCache>> {
     HashMap::new()
+}
+
+#[cfg(test)]
+fn seed_orca_tick_arrays_for_pool(
+    ctx: &ArbContext,
+    cache: &LivePoolCache,
+    orca_pool: Pubkey,
+    _token_mint: &Pubkey,
+) {
+    use ironcrab::execution::live_pool_cache::CachedPoolState;
+    use ironcrab::solana::dex::orca_tick_array::{
+        build_tick_array_account_bytes, parse_tick_array, swap_direction_tick_array_starts,
+    };
+
+    let (tick, tick_spacing) = match cache.get(&orca_pool) {
+        Some(CachedPoolState::Orca(s)) => (s.tick_current_index, s.tick_spacing),
+        _ => (0i32, 64u16),
+    };
+    let spacing_i = tick_spacing as i32;
+    let mut per_pool = HashMap::new();
+    for a_to_b in [true, false] {
+        let (s0, s1, s2) = swap_direction_tick_array_starts(tick, spacing_i, a_to_b);
+        for start in [s0, s1, s2] {
+            if per_pool.contains_key(&start) {
+                continue;
+            }
+            let bytes = build_tick_array_account_bytes(start, orca_pool, tick_spacing, &[]);
+            let parsed = parse_tick_array(&bytes).expect("tick array bytes");
+            let ticks = parsed
+                .ticks
+                .iter()
+                .map(|t| OrcaTickSnapshot {
+                    tick_index: t.tick_index,
+                    initialized: t.initialized,
+                    liquidity_net: t.liquidity_net.to_string(),
+                })
+                .collect();
+            per_pool.insert(
+                start,
+                OrcaTickArrayCache {
+                    ticks,
+                    update_slot: 1,
+                },
+            );
+        }
+    }
+    ctx.orca_tick_arrays
+        .write()
+        .insert(orca_pool.to_string(), per_pool);
 }
 
 /// Whirlpool + tick-window fixtures so V2 round-trip tests can quote Orca without vault-k.
@@ -17236,7 +17433,9 @@ mod pool_accounts_coverage_tests {
         let meteora_pool = Pubkey::new_unique();
         let orca_pool = Pubkey::new_unique();
         let cache = usdc_meteora_orca_cache(meteora_pool, orca_pool);
-        let ctx = test_arb_context(cache);
+        let ctx = test_arb_context(cache.clone());
+        let usdc = Pubkey::from_str(USDC_MINT).unwrap();
+        seed_orca_tick_arrays_for_pool(&ctx, cache.as_ref(), orca_pool, &usdc);
 
         let mut tracker = TokenArbTracker::new(USDC_MINT);
         tracker.token_decimals = Some(6);
@@ -17293,7 +17492,9 @@ mod pool_accounts_coverage_tests {
         let meteora_pool = Pubkey::new_unique();
         let orca_pool = Pubkey::new_unique();
         let cache = usdc_meteora_orca_cache(meteora_pool, orca_pool);
-        let ctx = test_arb_context(cache);
+        let ctx = test_arb_context(cache.clone());
+        let usdc = Pubkey::from_str(USDC_MINT).unwrap();
+        seed_orca_tick_arrays_for_pool(&ctx, cache.as_ref(), orca_pool, &usdc);
 
         let mut tracker = TokenArbTracker::new(USDC_MINT);
         tracker.token_decimals = Some(6);
@@ -17329,6 +17530,14 @@ mod pool_accounts_coverage_tests {
                 .map(String::as_str),
             Some(executable_buy_out.to_string().as_str())
         );
+        assert!(
+            intent
+                .resources
+                .accounts
+                .iter()
+                .any(|a| a.starts_with("tick_array_0:")),
+            "orca buy leg must publish quote-bound tick array account prefixes"
+        );
     }
 
     #[test]
@@ -17336,13 +17545,16 @@ mod pool_accounts_coverage_tests {
         let meteora_pool = Pubkey::new_unique();
         let orca_pool = Pubkey::new_unique();
         let cache = usdc_meteora_orca_cache(meteora_pool, orca_pool);
-        let ctx = test_arb_context(cache);
+        let ctx = test_arb_context(cache.clone());
 
         let mut tracker = TokenArbTracker::new(USDC_MINT);
         tracker.token_decimals = Some(6);
         tracker.upsert_pool(pool_state("meteora_dlmm", &meteora_pool.to_string()));
         tracker.upsert_pool(pool_state("orca", &orca_pool.to_string()));
         ctx.trackers.write().insert(USDC_MINT.to_string(), tracker);
+
+        let usdc = Pubkey::from_str(USDC_MINT).unwrap();
+        seed_orca_tick_arrays_for_pool(&ctx, cache.as_ref(), orca_pool, &usdc);
 
         let opp = ArbOpportunity {
             base_mint: USDC_MINT.to_string(),

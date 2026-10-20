@@ -155,6 +155,24 @@ fn orca_token_program_for_mint_from_cache(
     None
 }
 
+fn cache_orca_tick_arrays_from_leg_accounts(
+    connector: &dyn Dex,
+    pool: &str,
+    accounts: &[String],
+) -> Result<()> {
+    const PREFIXES: [&str; 3] = ["tick_array_0:", "tick_array_1:", "tick_array_2:"];
+    const KEYS: [&str; 3] = ["tick_array_0", "tick_array_1", "tick_array_2"];
+    for (prefix, key) in PREFIXES.iter().zip(KEYS.iter()) {
+        let Some(rest) = accounts.iter().find_map(|entry| entry.strip_prefix(prefix)) else {
+            return Err(anyhow!("orca tick arrays missing (pool={})", pool));
+        };
+        let pk = Pubkey::from_str(rest)
+            .map_err(|_| anyhow!("orca tick arrays missing (pool={})", pool))?;
+        connector.cache_extra_data(key, &pk.to_string());
+    }
+    Ok(())
+}
+
 /// Orca whirlpool swaps always reference user token ATAs A and B; never omit CreateIdempotent.
 fn cross_dex_route_includes_orca(buy_dex: &str, sell_dex: &str) -> bool {
     buy_dex == "orca" || sell_dex == "orca"
@@ -1659,6 +1677,16 @@ impl CrossDexHandler {
                 &token_program_sdk.to_string(),
             );
 
+            if buy_dex == "orca" {
+                if let Some(accts) = buy_accounts.as_deref() {
+                    cache_orca_tick_arrays_from_leg_accounts(
+                        buy_connector.as_ref(),
+                        &buy_pool,
+                        accts,
+                    )?;
+                }
+            }
+
             buy_connector
                 .build_swap_ix_async(SOL_MINT, token_mint, buy_amount_in, buy_min_out)
                 .await?
@@ -1758,6 +1786,16 @@ impl CrossDexHandler {
                         "RAYDIUM_LAYOUT_NOT_READY: sell pool {} — LivePoolCache miss or serum accounts incomplete in cache",
                         sell_pool
                     ));
+                }
+            }
+
+            if sell_dex == "orca" {
+                if let Some(accts) = sell_accounts.as_deref() {
+                    cache_orca_tick_arrays_from_leg_accounts(
+                        sell_connector.as_ref(),
+                        &sell_pool,
+                        accts,
+                    )?;
                 }
             }
 
@@ -3174,6 +3212,24 @@ mod tests {
         ]
     }
 
+    fn append_orca_tick_array_prefixes_for_leg(
+        pool: Pubkey,
+        accounts: &mut Vec<String>,
+        tick: i32,
+        spacing: u16,
+        mint_in: Pubkey,
+    ) {
+        use crate::solana::dex::orca_tick_array::{
+            derive_tick_array_pda, swap_direction_tick_array_starts,
+        };
+        let mint_a = Pubkey::from_str(&accounts[1]).expect("orca mint A");
+        let a_to_b = mint_in == mint_a;
+        let (s0, s1, s2) = swap_direction_tick_array_starts(tick, spacing as i32, a_to_b);
+        accounts.push(format!("tick_array_0:{}", derive_tick_array_pda(&pool, s0)));
+        accounts.push(format!("tick_array_1:{}", derive_tick_array_pda(&pool, s1)));
+        accounts.push(format!("tick_array_2:{}", derive_tick_array_pda(&pool, s2)));
+    }
+
     fn orca_pool_accounts_with_tick(
         pool: Pubkey,
         token_mint: Pubkey,
@@ -3186,6 +3242,7 @@ mod tests {
         accounts.push(format!("tick_current_index:{tick}"));
         accounts.push(format!("tick_spacing:{spacing}"));
         accounts.push(format!("token_a_program:{}", spl_token_prog));
+        append_orca_tick_array_prefixes_for_leg(pool, &mut accounts, tick, spacing, token_mint);
         accounts
     }
 
@@ -3320,7 +3377,8 @@ mod tests {
             "active_id:-281".to_string(),
             "bin_step:10".to_string(),
         ];
-        let sell_accounts = orca_pool_accounts_without_tick(sell_pool, token_mint, sol_mint);
+        let mut sell_accounts = orca_pool_accounts_without_tick(sell_pool, token_mint, sol_mint);
+        append_orca_tick_array_prefixes_for_leg(sell_pool, &mut sell_accounts, -624, 8, token_mint);
 
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
         let mut handler = CrossDexHandler::new(rpc, Some(wallet.pubkey())).with_pool_cache(cache);
