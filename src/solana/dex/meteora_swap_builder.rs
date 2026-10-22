@@ -396,8 +396,6 @@ impl MeteoraDlmmSwapBuilder {
         min_amount_out: u64,
         direction: SwapDirection,
         active_id: i32,
-        bin_array_bitmap: Option<[u64; 16]>,
-        bitmap_extension_payload: Option<&[u8]>,
         token_x_program: &Pubkey,
         token_y_program: &Pubkey,
     ) -> Result<Instruction> {
@@ -418,8 +416,8 @@ impl MeteoraDlmmSwapBuilder {
             active_id,
             0,
             BinArrayCoverage::ActiveOnly,
-            bin_array_bitmap,
-            bitmap_extension_payload,
+            None,
+            None,
         )
     }
 

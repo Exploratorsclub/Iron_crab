@@ -2438,6 +2438,7 @@ fn planned_explicit_pubkeys_for_pool_from_cache(
     state: &CachedPoolState,
     enable_meteora_cpmm: bool,
     enable_meteora_dlmm: bool,
+    meteora_bin_array_bitmap: Option<[u64; 16]>,
 ) -> Vec<Pubkey> {
     use std::collections::BTreeSet;
     let mut set = BTreeSet::new();
@@ -2462,7 +2463,7 @@ fn planned_explicit_pubkeys_for_pool_from_cache(
                         set.insert(pda);
                     }
                 }
-                if let Some(bitmap) = s.bin_array_bitmap {
+                if let Some(bitmap) = meteora_bin_array_bitmap {
                     if MeteoraDlmmSwapBuilder::needs_bitmap_extension_geyser_subscription(
                         &bitmap,
                         active_array_index,
@@ -3635,6 +3636,7 @@ impl MarketDataContext {
             &state,
             enable_meteora_cpmm,
             enable_meteora_dlmm,
+            self.live_pool_cache.meteora_dlmm_bin_array_bitmap(&pool),
         )
     }
 
@@ -14648,8 +14650,6 @@ mod discovery_tests {
             reserve_x_balance: None,
             reserve_y_balance: None,
             dlmm_bin_params_account_seeded: false,
-            bin_array_bitmap: None,
-            bitmap_extension_payload: None,
         };
         cache.upsert(p1, CachedPoolState::Meteora(on_x), 0);
         let on_y = MeteoraState {
@@ -14662,8 +14662,6 @@ mod discovery_tests {
             reserve_x_balance: None,
             reserve_y_balance: None,
             dlmm_bin_params_account_seeded: false,
-            bin_array_bitmap: None,
-            bitmap_extension_payload: None,
         };
         cache.upsert(p2, CachedPoolState::Meteora(on_y), 0);
         cache.upsert(
@@ -14678,8 +14676,6 @@ mod discovery_tests {
                 reserve_x_balance: None,
                 reserve_y_balance: None,
                 dlmm_bin_params_account_seeded: false,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             0,
         );
@@ -14768,8 +14764,6 @@ mod discovery_tests {
             reserve_x_balance: Some(1_000_000),
             reserve_y_balance: Some(50_000_000_000),
             dlmm_bin_params_account_seeded: true,
-            bin_array_bitmap: None,
-            bitmap_extension_payload: None,
         };
         assert_eq!(
             meteora_dlmm_readiness_for_pool_cache_update(&s),
@@ -14858,8 +14852,6 @@ mod discovery_tests {
                 reserve_x_balance: Some(1),
                 reserve_y_balance: Some(2),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             0,
         );
@@ -15947,7 +15939,7 @@ mod pr_b_geyser_tracking_tests {
             creator: Pubkey::new_unique(),
             cashback_enabled: false,
         });
-        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true, None);
         assert!(
             pubkeys.contains(&pool),
             "bonding curve (pool pubkey) must be in planned explicit set"
@@ -15966,7 +15958,7 @@ mod pr_b_geyser_tracking_tests {
                 Pubkey::new_unique(),
             ),
         );
-        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true, None);
         assert!(
             pubkeys.contains(&pool),
             "orca layout-seed row must plan pool pubkey for Geyser explicit"
@@ -15986,7 +15978,7 @@ mod pr_b_geyser_tracking_tests {
         orca.tick_current_index = 2048;
         orca.whirlpool_quote_account_seeded = true;
         let state = CachedPoolState::Orca(orca);
-        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true, None);
         let tick_pdas = ironcrab::solana::dex::orca_tick_array::planned_orca_tick_array_pubkeys(
             &pool, 2048, 64,
         );
@@ -16012,10 +16004,8 @@ mod pr_b_geyser_tracking_tests {
             reserve_x_balance: None,
             reserve_y_balance: None,
             dlmm_bin_params_account_seeded: false,
-            bin_array_bitmap: None,
-            bitmap_extension_payload: None,
         });
-        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true, None);
         assert!(
             pubkeys.contains(&pool),
             "DLMM with unseeded lbPair must still plan pool pubkey"
@@ -16043,7 +16033,7 @@ mod pr_b_geyser_tracking_tests {
             serum_base_vault: None,
             serum_quote_vault: None,
         });
-        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true, None);
         assert!(
             pubkeys.contains(&pool),
             "Raydium AMM MASTER row must plan pool pubkey for account decode"
@@ -21135,8 +21125,6 @@ mod pr_b_geyser_tracking_tests {
             reserve_x_balance: Some(1),
             reserve_y_balance: Some(2),
             dlmm_bin_params_account_seeded: false,
-            bin_array_bitmap: None,
-            bitmap_extension_payload: None,
         });
         ctx.live_pool_cache.upsert(pool, state.clone(), 1);
         ctx.hot_pool_registry.pin_arb_pool(pool);
@@ -21420,8 +21408,6 @@ mod pr_b_geyser_tracking_tests {
                 reserve_x_balance: Some(1_000_000),
                 reserve_y_balance: Some(2_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             10,
         );
@@ -23184,8 +23170,6 @@ mod pr_b_geyser_tracking_tests {
                 reserve_x_balance: Some(500_000),
                 reserve_y_balance: Some(1_500_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             99,
         );
@@ -23242,8 +23226,6 @@ mod pr_b_geyser_tracking_tests {
                 reserve_x_balance: Some(1),
                 reserve_y_balance: Some(1),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             1,
         );
@@ -23268,8 +23250,6 @@ mod pr_b_geyser_tracking_tests {
                 reserve_x_balance: Some(1),
                 reserve_y_balance: Some(1),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             2,
         );
@@ -26467,7 +26447,7 @@ mod pr_b_geyser_tracking_tests {
         };
         assert_eq!(s.pool_base_token_account, base_vault);
         assert_eq!(s.pool_quote_token_account, quote_vault);
-        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true);
+        let pubkeys = planned_explicit_pubkeys_for_pool_from_cache(pool, &state, true, true, None);
         assert!(pubkeys.contains(&pool));
         assert!(pubkeys.contains(&base_vault));
         assert!(pubkeys.contains(&quote_vault));
@@ -27026,8 +27006,6 @@ mod pr_b_geyser_tracking_tests {
             reserve_x_balance: Some(1),
             reserve_y_balance: Some(1),
             dlmm_bin_params_account_seeded: true,
-            bin_array_bitmap: None,
-            bitmap_extension_payload: None,
         })
     }
 

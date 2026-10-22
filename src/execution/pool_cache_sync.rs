@@ -28,10 +28,7 @@ use crate::execution::live_pool_cache::{
 use crate::ipc::{
     PoolCacheUpdate, PoolCacheUpdateType, NATIVE_SOL_MINT,
     POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY,
-    POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY,
-    POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY,
-    POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY,
-    POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY,
     POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY,
     POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY,
     POOL_CACHE_UPDATE_ORCA_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_ORCA_PROTOCOL_FEE_RATE_KEY,
@@ -41,18 +38,6 @@ use crate::ipc::{
     POOL_CACHE_UPDATE_RAYDIUM_CPMM_VAULTS_KEY,
 };
 use crate::nats::{slave_consumer_config, NatsClient, STREAM_NAME};
-
-fn decode_hex_payload(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    for i in (0..hex.len()).step_by(2) {
-        let byte = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
-        out.push(byte);
-    }
-    Some(out)
-}
 
 /// Extract base_reserve and quote_reserve from CachedPoolState (for merge logic).
 fn extract_reserves(state: &CachedPoolState) -> (u64, u64) {
@@ -327,15 +312,6 @@ fn build_minimal_pool_state_with_reserves(
                 })
                 .unwrap_or((base_mint, quote_mint, base_reserve, quote_reserve));
 
-            let bin_array_bitmap = meta
-                .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY))
-                .and_then(|s| {
-                    crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::parse_bin_array_bitmap_tag(s)
-                });
-            let bitmap_extension_payload = meta
-                .and_then(|m| m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY))
-                .and_then(|s| decode_hex_payload(s));
-
             CachedPoolState::Meteora(MeteoraState {
                 token_x_mint,
                 token_y_mint,
@@ -349,8 +325,6 @@ fn build_minimal_pool_state_with_reserves(
                     m.contains_key(POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY)
                         || m.contains_key(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY)
                 }),
-                bin_array_bitmap,
-                bitmap_extension_payload,
             })
         }
         "meteora_cpmm" => {
@@ -1232,25 +1206,6 @@ fn apply_pool_cache_update_outcome_inner(
                             }
                             if ex.dlmm_bin_params_account_seeded {
                                 new_m.dlmm_bin_params_account_seeded = true;
-                            }
-                            if um
-                                .and_then(|m| {
-                                    m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY)
-                                })
-                                .is_none()
-                            {
-                                new_m.bin_array_bitmap = ex.bin_array_bitmap;
-                            }
-                            if um
-                                .and_then(|m| {
-                                    m.get(
-                                        POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY,
-                                    )
-                                })
-                                .is_none()
-                            {
-                                new_m.bitmap_extension_payload =
-                                    ex.bitmap_extension_payload.clone();
                             }
                         }
                     }

@@ -477,8 +477,6 @@ impl PoolLayoutKeys {
                 reserve_x_balance: None,
                 reserve_y_balance: None,
                 dlmm_bin_params_account_seeded: false,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             PoolLayoutKeys::RaydiumAmm {
                 base_mint,

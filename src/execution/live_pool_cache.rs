@@ -251,10 +251,6 @@ pub struct MeteoraState {
     pub reserve_y_balance: Option<u64>,
     /// Account/Geyser pool parse populated DLMM bin parameters — never true for TX layout-only seed.
     pub dlmm_bin_params_account_seeded: bool,
-    /// Internal LB-pair bin-array bitmap (`[u64; 16]` at offset 584). `None` = unknown (cannot build swap).
-    pub bin_array_bitmap: Option<[u64; 16]>,
-    /// Extension account payload bytes `[40, 1576)` when observed on Geyser.
-    pub bitmap_extension_payload: Option<Vec<u8>>,
 }
 
 /// TX layout-only Meteora DLMM row: reserve vault pubkeys/mints only; bin params unset (not SSOT).
@@ -275,8 +271,6 @@ pub fn meteora_dlmm_tx_layout_seed(
         reserve_x_balance: None,
         reserve_y_balance: None,
         dlmm_bin_params_account_seeded: false,
-        bin_array_bitmap: None,
-        bitmap_extension_payload: None,
     }
 }
 
@@ -292,8 +286,6 @@ impl From<DlmmPool> for MeteoraState {
             reserve_x_balance: None,
             reserve_y_balance: None,
             dlmm_bin_params_account_seeded: true,
-            bin_array_bitmap: None,
-            bitmap_extension_payload: None,
         }
     }
 }
@@ -660,12 +652,6 @@ pub fn merge_account_parse_preserves_existing(
             if ex.dlmm_bin_params_account_seeded {
                 inc.dlmm_bin_params_account_seeded = true;
             }
-            if inc.bin_array_bitmap.is_none() {
-                inc.bin_array_bitmap = ex.bin_array_bitmap;
-            }
-            if inc.bitmap_extension_payload.is_none() {
-                inc.bitmap_extension_payload = ex.bitmap_extension_payload.clone();
-            }
             CachedPoolState::Meteora(inc)
         }
         (CachedPoolState::MeteoraCpmm(ex), CachedPoolState::MeteoraCpmm(mut inc)) => {
@@ -784,6 +770,12 @@ pub struct LivePoolCache {
     /// Side map (not in [`MeteoraState`]) so Level-5 eval struct literals stay stable.
     meteora_dlmm_has_bitmap_extension_by_pool: DashMap<Pubkey, bool>,
 
+    /// Meteora DLMM LB-pair internal bin-array bitmap (16 words @ offset 584). Not in [`MeteoraState`].
+    meteora_dlmm_bin_array_bitmap_by_pool: DashMap<Pubkey, [u64; 16]>,
+
+    /// Meteora DLMM `BinArrayBitmapExtension` payload bytes `[40, 1576)`.
+    meteora_dlmm_bitmap_extension_payload_by_pool: DashMap<Pubkey, Vec<u8>>,
+
     /// PumpSwap pool-market → extended `sell` layout observed on-chain (Scope 46).
     /// **Not** part of [`PumpAmmState`] so external crates (Level-5 eval) keep stable struct literals.
     /// Monotonic flag: once true, never cleared.
@@ -847,6 +839,8 @@ impl LivePoolCache {
             orca_readiness_by_pool: DashMap::new(),
             meteora_dlmm_readiness_by_pool: DashMap::new(),
             meteora_dlmm_has_bitmap_extension_by_pool: DashMap::new(),
+            meteora_dlmm_bin_array_bitmap_by_pool: DashMap::new(),
+            meteora_dlmm_bitmap_extension_payload_by_pool: DashMap::new(),
             pump_amm_sell_extended_flag_by_market: DashMap::new(),
             pump_amm_sell_extended_third_meta_by_market: DashMap::new(),
             pump_amm_sell_extended_tail_0_by_market: DashMap::new(),
@@ -1701,7 +1695,41 @@ impl LivePoolCache {
             .map(|v| *v)
     }
 
-    /// JetStream / Geyser metadata: merge bitmap-extension existence into side map.
+    pub fn set_meteora_dlmm_bin_array_bitmap(&self, pool: &Pubkey, bitmap: [u64; 16]) {
+        self.meteora_dlmm_bin_array_bitmap_by_pool
+            .insert(*pool, bitmap);
+    }
+
+    pub fn meteora_dlmm_bin_array_bitmap(&self, pool: &Pubkey) -> Option<[u64; 16]> {
+        self.meteora_dlmm_bin_array_bitmap_by_pool
+            .get(pool)
+            .map(|v| *v)
+    }
+
+    /// Geyser: store extension payload (bytes 40..1576 of extension account).
+    pub fn set_meteora_dlmm_bitmap_extension_payload(&self, pool: &Pubkey, payload: Vec<u8>) {
+        self.meteora_dlmm_bitmap_extension_payload_by_pool
+            .insert(*pool, payload);
+    }
+
+    pub fn meteora_dlmm_bitmap_extension_payload(&self, pool: &Pubkey) -> Option<Vec<u8>> {
+        self.meteora_dlmm_bitmap_extension_payload_by_pool
+            .get(pool)
+            .map(|v| v.clone())
+    }
+
+    /// LB pair account parse (904 bytes): internal bitmap words at offset 584.
+    pub fn ingest_meteora_dlmm_lb_pair_bitmap_from_account_data(&self, pool: &Pubkey, data: &[u8]) {
+        if let Some(bitmap) =
+            crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::parse_lb_pair_internal_bitmap(
+                data,
+            )
+        {
+            self.set_meteora_dlmm_bin_array_bitmap(pool, bitmap);
+        }
+    }
+
+    /// JetStream / Geyser metadata: merge DLMM bitmap side maps (missing keys do not clear existing).
     pub fn merge_meteora_dlmm_bitmap_extension_from_metadata(
         &self,
         pool: &Pubkey,
@@ -1720,37 +1748,16 @@ impl LivePoolCache {
                 self.set_meteora_dlmm_has_bitmap_extension(pool, has_extension);
             }
         }
-        if let Some(entry) = self.pools.get(pool) {
-            if let CachedPoolState::Meteora(mut state) = entry.state.clone() {
-                if let Some(tag) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY) {
-                    if let Some(bitmap) =
-                        crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::parse_bin_array_bitmap_tag(tag)
-                    {
-                        state.bin_array_bitmap = Some(bitmap);
-                    }
-                }
-                if let Some(hex) =
-                    m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY)
-                {
-                    if let Some(payload) = decode_meteora_extension_payload_hex(hex) {
-                        state.bitmap_extension_payload = Some(payload);
-                    }
-                }
-                let slot = entry.slot;
-                drop(entry);
-                self.upsert(*pool, CachedPoolState::Meteora(state), slot);
+        if let Some(tag) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY) {
+            if let Some(bitmap) =
+                crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::parse_bin_array_bitmap_tag(tag)
+            {
+                self.set_meteora_dlmm_bin_array_bitmap(pool, bitmap);
             }
         }
-    }
-
-    /// Geyser: store extension payload on the Meteora pool row (bytes 40..1576).
-    pub fn set_meteora_dlmm_bitmap_extension_payload(&self, pool: &Pubkey, payload: Vec<u8>) {
-        if let Some(entry) = self.pools.get(pool) {
-            if let CachedPoolState::Meteora(mut state) = entry.state.clone() {
-                state.bitmap_extension_payload = Some(payload);
-                let slot = entry.slot;
-                drop(entry);
-                self.upsert(*pool, CachedPoolState::Meteora(state), slot);
+        if let Some(hex) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY) {
+            if let Some(payload) = decode_meteora_extension_payload_hex(hex) {
+                self.set_meteora_dlmm_bitmap_extension_payload(pool, payload);
             }
         }
     }
@@ -2988,12 +2995,7 @@ fn parse_meteora_dlmm(data: &[u8]) -> Option<CachedPoolState> {
     }
 
     let parsed = DlmmPool::parse(data).ok()?;
-    let mut state = MeteoraState::from(parsed);
-    state.bin_array_bitmap =
-        crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::parse_lb_pair_internal_bitmap(
-            data,
-        );
-    Some(CachedPoolState::Meteora(state))
+    Some(CachedPoolState::Meteora(MeteoraState::from(parsed)))
 }
 
 fn parse_meteora_cpmm(data: &[u8]) -> Option<CachedPoolState> {
@@ -4060,8 +4062,6 @@ mod tests {
                 reserve_x_balance: Some(5_000_000_000),
                 reserve_y_balance: Some(10_000_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             100,
         );
@@ -5754,8 +5754,6 @@ mod tests {
             reserve_x_balance,
             reserve_y_balance,
             dlmm_bin_params_account_seeded: true,
-            bin_array_bitmap: None,
-            bitmap_extension_payload: None,
         }
     }
 

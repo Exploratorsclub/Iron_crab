@@ -700,7 +700,7 @@ impl CrossDexHandler {
                     format!("active_id:{}", meteora_state.active_id),
                     format!("bin_step:{}", meteora_state.bin_step),
                 ];
-                if let Some(bitmap) = meteora_state.bin_array_bitmap {
+                if let Some(bitmap) = cache.meteora_dlmm_bin_array_bitmap(pool_pk) {
                     accounts.push(format!(
                         "bin_array_bitmap:{}",
                         crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::format_bin_array_bitmap_tag(
@@ -708,7 +708,7 @@ impl CrossDexHandler {
                         )
                     ));
                 }
-                if let Some(payload) = &meteora_state.bitmap_extension_payload {
+                if let Some(payload) = cache.meteora_dlmm_bitmap_extension_payload(pool_pk) {
                     accounts.push(format!(
                         "bitmap_extension_hex:{}",
                         payload
@@ -1992,11 +1992,10 @@ mod tests {
                 reserve_x_balance: Some(50_000_000_000),
                 reserve_y_balance: Some(1_000_000_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: Some(bitmap),
-                bitmap_extension_payload: None,
             }),
             100,
         );
+        cache.set_meteora_dlmm_bin_array_bitmap(&buy_pool, bitmap);
         cache.set_meteora_dlmm_has_bitmap_extension(&buy_pool, true);
         let sell_pool_accounts = pump_amm_v14_pool_accounts(sell_pool, token_mint);
         cache.upsert(
@@ -2574,11 +2573,11 @@ mod tests {
                 reserve_x_balance: Some(50_000_000_000),
                 reserve_y_balance: Some(1_000_000_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: Some(meteora_test_bitmap_for_active_id(-281)),
-                bitmap_extension_payload: None,
             }),
             100,
         );
+        cache
+            .set_meteora_dlmm_bin_array_bitmap(&sell_pool, meteora_test_bitmap_for_active_id(-281));
         cache.set_meteora_dlmm_has_bitmap_extension(&sell_pool, true);
 
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
@@ -2700,11 +2699,11 @@ mod tests {
                 reserve_x_balance: Some(50_000_000_000),
                 reserve_y_balance: Some(1_000_000_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: Some([0u64; 16]),
-                bitmap_extension_payload: Some(ext),
             }),
             100,
         );
+        cache.set_meteora_dlmm_bin_array_bitmap(&buy_pool, [0u64; 16]);
+        cache.set_meteora_dlmm_bitmap_extension_payload(&buy_pool, ext);
         let sell_pool_accounts = pump_amm_v14_pool_accounts(sell_pool, token_mint);
         cache.upsert(
             sell_pool,
@@ -2918,11 +2917,11 @@ mod tests {
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(50_000_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: Some(meteora_test_bitmap_for_active_id(-281)),
-                bitmap_extension_payload: None,
             }),
             100,
         );
+        cache
+            .set_meteora_dlmm_bin_array_bitmap(&sell_pool, meteora_test_bitmap_for_active_id(-281));
     }
 
     fn orca_buy_pool_accounts_with_tick(
@@ -3128,11 +3127,11 @@ mod tests {
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(50_000_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: Some(meteora_test_bitmap_for_active_id(-281)),
-                bitmap_extension_payload: None,
             }),
             100,
         );
+        cache
+            .set_meteora_dlmm_bin_array_bitmap(&sell_pool, meteora_test_bitmap_for_active_id(-281));
 
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
         let mut handler = CrossDexHandler::new(rpc, Some(wallet.pubkey())).with_pool_cache(cache);
@@ -3514,11 +3513,10 @@ mod tests {
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(50_000_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: Some(meteora_test_bitmap_for_active_id(-281)),
-                bitmap_extension_payload: None,
             }),
             100,
         );
+        cache.set_meteora_dlmm_bin_array_bitmap(&buy_pool, meteora_test_bitmap_for_active_id(-281));
         cache.upsert(sell_pool, CachedPoolState::Orca(orca_state), 100);
     }
 
@@ -3686,11 +3684,10 @@ mod tests {
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(50_000_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: Some(meteora_test_bitmap_for_active_id(-281)),
-                bitmap_extension_payload: None,
             }),
             100,
         );
+        cache.set_meteora_dlmm_bin_array_bitmap(&buy_pool, meteora_test_bitmap_for_active_id(-281));
 
         let buy_accounts = vec![
             buy_pool.to_string(),

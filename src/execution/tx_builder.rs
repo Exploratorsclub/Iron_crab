@@ -2421,8 +2421,6 @@ mod tests {
             reserve_x_balance: Some(1),
             reserve_y_balance: Some(2),
             dlmm_bin_params_account_seeded: true,
-            bin_array_bitmap: None,
-            bitmap_extension_payload: None,
         };
         assert!(super::meteora_dlmm_cache_state_injectable(&s));
     }
@@ -2439,8 +2437,6 @@ mod tests {
             reserve_x_balance: Some(1),
             reserve_y_balance: Some(2),
             dlmm_bin_params_account_seeded: true,
-            bin_array_bitmap: None,
-            bitmap_extension_payload: None,
         };
         assert!(!super::meteora_dlmm_cache_state_injectable(&s));
     }

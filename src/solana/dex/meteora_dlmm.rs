@@ -203,11 +203,19 @@ impl MeteoraDlmm {
                 entry.pool.bin_step = state.bin_step;
                 entry.reserve_x_balance = state.reserve_x_balance;
                 entry.reserve_y_balance = state.reserve_y_balance;
-                if state.bin_array_bitmap.is_some() {
-                    entry.bin_array_bitmap = state.bin_array_bitmap;
+                if let Some(bitmap) = self
+                    .live_pool_cache
+                    .as_ref()
+                    .and_then(|c| c.meteora_dlmm_bin_array_bitmap(pool_address))
+                {
+                    entry.bin_array_bitmap = Some(bitmap);
                 }
-                if state.bitmap_extension_payload.is_some() {
-                    entry.bitmap_extension_payload = state.bitmap_extension_payload.clone();
+                if let Some(payload) = self
+                    .live_pool_cache
+                    .as_ref()
+                    .and_then(|c| c.meteora_dlmm_bitmap_extension_payload(pool_address))
+                {
+                    entry.bitmap_extension_payload = Some(payload);
                 }
                 entry.last_updated = std::time::SystemTime::now();
             }
@@ -227,13 +235,21 @@ impl MeteoraDlmm {
             token_y_program: None,
         };
 
+        let bin_array_bitmap = self
+            .live_pool_cache
+            .as_ref()
+            .and_then(|c| c.meteora_dlmm_bin_array_bitmap(pool_address));
+        let bitmap_extension_payload = self
+            .live_pool_cache
+            .as_ref()
+            .and_then(|c| c.meteora_dlmm_bitmap_extension_payload(pool_address));
         let cache_entry = PoolCache {
             address: *pool_address,
             pool,
             reserve_x_balance: state.reserve_x_balance,
             reserve_y_balance: state.reserve_y_balance,
-            bin_array_bitmap: state.bin_array_bitmap,
-            bitmap_extension_payload: state.bitmap_extension_payload.clone(),
+            bin_array_bitmap,
+            bitmap_extension_payload,
             last_updated: std::time::SystemTime::now(),
         };
 
@@ -698,6 +714,7 @@ impl Dex for MeteoraDlmm {
             token_y_program: None,
         };
 
+        let extension_for_live_cache = bitmap_extension_payload.clone();
         let cache = PoolCache {
             address: pool_pk,
             pool: pool.clone(),
@@ -718,6 +735,14 @@ impl Dex for MeteoraDlmm {
         );
 
         self.pools.insert(pool_pk, cache);
+        if let Some(ref lpc) = self.live_pool_cache {
+            if let Some(bitmap) = bin_array_bitmap {
+                lpc.set_meteora_dlmm_bin_array_bitmap(&pool_pk, bitmap);
+            }
+            if let Some(payload) = extension_for_live_cache {
+                lpc.set_meteora_dlmm_bitmap_extension_payload(&pool_pk, payload);
+            }
+        }
 
         // Update mint index
         self.mint_index
@@ -941,27 +966,13 @@ impl Dex for MeteoraDlmm {
         let bin_array_bitmap = pool_cache.bin_array_bitmap.or_else(|| {
             self.live_pool_cache
                 .as_ref()
-                .and_then(|c| c.get(&pool_addr))
-                .and_then(|s| {
-                    if let crate::execution::live_pool_cache::CachedPoolState::Meteora(m) = s {
-                        m.bin_array_bitmap
-                    } else {
-                        None
-                    }
-                })
+                .and_then(|c| c.meteora_dlmm_bin_array_bitmap(&pool_addr))
         });
         let bitmap_extension_payload: Option<Vec<u8>> =
             pool_cache.bitmap_extension_payload.clone().or_else(|| {
                 self.live_pool_cache
                     .as_ref()
-                    .and_then(|c| c.get(&pool_addr))
-                    .and_then(|s| {
-                        if let crate::execution::live_pool_cache::CachedPoolState::Meteora(m) = s {
-                            m.bitmap_extension_payload.clone()
-                        } else {
-                            None
-                        }
-                    })
+                    .and_then(|c| c.meteora_dlmm_bitmap_extension_payload(&pool_addr))
             });
 
         let bin_array_coverage = {

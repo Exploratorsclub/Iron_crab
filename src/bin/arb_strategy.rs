@@ -12772,8 +12772,6 @@ mod two_hop_price_tests {
                 reserve_x_balance: Some(1_000_000),
                 reserve_y_balance: Some(2_000_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             10,
         );
@@ -12962,8 +12960,6 @@ mod two_hop_price_tests {
                 reserve_x_balance: Some(500_000),
                 reserve_y_balance: Some(1_500_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             5,
         );
@@ -13011,8 +13007,6 @@ mod two_hop_price_tests {
                 reserve_x_balance: Some(800_000),
                 reserve_y_balance: Some(2_000_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             50,
         );
@@ -13080,8 +13074,6 @@ mod two_hop_price_tests {
                 reserve_x_balance: Some(1),
                 reserve_y_balance: Some(1),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             1,
         );
@@ -17409,8 +17401,6 @@ mod pool_accounts_coverage_tests {
                 reserve_x_balance: Some(1_000_000_000),
                 reserve_y_balance: Some(2_000_000_000),
                 dlmm_bin_params_account_seeded: true,
-                bin_array_bitmap: None,
-                bitmap_extension_payload: None,
             }),
             1,
         );
