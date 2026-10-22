@@ -235,15 +235,24 @@ impl MeteoraDlmmSwapBuilder {
         word & (1u64 << b) != 0
     }
 
+    /// First extension bin-array index to scan when the internal bitmap has no bit in `direction`.
+    fn extension_bin_array_search_start(active_array_index: i64, direction: SwapDirection) -> i64 {
+        match direction {
+            SwapDirection::YtoX => active_array_index.max(512),
+            SwapDirection::XtoY => active_array_index.min(-513),
+        }
+    }
+
     fn collect_extension_bin_array_indices(
         payload: &[u8],
+        active_array_index: i64,
         direction: SwapDirection,
         max: usize,
     ) -> Vec<i64> {
         let mut out = Vec::new();
         match direction {
             SwapDirection::YtoX => {
-                let mut idx = 512i64;
+                let mut idx = Self::extension_bin_array_search_start(active_array_index, direction);
                 while out.len() < max && idx < 10_000 {
                     if Self::extension_bitmap_has_bit(payload, idx) {
                         out.push(idx);
@@ -252,7 +261,7 @@ impl MeteoraDlmmSwapBuilder {
                 }
             }
             SwapDirection::XtoY => {
-                let mut idx = -513i64;
+                let mut idx = Self::extension_bin_array_search_start(active_array_index, direction);
                 while out.len() < max && idx > -10_000 {
                     if Self::extension_bitmap_has_bit(payload, idx) {
                         out.push(idx);
@@ -287,7 +296,7 @@ impl MeteoraDlmmSwapBuilder {
 
         let extension_pda = Self::derive_bitmap_extension_pda(lb_pair)?;
         let payload = extension_payload.ok_or_else(|| anyhow!("bitmap_extension_unknown"))?;
-        let indices = Self::collect_extension_bin_array_indices(payload, direction, 3);
+        let indices = Self::collect_extension_bin_array_indices(payload, start, direction, 3);
         if indices.is_empty() {
             return Err(anyhow!("bitmap_extension_unknown"));
         }
@@ -587,6 +596,27 @@ mod tests {
         b
     }
 
+    fn set_extension_bitmap_bit(payload: &mut [u8], index: i64) {
+        assert_eq!(payload.len(), METEORA_BITMAP_EXTENSION_PAYLOAD_LEN);
+        let (positive_side, page, bit) = if index >= 0 {
+            (true, index / 512 - 1, (index % 512) as u32)
+        } else {
+            let t = -(index + 1);
+            (false, t / 512 - 1, (t % 512) as u32)
+        };
+        let base = if positive_side {
+            page as usize * 64
+        } else {
+            768 + page as usize * 64
+        };
+        let limb = bit / 64;
+        let b = bit % 64;
+        let offset = base + limb as usize * 8;
+        let mut word = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
+        word |= 1u64 << b;
+        payload[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
+    }
+
     #[test]
     fn test_bin_array_index_calculation() {
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(0), 0);
@@ -730,6 +760,55 @@ mod tests {
         );
         let expected_first = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, 512).unwrap();
         assert_eq!(ix.accounts.last().unwrap().pubkey, expected_first);
+    }
+
+    #[test]
+    fn extension_ytox_starts_at_active_index_when_above_internal_range() {
+        let lb_pair = Pubkey::new_unique();
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let builder = MeteoraDlmmSwapBuilder::new(rpc);
+        let active_id = 600 * 70;
+        assert_eq!(
+            MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id),
+            600
+        );
+        let bitmap = [0u64; 16];
+        let mut ext = vec![0u8; METEORA_BITMAP_EXTENSION_PAYLOAD_LEN];
+        set_extension_bitmap_bit(&mut ext, 600);
+
+        let ix = builder
+            .build_swap_with_bins_sync_coverage(
+                &lb_pair,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
+                &Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
+                &Pubkey::new_unique(),
+                1,
+                1,
+                SwapDirection::YtoX,
+                active_id,
+                10,
+                BinArrayCoverage::AdjacentThree,
+                Some(bitmap),
+                Some(&ext),
+            )
+            .expect("build");
+
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            MeteoraDlmmSwapBuilder::derive_bitmap_extension_pda(&lb_pair).unwrap()
+        );
+        let expected_first = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, 600).unwrap();
+        assert_eq!(ix.accounts.last().unwrap().pubkey, expected_first);
+        assert_ne!(
+            ix.accounts.last().unwrap().pubkey,
+            MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, 512).unwrap()
+        );
     }
 
     #[test]
