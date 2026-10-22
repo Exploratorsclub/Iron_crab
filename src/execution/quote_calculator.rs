@@ -897,6 +897,8 @@ mod tests {
             reserve_x_balance: Some(5_000_000_000_000),  // 5000 tokens
             reserve_y_balance: Some(10_000_000_000_000), // 10000 tokens
             dlmm_bin_params_account_seeded: true,
+            bin_array_bitmap: None,
+            bitmap_extension_payload: None,
         };
 
         let intent = create_test_intent(token_x, token_y, 50_000_000_000); // 50 token_x

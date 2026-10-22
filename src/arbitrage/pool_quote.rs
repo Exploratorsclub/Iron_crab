@@ -3063,6 +3063,8 @@ mod tests {
             reserve_x_balance: Some(1_000_000_000_000),
             reserve_y_balance: Some(1_010_000_000_000),
             dlmm_bin_params_account_seeded: true,
+            bin_array_bitmap: None,
+            bitmap_extension_payload: None,
         });
         let sol_in = DLMM_PROBE_SOL_LAMPORTS;
         let cp_out = cpmm_amount_out(

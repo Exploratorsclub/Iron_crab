@@ -2,18 +2,8 @@
 //!
 //! GEYSER-FIRST: Builds swap instructions using only cached data from Geyser.
 //! NO RPC CALLS IN HOT PATH!
-//!
-//! The active_id and pool state come from LivePoolCache (Geyser subscription).
-//! Bin array PDAs are derived deterministically - if they don't exist,
-//! TX simulation will fail with a clear error.
-//!
-//! Key accounts:
-//! - `bin_array_bitmap_extension`: optional PDA when pool has extended bin-array bitmap
-//!   Seeds: ["bitmap", lb_pair.as_ref()] (official Meteora DLMM)
-//! - `bin_arrays`: PDAs derived from active_id (3 arrays: active-1, active, active+1)
-//!   Seeds: ["bin_array", lb_pair.as_ref(), &index.to_le_bytes()]
 
-use anyhow::{ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -22,53 +12,69 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::solana::rpc::SolanaRpc;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// SPL Token program ID
 pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
+/// Token-2022 program ID
+pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+/// Wrapped SOL mint
+pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Memo program (swap2)
+/// SPL Memo program v2 (Meteora `swap2` remaining account).
+pub const MEMO_PROGRAM: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+
 /// Meteora DLMM program ID
 pub const METEORA_DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
-/// Instruction discriminator for swap (first 8 bytes of instruction data)
-/// Anchor: sha256("global:swap")[0..8]
+/// Instruction discriminator for legacy swap
 const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+
+/// Instruction discriminator for swap2 (Token-2022 / memo)
+const SWAP2_DISCRIMINATOR: [u8; 8] = [0x41, 0x4b, 0x3f, 0x4c, 0xeb, 0x5b, 0x5b, 0x88];
+
+/// LB pair internal bitmap offset and size
+pub const LB_PAIR_BIN_ARRAY_BITMAP_OFFSET: usize = 584;
+pub const LB_PAIR_BIN_ARRAY_BITMAP_WORDS: usize = 16;
+
+/// Internal bin-array index range covered by the LB pair bitmap
+pub const INTERNAL_BITMAP_INDEX_MIN: i64 = -512;
+pub const INTERNAL_BITMAP_INDEX_MAX: i64 = 511;
+
+/// Extension account payload (bytes 40..1576)
+pub const METEORA_BITMAP_EXTENSION_PAYLOAD_LEN: usize = 1536;
 
 /// Swap direction
 #[derive(Debug, Clone, Copy)]
 pub enum SwapDirection {
-    /// Swap X for Y (buy Y with X)
+    /// Swap X for Y (buy Y with X) — search toward smaller array indices
     XtoY,
-    /// Swap Y for X (buy X with Y)
+    /// Swap Y for X (buy X with Y) — search toward larger array indices
     YtoX,
 }
 
 /// Bin-array coverage for DLMM swap remaining accounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinArrayCoverage {
-    /// Active bin array only — for size-constrained atomic bundles (small swaps).
     ActiveOnly,
-    /// Active ± 1 — default for general swaps.
     AdjacentThree,
 }
 
-/// Extra-data key for [`MeteoraDlmm`] bin-array coverage (cross-dex atomic bundles).
 pub const METEORA_BIN_ARRAY_COVERAGE_KEY: &str = "bin_array_coverage";
-/// Value: use [`BinArrayCoverage::ActiveOnly`] for minimal TX size.
 pub const METEORA_BIN_ARRAY_COVERAGE_ACTIVE_ONLY: &str = "active_only";
 
-/// Extra-data key: pool has on-chain `BinArrayBitmapExtension` (`"true"` / `"false"`).
+/// Extra-data key: pool has on-chain `BinArrayBitmapExtension` (metadata only; not used for account #1).
 pub const METEORA_HAS_BITMAP_EXTENSION_KEY: &str = "has_bitmap_extension";
 
-/// Anchor discriminator for `BinArrayBitmapExtension` (Meteora DLMM).
 pub const METEORA_BITMAP_EXTENSION_DISCRIMINATOR: [u8; 8] = [80, 111, 124, 113, 55, 237, 18, 5];
-
-/// On-chain account size: 8 + 32 + (12 * 8 * 8) * 2 bitmap planes.
 pub const METEORA_BITMAP_EXTENSION_ACCOUNT_SIZE: usize = 1576;
 
 /// Builder for Meteora DLMM swap instructions (GEYSER-FIRST: no RPC in hot path)
 pub struct MeteoraDlmmSwapBuilder {
-    #[allow(dead_code)] // RPC kept for potential future use outside hot path
+    #[allow(dead_code)]
     rpc: Arc<SolanaRpc>,
 }
 
@@ -77,10 +83,6 @@ impl MeteoraDlmmSwapBuilder {
         Self { rpc }
     }
 
-    /// Derive the bin_array_bitmap_extension PDA for a pool
-    ///
-    /// Required when the pool has initialized `BinArrayBitmapExtension` on-chain.
-    /// Seeds: ["bitmap", lb_pair.as_ref()] (official Meteora DLMM IDL).
     pub fn derive_bitmap_extension_pda(lb_pair: &Pubkey) -> Result<Pubkey> {
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
         let (pda, _bump) =
@@ -88,23 +90,45 @@ impl MeteoraDlmmSwapBuilder {
         Ok(pda)
     }
 
-    /// Resolve account #1 (`bin_array_bitmap_extension`) for swap instructions.
-    ///
-    /// - `Some(true)` → derived bitmap-extension PDA (pool has extension on-chain)
-    /// - `Some(false)` | `None` → program_id placeholder (safe default per Meteora SDK)
-    pub fn resolve_bin_array_bitmap_extension(
-        lb_pair: &Pubkey,
-        has_bitmap_extension: Option<bool>,
-    ) -> Result<Pubkey> {
-        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
-        if has_bitmap_extension == Some(true) {
-            Self::derive_bitmap_extension_pda(lb_pair)
-        } else {
-            Ok(program_id)
+    /// Parse internal `[u64; 16]` bitmap from LB pair account bytes (offset 584).
+    pub fn parse_lb_pair_internal_bitmap(data: &[u8]) -> Option<[u64; 16]> {
+        if data.len() < LB_PAIR_BIN_ARRAY_BITMAP_OFFSET + LB_PAIR_BIN_ARRAY_BITMAP_WORDS * 8 {
+            return None;
         }
+        let mut words = [0u64; LB_PAIR_BIN_ARRAY_BITMAP_WORDS];
+        for (i, word) in words
+            .iter_mut()
+            .enumerate()
+            .take(LB_PAIR_BIN_ARRAY_BITMAP_WORDS)
+        {
+            let start = LB_PAIR_BIN_ARRAY_BITMAP_OFFSET + i * 8;
+            *word = u64::from_le_bytes(data[start..start + 8].try_into().ok()?);
+        }
+        Some(words)
     }
 
-    /// Parse parent LB pair from a Geyser `BinArrayBitmapExtension` account update.
+    /// Serialize bitmap words for cache tags / JetStream metadata.
+    pub fn format_bin_array_bitmap_tag(bitmap: &[u64; 16]) -> String {
+        bitmap
+            .iter()
+            .map(|w| w.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Parse `bin_array_bitmap:<16 comma-separated u64>` tag.
+    pub fn parse_bin_array_bitmap_tag(value: &str) -> Option<[u64; 16]> {
+        let mut words = [0u64; LB_PAIR_BIN_ARRAY_BITMAP_WORDS];
+        let parts: Vec<&str> = value.split(',').collect();
+        if parts.len() != LB_PAIR_BIN_ARRAY_BITMAP_WORDS {
+            return None;
+        }
+        for (i, p) in parts.iter().enumerate() {
+            words[i] = p.trim().parse().ok()?;
+        }
+        Some(words)
+    }
+
     pub fn parse_bitmap_extension_lb_pair(data: &[u8]) -> Option<Pubkey> {
         if data.len() < 40 {
             return None;
@@ -115,7 +139,17 @@ impl MeteoraDlmmSwapBuilder {
         Pubkey::try_from(&data[8..40]).ok()
     }
 
-    /// Heuristic: METEORA DLMM owner + bitmap-extension account layout.
+    /// Extract extension bitmap payload bytes `[40, 1576)`.
+    pub fn parse_bitmap_extension_payload(data: &[u8]) -> Option<Vec<u8>> {
+        if data.len() < METEORA_BITMAP_EXTENSION_ACCOUNT_SIZE {
+            return None;
+        }
+        if data[0..8] != METEORA_BITMAP_EXTENSION_DISCRIMINATOR {
+            return None;
+        }
+        Some(data[40..METEORA_BITMAP_EXTENSION_ACCOUNT_SIZE].to_vec())
+    }
+
     pub fn geyser_account_data_looks_like_meteora_bitmap_extension(
         owner: &Pubkey,
         data: &[u8],
@@ -128,31 +162,172 @@ impl MeteoraDlmmSwapBuilder {
             && data[0..8] == METEORA_BITMAP_EXTENSION_DISCRIMINATOR
     }
 
-    /// Patch swap instruction account #1 after build (cross-DEX / cache-aware path).
-    pub fn patch_swap_ix_bitmap_extension(
-        ix: &mut Instruction,
-        lb_pair: &Pubkey,
-        has_bitmap_extension: Option<bool>,
-    ) -> Result<()> {
-        let bitmap = Self::resolve_bin_array_bitmap_extension(lb_pair, has_bitmap_extension)?;
-        if ix.accounts.len() > 1 {
-            ix.accounts[1] = AccountMeta::new_readonly(bitmap, false);
+    pub fn internal_bitmap_has_bit(bitmap: &[u64; 16], array_index: i64) -> bool {
+        if !(INTERNAL_BITMAP_INDEX_MIN..=INTERNAL_BITMAP_INDEX_MAX).contains(&array_index) {
+            return false;
         }
-        Ok(())
+        let bit_pos = (array_index + 512) as u32;
+        let word = bit_pos / 64;
+        let bit = bit_pos % 64;
+        bitmap[word as usize] & (1u64 << bit) != 0
     }
 
-    /// Derive bin array PDAs for a given active_id (GEYSER-FIRST: no RPC!)
-    ///
-    /// Instead of checking which bin arrays exist via RPC, we simply derive
-    /// all potentially needed bin array PDAs and include them in the TX.
-    /// The Solana runtime will validate them. If a bin array doesn't exist,
-    /// the TX simulation will fail with a clear error - that's fine!
-    ///
-    /// Why this is correct:
-    /// - Geyser provides real-time active_id updates (faster than RPC)
-    /// - Bin array PDAs are deterministic (seed = [b"bin_array", lb_pair, index])
-    /// - Including a non-existent PDA causes simulation failure (not silent error)
-    /// - 3 bin arrays (active-1, active, active+1) cover typical swap ranges
+    /// Whether any initialized bin-array index exists in the internal bitmap along `direction` from `start` (inclusive).
+    pub fn internal_has_bit_in_direction(
+        bitmap: &[u64; 16],
+        start: i64,
+        direction: SwapDirection,
+    ) -> bool {
+        match direction {
+            SwapDirection::YtoX => {
+                for idx in start..=INTERNAL_BITMAP_INDEX_MAX {
+                    if Self::internal_bitmap_has_bit(bitmap, idx) {
+                        return true;
+                    }
+                }
+                false
+            }
+            SwapDirection::XtoY => {
+                for idx in (INTERNAL_BITMAP_INDEX_MIN..=start).rev() {
+                    if Self::internal_bitmap_has_bit(bitmap, idx) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Geyser subscribe to bitmap-extension PDA when either swap direction lacks an internal bitmap bit from active index.
+    pub fn needs_bitmap_extension_geyser_subscription(
+        bitmap: &[u64; 16],
+        active_array_index: i64,
+    ) -> bool {
+        !Self::internal_has_bit_in_direction(bitmap, active_array_index, SwapDirection::YtoX)
+            || !Self::internal_has_bit_in_direction(bitmap, active_array_index, SwapDirection::XtoY)
+    }
+
+    fn extension_bitmap_has_bit(payload: &[u8], index: i64) -> bool {
+        if payload.len() < METEORA_BITMAP_EXTENSION_PAYLOAD_LEN {
+            return false;
+        }
+        let (positive_side, page, bit) = if index >= 0 {
+            (true, index / 512 - 1, (index % 512) as u32)
+        } else {
+            let t = -(index + 1);
+            (false, t / 512 - 1, (t % 512) as u32)
+        };
+        if !(0..12).contains(&page) {
+            return false;
+        }
+        let base = if positive_side {
+            page as usize * 64
+        } else {
+            768 + page as usize * 64
+        };
+        let limb = bit / 64;
+        let b = bit % 64;
+        let offset = base + limb as usize * 8;
+        if offset + 8 > payload.len() {
+            return false;
+        }
+        let word = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap_or([0; 8]));
+        word & (1u64 << b) != 0
+    }
+
+    fn collect_extension_bin_array_indices(
+        payload: &[u8],
+        direction: SwapDirection,
+        max: usize,
+    ) -> Vec<i64> {
+        let mut out = Vec::new();
+        match direction {
+            SwapDirection::YtoX => {
+                let mut idx = 512i64;
+                while out.len() < max && idx < 10_000 {
+                    if Self::extension_bitmap_has_bit(payload, idx) {
+                        out.push(idx);
+                    }
+                    idx += 1;
+                }
+            }
+            SwapDirection::XtoY => {
+                let mut idx = -513i64;
+                while out.len() < max && idx > -10_000 {
+                    if Self::extension_bitmap_has_bit(payload, idx) {
+                        out.push(idx);
+                    }
+                    idx -= 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve account #1 and bin-array remaining accounts from cached bitmap + optional extension payload.
+    pub fn resolve_bitmap_swap_accounts(
+        lb_pair: &Pubkey,
+        bitmap: &[u64; 16],
+        extension_payload: Option<&[u8]>,
+        active_id: i32,
+        direction: SwapDirection,
+        bin_array_coverage: BinArrayCoverage,
+    ) -> Result<(Pubkey, Vec<Pubkey>)> {
+        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
+        let start = Self::bin_id_to_bin_array_index(active_id);
+
+        if Self::internal_has_bit_in_direction(bitmap, start, direction) {
+            let bin_arrays = Self::derive_bin_arrays_for_active_id_with_coverage(
+                lb_pair,
+                active_id,
+                bin_array_coverage,
+            )?;
+            return Ok((program_id, bin_arrays));
+        }
+
+        let extension_pda = Self::derive_bitmap_extension_pda(lb_pair)?;
+        let payload = extension_payload.ok_or_else(|| anyhow!("bitmap_extension_unknown"))?;
+        let indices = Self::collect_extension_bin_array_indices(payload, direction, 3);
+        if indices.is_empty() {
+            return Err(anyhow!("bitmap_extension_unknown"));
+        }
+        let mut bin_arrays = Vec::with_capacity(indices.len());
+        for idx in indices {
+            bin_arrays.push(Self::derive_bin_array_pda(lb_pair, idx)?);
+        }
+        Ok((extension_pda, bin_arrays))
+    }
+
+    pub fn resolve_token_program_for_mint(
+        mint: &Pubkey,
+        extra_data_value: Option<&str>,
+        pool_field: Option<Pubkey>,
+    ) -> Result<Pubkey> {
+        let tokenkeg = Pubkey::from_str(TOKEN_PROGRAM)?;
+        let token_2022 = Pubkey::from_str(TOKEN_2022_PROGRAM)?;
+        let wsol = Pubkey::from_str(WSOL_MINT)?;
+
+        let is_valid = |p: &Pubkey| *p == tokenkeg || *p == token_2022;
+
+        if let Some(s) = extra_data_value {
+            let p = Pubkey::from_str(s)?;
+            if is_valid(&p) {
+                return Ok(p);
+            }
+            return Err(anyhow!("token_program_unknown"));
+        }
+        if let Some(p) = pool_field {
+            if is_valid(&p) {
+                return Ok(p);
+            }
+            return Err(anyhow!("token_program_unknown"));
+        }
+        if *mint == wsol {
+            return Ok(tokenkeg);
+        }
+        Err(anyhow!("token_program_unknown"))
+    }
+
     pub fn derive_bin_arrays_for_active_id(
         lb_pair: &Pubkey,
         active_id: i32,
@@ -164,7 +339,6 @@ impl MeteoraDlmmSwapBuilder {
         )
     }
 
-    /// Derive bin-array PDAs with explicit coverage (GEYSER-FIRST: no RPC).
     pub fn derive_bin_arrays_for_active_id_with_coverage(
         lb_pair: &Pubkey,
         active_id: i32,
@@ -183,8 +357,7 @@ impl MeteoraDlmmSwapBuilder {
 
         let mut bin_arrays = Vec::with_capacity(indices.len());
         for index in indices {
-            let pda = Self::derive_bin_array_pda(lb_pair, index)?;
-            bin_arrays.push(pda);
+            bin_arrays.push(Self::derive_bin_array_pda(lb_pair, index)?);
         }
 
         debug!(
@@ -199,10 +372,6 @@ impl MeteoraDlmmSwapBuilder {
         Ok(bin_arrays)
     }
 
-    /// Build a swap instruction for Meteora DLMM
-    ///
-    /// # Arguments
-    /// * `has_bitmap_extension` - Geyser-tracked extension existence (`None` → program_id placeholder)
     #[allow(clippy::too_many_arguments)]
     pub fn build_swap(
         &self,
@@ -218,72 +387,33 @@ impl MeteoraDlmmSwapBuilder {
         min_amount_out: u64,
         direction: SwapDirection,
         active_id: i32,
-        has_bitmap_extension: Option<bool>,
+        bin_array_bitmap: Option<[u64; 16]>,
+        bitmap_extension_payload: Option<&[u8]>,
+        token_x_program: &Pubkey,
+        token_y_program: &Pubkey,
     ) -> Result<Instruction> {
-        ensure!(amount_in > 0, "Amount in must be positive");
-        ensure!(min_amount_out > 0, "Min amount out must be positive");
-
-        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
-        let token_program = Pubkey::from_str(TOKEN_PROGRAM)?;
-
-        let bin_array_bitmap_extension =
-            Self::resolve_bin_array_bitmap_extension(lb_pair, has_bitmap_extension)?;
-
-        // Derive bin array PDA for active bin
-        let bin_array_index = Self::bin_id_to_bin_array_index(active_id);
-        let bin_array_pda = Self::derive_bin_array_pda(lb_pair, bin_array_index)?;
-
-        // Build instruction data
-        let mut data = Vec::with_capacity(24);
-        data.extend_from_slice(&SWAP_DISCRIMINATOR);
-        data.extend_from_slice(&amount_in.to_le_bytes());
-        data.extend_from_slice(&min_amount_out.to_le_bytes());
-
-        let (user_token_in, user_token_out) = match direction {
-            SwapDirection::XtoY => (user_token_x, user_token_y),
-            SwapDirection::YtoX => (user_token_y, user_token_x),
-        };
-
-        let (oracle, _) = Pubkey::find_program_address(&[b"oracle", lb_pair.as_ref()], &program_id);
-        let (event_authority, _) =
-            Pubkey::find_program_address(&[b"__event_authority"], &program_id);
-
-        let accounts = vec![
-            AccountMeta::new(*lb_pair, false),
-            AccountMeta::new_readonly(bin_array_bitmap_extension, false),
-            AccountMeta::new(*reserve_x, false),
-            AccountMeta::new(*reserve_y, false),
-            AccountMeta::new(*user_token_in, false),
-            AccountMeta::new(*user_token_out, false),
-            AccountMeta::new_readonly(*token_x_mint, false),
-            AccountMeta::new_readonly(*token_y_mint, false),
-            AccountMeta::new(oracle, false),
-            AccountMeta::new_readonly(program_id, false),
-            AccountMeta::new_readonly(*user, true),
-            AccountMeta::new_readonly(token_program, false),
-            AccountMeta::new_readonly(token_program, false),
-            AccountMeta::new_readonly(event_authority, false),
-            AccountMeta::new_readonly(program_id, false),
-            AccountMeta::new(bin_array_pda, false),
-        ];
-
-        Ok(Instruction {
-            program_id,
-            accounts,
-            data,
-        })
+        self.build_swap_with_bins_sync_coverage(
+            lb_pair,
+            reserve_x,
+            reserve_y,
+            user_token_x,
+            user_token_y,
+            token_x_mint,
+            token_y_mint,
+            token_x_program,
+            token_y_program,
+            user,
+            amount_in,
+            min_amount_out,
+            direction,
+            active_id,
+            0,
+            BinArrayCoverage::ActiveOnly,
+            bin_array_bitmap,
+            bitmap_extension_payload,
+        )
     }
 
-    /// Build a swap instruction with bin array accounts
-    ///
-    /// GEYSER-FIRST: This method uses the active_id from the LivePoolCache (via Geyser)
-    /// and derives bin array PDAs deterministically. NO RPC CALLS IN HOT PATH!
-    ///
-    /// The active_id from Geyser is MORE CURRENT than RPC (push vs pull).
-    /// Bin arrays are derived PDAs - if one doesn't exist, simulation will fail cleanly.
-    ///
-    /// CRITICAL: token_x_program and token_y_program must match the actual token programs
-    /// of the mints (SPL Token or Token-2022). Mismatch causes InvalidAccountData errors.
     #[allow(clippy::too_many_arguments)]
     pub fn build_swap_with_bins_sync(
         &self,
@@ -321,10 +451,10 @@ impl MeteoraDlmmSwapBuilder {
             _bin_step,
             BinArrayCoverage::AdjacentThree,
             None,
+            None,
         )
     }
 
-    /// Same as [`build_swap_with_bins_sync`] but with explicit bin-array coverage.
     #[allow(clippy::too_many_arguments)]
     pub fn build_swap_with_bins_sync_coverage(
         &self,
@@ -344,101 +474,74 @@ impl MeteoraDlmmSwapBuilder {
         active_id: i32,
         _bin_step: u16,
         bin_array_coverage: BinArrayCoverage,
-        has_bitmap_extension: Option<bool>,
+        bin_array_bitmap: Option<[u64; 16]>,
+        bitmap_extension_payload: Option<&[u8]>,
     ) -> Result<Instruction> {
         ensure!(amount_in > 0, "Amount in must be positive");
         ensure!(min_amount_out > 0, "Min amount out must be positive");
 
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
+        let token_2022_id = Pubkey::from_str(TOKEN_2022_PROGRAM)?;
+        let use_swap2 = *token_x_program == token_2022_id || *token_y_program == token_2022_id;
 
-        // Log token programs being used (important for Token-2022 debugging)
-        let token_2022_id = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?;
-        let x_is_2022 = token_x_program == &token_2022_id;
-        let y_is_2022 = token_y_program == &token_2022_id;
-        if x_is_2022 || y_is_2022 {
-            info!(
-                pool = %lb_pair,
-                token_x_program = %token_x_program,
-                token_y_program = %token_y_program,
-                x_is_token_2022 = x_is_2022,
-                y_is_token_2022 = y_is_2022,
-                "Meteora Swap Builder: using Token-2022 programs"
-            );
-        }
+        let bitmap = bin_array_bitmap.ok_or_else(|| anyhow!("bitmap_unknown"))?;
 
-        let active_array_index = Self::bin_id_to_bin_array_index(active_id);
-        info!(
-            pool = %lb_pair,
-            active_id = active_id,
-            active_array_index = active_array_index,
-            has_bitmap_extension = ?has_bitmap_extension,
-            "Meteora: building swap with active_id from Geyser cache (GEYSER-FIRST)"
-        );
-
-        let bin_array_bitmap_extension =
-            Self::resolve_bin_array_bitmap_extension(lb_pair, has_bitmap_extension)?;
-
-        // Derive bin array PDAs (GEYSER-FIRST: no RPC to check existence!)
-        // If a bin array doesn't exist, the TX simulation will fail with a clear error.
-        let bin_arrays = Self::derive_bin_arrays_for_active_id_with_coverage(
+        let (bin_array_bitmap_extension, bin_arrays) = Self::resolve_bitmap_swap_accounts(
             lb_pair,
+            &bitmap,
+            bitmap_extension_payload,
             active_id,
+            direction,
             bin_array_coverage,
         )?;
 
-        // Log the derived bin arrays for debugging
-        info!(
-            pool = %lb_pair,
-            bin_array_count = bin_arrays.len(),
-            bin_array_0 = %bin_arrays.first().map(|p| p.to_string()).unwrap_or_default(),
-            bin_array_1 = %bin_arrays.get(1).map(|p| p.to_string()).unwrap_or_default(),
-            bin_array_2 = %bin_arrays.get(2).map(|p| p.to_string()).unwrap_or_default(),
-            "Meteora: derived bin array PDAs (may not exist on-chain!)"
-        );
-
-        // Derive oracle PDA
         let (oracle, _) = Pubkey::find_program_address(&[b"oracle", lb_pair.as_ref()], &program_id);
-
-        // Derive event_authority PDA
         let (event_authority, _) =
             Pubkey::find_program_address(&[b"__event_authority"], &program_id);
 
-        // Build instruction data
-        let mut data = Vec::with_capacity(24);
-        data.extend_from_slice(&SWAP_DISCRIMINATOR);
-        data.extend_from_slice(&amount_in.to_le_bytes());
-        data.extend_from_slice(&min_amount_out.to_le_bytes());
-
-        // Build account list (matching official IDL order)
-        // CRITICAL: Accounts 4 and 5 are user_token_in and user_token_out, NOT x/y!
-        // The order depends on swap direction:
-        // - XtoY (sell Token for SOL): in=token_x, out=token_y
-        // - YtoX (buy Token with SOL): in=token_y (wSOL), out=token_x (Token)
         let (user_token_in, user_token_out) = match direction {
             SwapDirection::XtoY => (user_token_x, user_token_y),
             SwapDirection::YtoX => (user_token_y, user_token_x),
         };
 
+        let mut data = Vec::with_capacity(if use_swap2 { 28 } else { 24 });
+        if use_swap2 {
+            data.extend_from_slice(&SWAP2_DISCRIMINATOR);
+        } else {
+            data.extend_from_slice(&SWAP_DISCRIMINATOR);
+        }
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_amount_out.to_le_bytes());
+        if use_swap2 {
+            data.extend_from_slice(&[0u8; 4]);
+        }
+
         let mut accounts = vec![
-            AccountMeta::new(*lb_pair, false), // 0: LB Pair (writable)
-            AccountMeta::new_readonly(bin_array_bitmap_extension, false), // 1: bitmap extension (required if exists!)
-            AccountMeta::new(*reserve_x, false),                          // 2: Reserve X (writable)
-            AccountMeta::new(*reserve_y, false),                          // 3: Reserve Y (writable)
-            AccountMeta::new(*user_token_in, false), // 4: User token IN (writable) - depends on direction!
-            AccountMeta::new(*user_token_out, false), // 5: User token OUT (writable) - depends on direction!
-            AccountMeta::new_readonly(*token_x_mint, false), // 6: Token X mint
-            AccountMeta::new_readonly(*token_y_mint, false), // 7: Token Y mint
-            AccountMeta::new(oracle, false),          // 8: Oracle PDA (WRITABLE!)
-            AccountMeta::new_readonly(program_id, false), // 9: host_fee_in (optional)
-            AccountMeta::new_readonly(*user, true),   // 10: User (signer)
-            AccountMeta::new_readonly(*token_x_program, false), // 11: token_x_program (SPL Token OR Token-2022)
-            AccountMeta::new_readonly(*token_y_program, false), // 12: token_y_program (SPL Token OR Token-2022)
-            AccountMeta::new_readonly(event_authority, false),  // 13: Event authority
-            AccountMeta::new_readonly(program_id, false),       // 14: Program ID
+            AccountMeta::new(*lb_pair, false),
+            AccountMeta::new_readonly(bin_array_bitmap_extension, false),
+            AccountMeta::new(*reserve_x, false),
+            AccountMeta::new(*reserve_y, false),
+            AccountMeta::new(*user_token_in, false),
+            AccountMeta::new(*user_token_out, false),
+            AccountMeta::new_readonly(*token_x_mint, false),
+            AccountMeta::new_readonly(*token_y_mint, false),
+            AccountMeta::new(oracle, false),
+            AccountMeta::new_readonly(program_id, false),
+            AccountMeta::new_readonly(*user, true),
+            AccountMeta::new_readonly(*token_x_program, false),
+            AccountMeta::new_readonly(*token_y_program, false),
         ];
 
-        // Add bin array accounts as remaining accounts (writable)
-        // bin_arrays is now Vec<Pubkey> from fetch_bin_arrays_direct
+        if use_swap2 {
+            let memo = Pubkey::from_str(MEMO_PROGRAM)?;
+            accounts.push(AccountMeta::new_readonly(memo, false));
+            accounts.push(AccountMeta::new_readonly(event_authority, false));
+            accounts.push(AccountMeta::new_readonly(program_id, false));
+        } else {
+            accounts.push(AccountMeta::new_readonly(event_authority, false));
+            accounts.push(AccountMeta::new_readonly(program_id, false));
+        }
+
         for bin_array_pda in bin_arrays {
             accounts.push(AccountMeta::new(bin_array_pda, false));
         }
@@ -450,9 +553,6 @@ impl MeteoraDlmmSwapBuilder {
         })
     }
 
-    /// Derive bin array PDA for a given bin array index
-    ///
-    /// Seed format: [b"bin_array", lb_pair.as_ref(), &bin_array_index.to_le_bytes()]
     pub fn derive_bin_array_pda(lb_pair: &Pubkey, bin_array_index: i64) -> Result<Pubkey> {
         let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM)?;
 
@@ -468,17 +568,8 @@ impl MeteoraDlmmSwapBuilder {
         Ok(pda)
     }
 
-    /// Calculate which bin array index a bin ID belongs to
-    ///
-    /// Meteora DLMM uses bin arrays of fixed size (typically 70 bins per array).
-    /// Bin array index = floor(bin_id / BIN_ARRAY_SIZE)
-    ///
-    /// CRITICAL: Must use floor division for negative bin_ids!
-    /// - bin_id = -1:  floor(-1/70) = -1  (correct)
-    /// - bin_id = -1:  -1 / 70 = 0       (wrong! integer division truncates toward zero)
     pub fn bin_id_to_bin_array_index(bin_id: i32) -> i64 {
-        const BIN_ARRAY_SIZE: i32 = 70; // Meteora default
-                                        // Use div_euclid for floor division (handles negative numbers correctly)
+        const BIN_ARRAY_SIZE: i32 = 70;
         bin_id.div_euclid(BIN_ARRAY_SIZE) as i64
     }
 }
@@ -487,57 +578,33 @@ impl MeteoraDlmmSwapBuilder {
 mod tests {
     use super::*;
 
+    fn bitmap_with_bit_at_index(array_index: i64) -> [u64; 16] {
+        let mut b = [0u64; 16];
+        let bit_pos = (array_index + 512) as u32;
+        let word = bit_pos / 64;
+        let bit = bit_pos % 64;
+        b[word as usize] = 1u64 << bit;
+        b
+    }
+
     #[test]
     fn test_bin_array_index_calculation() {
-        // Bin 0 -> array 0
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(0), 0);
-
-        // Bin 69 -> array 0 (last bin in first array)
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(69), 0);
-
-        // Bin 70 -> array 1 (first bin in second array)
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(70), 1);
-
-        // Negative bins - MUST use floor division!
-        // bin_id = -1:  floor(-1/70) = -1
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(-1), -1);
-        // bin_id = -70: floor(-70/70) = -1
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(-70), -1);
-        // bin_id = -71: floor(-71/70) = -2
         assert_eq!(MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(-71), -2);
     }
 
     #[test]
     fn test_derive_bin_array_pda() {
         let lb_pair = Pubkey::new_unique();
-
-        // Should derive deterministically
         let pda1 = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, 0).unwrap();
         let pda2 = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, 0).unwrap();
         assert_eq!(pda1, pda2);
-
-        // Different indices should give different PDAs
         let pda3 = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, 1).unwrap();
         assert_ne!(pda1, pda3);
-    }
-
-    #[test]
-    fn active_only_bin_coverage_has_fewer_accounts_than_adjacent_three() {
-        let lb_pair = Pubkey::new_unique();
-        let active_only = MeteoraDlmmSwapBuilder::derive_bin_arrays_for_active_id_with_coverage(
-            &lb_pair,
-            100,
-            BinArrayCoverage::ActiveOnly,
-        )
-        .expect("active only");
-        let adjacent = MeteoraDlmmSwapBuilder::derive_bin_arrays_for_active_id_with_coverage(
-            &lb_pair,
-            100,
-            BinArrayCoverage::AdjacentThree,
-        )
-        .expect("adjacent three");
-        assert_eq!(active_only.len(), 1);
-        assert_eq!(adjacent.len(), 3);
     }
 
     #[test]
@@ -548,38 +615,59 @@ mod tests {
             Pubkey::find_program_address(&[b"bitmap", lb_pair.as_ref()], &program_id);
         let derived = MeteoraDlmmSwapBuilder::derive_bitmap_extension_pda(&lb_pair).unwrap();
         assert_eq!(derived, official);
-        let (legacy_wrong, _) =
-            Pubkey::find_program_address(&[b"bitmap_extension", lb_pair.as_ref()], &program_id);
-        assert_ne!(derived, legacy_wrong);
     }
 
     #[test]
-    fn resolve_bitmap_extension_placeholder_vs_pda() {
-        let lb_pair = Pubkey::new_unique();
-        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM).unwrap();
-        let placeholder =
-            MeteoraDlmmSwapBuilder::resolve_bin_array_bitmap_extension(&lb_pair, None).unwrap();
-        assert_eq!(placeholder, program_id);
-        let false_placeholder =
-            MeteoraDlmmSwapBuilder::resolve_bin_array_bitmap_extension(&lb_pair, Some(false))
-                .unwrap();
-        assert_eq!(false_placeholder, program_id);
-        let pda = MeteoraDlmmSwapBuilder::resolve_bin_array_bitmap_extension(&lb_pair, Some(true))
-            .unwrap();
-        assert_ne!(pda, program_id);
-        assert_eq!(
-            pda,
-            MeteoraDlmmSwapBuilder::derive_bitmap_extension_pda(&lb_pair).unwrap()
-        );
-    }
-
-    #[test]
-    fn patch_swap_ix_bitmap_extension_updates_account_one() {
+    fn swap_ytox_internal_bit_at_active_uses_program_id_legacy_swap() {
         let lb_pair = Pubkey::new_unique();
         let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
         let builder = MeteoraDlmmSwapBuilder::new(rpc);
         let user = Pubkey::new_unique();
-        let mut ix = builder
+        let token_prog = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+        let active_id = -244i32;
+        let array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
+        assert_eq!(array_index, -4);
+        let bitmap = bitmap_with_bit_at_index(array_index);
+
+        let ix = builder
+            .build_swap_with_bins_sync_coverage(
+                &lb_pair,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &token_prog,
+                &token_prog,
+                &user,
+                1,
+                1,
+                SwapDirection::YtoX,
+                active_id,
+                10,
+                BinArrayCoverage::AdjacentThree,
+                Some(bitmap),
+                None,
+            )
+            .expect("build");
+
+        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM).unwrap();
+        assert_eq!(ix.accounts[1].pubkey, program_id);
+        assert_eq!(ix.data.len(), 24);
+        assert_eq!(ix.data[0..8], SWAP_DISCRIMINATOR);
+        assert!(!ix
+            .accounts
+            .iter()
+            .any(|a| a.pubkey == Pubkey::from_str(MEMO_PROGRAM).unwrap()));
+    }
+
+    #[test]
+    fn missing_bitmap_words_is_bitmap_unknown() {
+        let lb_pair = Pubkey::new_unique();
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let builder = MeteoraDlmmSwapBuilder::new(rpc);
+        let err = builder
             .build_swap_with_bins_sync_coverage(
                 &lb_pair,
                 &Pubkey::new_unique(),
@@ -590,23 +678,168 @@ mod tests {
                 &Pubkey::new_unique(),
                 &Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
                 &Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
-                &user,
+                &Pubkey::new_unique(),
                 1,
                 1,
                 SwapDirection::YtoX,
-                100,
+                -244,
                 10,
                 BinArrayCoverage::AdjacentThree,
                 None,
+                None,
             )
-            .expect("build swap");
-        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM).unwrap();
-        assert_eq!(ix.accounts[1].pubkey, program_id);
-        MeteoraDlmmSwapBuilder::patch_swap_ix_bitmap_extension(&mut ix, &lb_pair, Some(true))
-            .expect("patch");
+            .unwrap_err();
+        assert!(err.to_string().contains("bitmap_unknown"));
+    }
+
+    #[test]
+    fn empty_internal_bitmap_uses_extension_pda_ytox_index_512() {
+        let lb_pair = Pubkey::new_unique();
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let builder = MeteoraDlmmSwapBuilder::new(rpc);
+        let bitmap = [0u64; 16];
+        let mut ext = vec![0u8; METEORA_BITMAP_EXTENSION_PAYLOAD_LEN];
+        ext[0] = 1; // positive page 0 limb 0 bit 0 => index 512
+
+        let ix = builder
+            .build_swap_with_bins_sync_coverage(
+                &lb_pair,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
+                &Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
+                &Pubkey::new_unique(),
+                1,
+                1,
+                SwapDirection::YtoX,
+                -244,
+                10,
+                BinArrayCoverage::AdjacentThree,
+                Some(bitmap),
+                Some(&ext),
+            )
+            .expect("build");
+
         assert_eq!(
             ix.accounts[1].pubkey,
             MeteoraDlmmSwapBuilder::derive_bitmap_extension_pda(&lb_pair).unwrap()
         );
+        let expected_first = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, 512).unwrap();
+        assert_eq!(ix.accounts.last().unwrap().pubkey, expected_first);
+    }
+
+    #[test]
+    fn empty_internal_bitmap_xtoy_extension_negative_513() {
+        let lb_pair = Pubkey::new_unique();
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let builder = MeteoraDlmmSwapBuilder::new(rpc);
+        let bitmap = [0u64; 16];
+        let mut ext = vec![0u8; METEORA_BITMAP_EXTENSION_PAYLOAD_LEN];
+        ext[768] = 1; // negative page 0 limb 0 => index -513
+
+        let ix = builder
+            .build_swap_with_bins_sync_coverage(
+                &lb_pair,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
+                &Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
+                &Pubkey::new_unique(),
+                1,
+                1,
+                SwapDirection::XtoY,
+                100,
+                10,
+                BinArrayCoverage::AdjacentThree,
+                Some(bitmap),
+                Some(&ext),
+            )
+            .expect("build");
+
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            MeteoraDlmmSwapBuilder::derive_bitmap_extension_pda(&lb_pair).unwrap()
+        );
+        let expected_first = MeteoraDlmmSwapBuilder::derive_bin_array_pda(&lb_pair, -513).unwrap();
+        assert_eq!(ix.accounts.last().unwrap().pubkey, expected_first);
+    }
+
+    #[test]
+    fn swap2_token2022_on_x_uses_memo_and_event_accounts() {
+        let lb_pair = Pubkey::new_unique();
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let builder = MeteoraDlmmSwapBuilder::new(rpc);
+        let active_id = 70;
+        let array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
+        let bitmap = bitmap_with_bit_at_index(array_index);
+        let tokenkeg = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+        let token2022 = Pubkey::from_str(TOKEN_2022_PROGRAM).unwrap();
+        let program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM).unwrap();
+        let (event_authority, _) =
+            Pubkey::find_program_address(&[b"__event_authority"], &program_id);
+
+        let ix = builder
+            .build_swap_with_bins_sync_coverage(
+                &lb_pair,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &token2022,
+                &tokenkeg,
+                &Pubkey::new_unique(),
+                1,
+                1,
+                SwapDirection::YtoX,
+                active_id,
+                10,
+                BinArrayCoverage::ActiveOnly,
+                Some(bitmap),
+                None,
+            )
+            .expect("build");
+
+        assert_eq!(ix.data.len(), 28);
+        assert_eq!(ix.data[0..8], SWAP2_DISCRIMINATOR);
+        assert_eq!(ix.data[24..28], [0, 0, 0, 0]);
+        assert_eq!(
+            ix.accounts[13].pubkey,
+            Pubkey::from_str(MEMO_PROGRAM).unwrap()
+        );
+        assert_eq!(ix.accounts[14].pubkey, event_authority);
+    }
+
+    #[test]
+    fn invalid_token_program_is_unknown() {
+        let mint = Pubkey::new_unique();
+        let err = MeteoraDlmmSwapBuilder::resolve_token_program_for_mint(
+            &mint,
+            Some(&Pubkey::new_unique().to_string()),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("token_program_unknown"));
+    }
+
+    #[test]
+    fn parse_meteora_lb_pair_real_bitmap_word_six() {
+        let data = include_bytes!("../../../meteora_lb_pair_real.bin");
+        let words = MeteoraDlmmSwapBuilder::parse_lb_pair_internal_bitmap(data).expect("bitmap");
+        assert_eq!(words[6], 0xfffffffc00000000u64);
+        let active_id = i32::from_le_bytes(data[0x4C..0x50].try_into().unwrap());
+        assert_eq!(active_id, -4990);
+        let array_index = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
+        assert_eq!(array_index, -72);
+        assert!(MeteoraDlmmSwapBuilder::internal_bitmap_has_bit(&words, -72));
     }
 }

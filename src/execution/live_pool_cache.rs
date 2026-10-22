@@ -251,6 +251,10 @@ pub struct MeteoraState {
     pub reserve_y_balance: Option<u64>,
     /// Account/Geyser pool parse populated DLMM bin parameters — never true for TX layout-only seed.
     pub dlmm_bin_params_account_seeded: bool,
+    /// Internal LB-pair bin-array bitmap (`[u64; 16]` at offset 584). `None` = unknown (cannot build swap).
+    pub bin_array_bitmap: Option<[u64; 16]>,
+    /// Extension account payload bytes `[40, 1576)` when observed on Geyser.
+    pub bitmap_extension_payload: Option<Vec<u8>>,
 }
 
 /// TX layout-only Meteora DLMM row: reserve vault pubkeys/mints only; bin params unset (not SSOT).
@@ -271,6 +275,8 @@ pub fn meteora_dlmm_tx_layout_seed(
         reserve_x_balance: None,
         reserve_y_balance: None,
         dlmm_bin_params_account_seeded: false,
+        bin_array_bitmap: None,
+        bitmap_extension_payload: None,
     }
 }
 
@@ -286,6 +292,8 @@ impl From<DlmmPool> for MeteoraState {
             reserve_x_balance: None,
             reserve_y_balance: None,
             dlmm_bin_params_account_seeded: true,
+            bin_array_bitmap: None,
+            bitmap_extension_payload: None,
         }
     }
 }
@@ -651,6 +659,12 @@ pub fn merge_account_parse_preserves_existing(
                 preserve_option_reserve(inc.reserve_y_balance, ex.reserve_y_balance);
             if ex.dlmm_bin_params_account_seeded {
                 inc.dlmm_bin_params_account_seeded = true;
+            }
+            if inc.bin_array_bitmap.is_none() {
+                inc.bin_array_bitmap = ex.bin_array_bitmap;
+            }
+            if inc.bitmap_extension_payload.is_none() {
+                inc.bitmap_extension_payload = ex.bitmap_extension_payload.clone();
             }
             CachedPoolState::Meteora(inc)
         }
@@ -1693,15 +1707,51 @@ impl LivePoolCache {
         pool: &Pubkey,
         meta: Option<&std::collections::HashMap<String, String>>,
     ) {
-        use crate::ipc::POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY;
+        use crate::ipc::{
+            POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY,
+            POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY,
+            POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY,
+        };
         let Some(m) = meta else {
             return;
         };
-        let Some(v) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY) else {
-            return;
-        };
-        if let Ok(has_extension) = v.parse::<bool>() {
-            self.set_meteora_dlmm_has_bitmap_extension(pool, has_extension);
+        if let Some(v) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY) {
+            if let Ok(has_extension) = v.parse::<bool>() {
+                self.set_meteora_dlmm_has_bitmap_extension(pool, has_extension);
+            }
+        }
+        if let Some(entry) = self.pools.get(pool) {
+            if let CachedPoolState::Meteora(mut state) = entry.state.clone() {
+                if let Some(tag) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY) {
+                    if let Some(bitmap) =
+                        crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::parse_bin_array_bitmap_tag(tag)
+                    {
+                        state.bin_array_bitmap = Some(bitmap);
+                    }
+                }
+                if let Some(hex) =
+                    m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY)
+                {
+                    if let Some(payload) = decode_meteora_extension_payload_hex(hex) {
+                        state.bitmap_extension_payload = Some(payload);
+                    }
+                }
+                let slot = entry.slot;
+                drop(entry);
+                self.upsert(*pool, CachedPoolState::Meteora(state), slot);
+            }
+        }
+    }
+
+    /// Geyser: store extension payload on the Meteora pool row (bytes 40..1576).
+    pub fn set_meteora_dlmm_bitmap_extension_payload(&self, pool: &Pubkey, payload: Vec<u8>) {
+        if let Some(entry) = self.pools.get(pool) {
+            if let CachedPoolState::Meteora(mut state) = entry.state.clone() {
+                state.bitmap_extension_payload = Some(payload);
+                let slot = entry.slot;
+                drop(entry);
+                self.upsert(*pool, CachedPoolState::Meteora(state), slot);
+            }
         }
     }
 
@@ -2919,6 +2969,18 @@ fn parse_raydium_cpmm(data: &[u8]) -> Option<CachedPoolState> {
     }))
 }
 
+fn decode_meteora_extension_payload_hex(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
+        out.push(byte);
+    }
+    Some(out)
+}
+
 fn parse_meteora_dlmm(data: &[u8]) -> Option<CachedPoolState> {
     // LB Pair: 904 bytes
     if data.len() != 904 {
@@ -2926,7 +2988,12 @@ fn parse_meteora_dlmm(data: &[u8]) -> Option<CachedPoolState> {
     }
 
     let parsed = DlmmPool::parse(data).ok()?;
-    Some(CachedPoolState::Meteora(MeteoraState::from(parsed)))
+    let mut state = MeteoraState::from(parsed);
+    state.bin_array_bitmap =
+        crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::parse_lb_pair_internal_bitmap(
+            data,
+        );
+    Some(CachedPoolState::Meteora(state))
 }
 
 fn parse_meteora_cpmm(data: &[u8]) -> Option<CachedPoolState> {
@@ -3993,6 +4060,8 @@ mod tests {
                 reserve_x_balance: Some(5_000_000_000),
                 reserve_y_balance: Some(10_000_000_000),
                 dlmm_bin_params_account_seeded: true,
+                bin_array_bitmap: None,
+                bitmap_extension_payload: None,
             }),
             100,
         );
@@ -5685,6 +5754,8 @@ mod tests {
             reserve_x_balance,
             reserve_y_balance,
             dlmm_bin_params_account_seeded: true,
+            bin_array_bitmap: None,
+            bitmap_extension_payload: None,
         }
     }
 

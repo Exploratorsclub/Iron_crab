@@ -36,7 +36,6 @@ use crate::arbitrage::pool_quote::{
 use crate::execution::live_pool_cache::{CachedPoolState, LivePoolCache};
 use crate::ipc::TradeIntent;
 use crate::solana::dex::meteora_dlmm::MeteoraDlmm;
-use crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use crate::solana::dex::orca::Orca;
 use crate::solana::dex::pumpfun_amm::{
     pump_amm_buy_program_ix_index, pump_amm_canonical_global_config,
@@ -692,7 +691,7 @@ impl CrossDexHandler {
                 // Downcast to MeteoraDlmm and inject
                 // Note: This requires the connector to be the concrete type
                 // For now, we use set_pool_from_accounts with the cached data
-                let accounts = vec![
+                let mut accounts = vec![
                     pool_pk.to_string(),
                     meteora_state.token_x_mint.to_string(),
                     meteora_state.token_y_mint.to_string(),
@@ -701,6 +700,23 @@ impl CrossDexHandler {
                     format!("active_id:{}", meteora_state.active_id),
                     format!("bin_step:{}", meteora_state.bin_step),
                 ];
+                if let Some(bitmap) = meteora_state.bin_array_bitmap {
+                    accounts.push(format!(
+                        "bin_array_bitmap:{}",
+                        crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::format_bin_array_bitmap_tag(
+                            &bitmap
+                        )
+                    ));
+                }
+                if let Some(payload) = &meteora_state.bitmap_extension_payload {
+                    accounts.push(format!(
+                        "bitmap_extension_hex:{}",
+                        payload
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<String>()
+                    ));
+                }
                 if connector
                     .set_pool_from_accounts(&pool_pk.to_string(), &accounts)
                     .is_ok()
@@ -1607,7 +1623,7 @@ impl CrossDexHandler {
         }
 
         // Build buy instructions
-        let mut buy_swap_instructions = if buy_dex == "pump_amm" {
+        let buy_swap_instructions = if buy_dex == "pump_amm" {
             self.build_pump_amm_arb_swap_ixs(
                 SOL_MINT,
                 token_mint,
@@ -1688,22 +1704,6 @@ impl CrossDexHandler {
                 .build_swap_ix_async(SOL_MINT, token_mint, buy_amount_in, buy_min_out)
                 .await?
         };
-
-        if buy_dex == "meteora_dlmm" {
-            if let Ok(pool_pk) = Pubkey::from_str(&buy_pool) {
-                let has_bitmap_extension = self
-                    .pool_cache
-                    .as_ref()
-                    .and_then(|cache| cache.meteora_dlmm_has_bitmap_extension(&pool_pk));
-                for ix in &mut buy_swap_instructions {
-                    MeteoraDlmmSwapBuilder::patch_swap_ix_bitmap_extension(
-                        ix,
-                        &pool_pk,
-                        has_bitmap_extension,
-                    )?;
-                }
-            }
-        }
 
         // Build sell instructions
         let sell_amount_in = buy_quote.amount_out;
@@ -1882,6 +1882,15 @@ mod tests {
         PUMP_AMM_WRONG_LEGACY_GLOBAL_CONFIG,
     };
     use crate::solana::compute_budget_helper;
+    use crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
+
+    fn meteora_test_bitmap_for_active_id(active_id: i32) -> [u64; 16] {
+        let idx = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
+        let mut bitmap = [0u64; 16];
+        let bit_pos = (idx + 512) as u32;
+        bitmap[(bit_pos / 64) as usize] = 1u64 << (bit_pos % 64);
+        bitmap
+    }
     use crate::solana::dex::orca::ORCA_WHIRLPOOL_PROGRAM;
     use crate::solana::dex::pumpfun_amm::{
         pump_amm_buy_program_ix_index, pump_amm_canonical_global_config,
@@ -1962,6 +1971,15 @@ mod tests {
         token_mint: Pubkey,
     ) {
         let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let active_id = -281i32;
+        let array_index =
+            crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(
+                active_id,
+            );
+        let mut bitmap = [0u64; 16];
+        let bit_pos = (array_index + 512) as u32;
+        bitmap[(bit_pos / 64) as usize] = 1u64 << (bit_pos % 64);
+
         cache.upsert(
             buy_pool,
             CachedPoolState::Meteora(MeteoraState {
@@ -1969,11 +1987,13 @@ mod tests {
                 token_y_mint: token_mint,
                 reserve_x: Pubkey::new_unique(),
                 reserve_y: Pubkey::new_unique(),
-                active_id: -281,
+                active_id,
                 bin_step: 10,
                 reserve_x_balance: Some(50_000_000_000),
                 reserve_y_balance: Some(1_000_000_000_000),
                 dlmm_bin_params_account_seeded: true,
+                bin_array_bitmap: Some(bitmap),
+                bitmap_extension_payload: None,
             }),
             100,
         );
@@ -2554,6 +2574,8 @@ mod tests {
                 reserve_x_balance: Some(50_000_000_000),
                 reserve_y_balance: Some(1_000_000_000_000),
                 dlmm_bin_params_account_seeded: true,
+                bin_array_bitmap: Some(meteora_test_bitmap_for_active_id(-281)),
+                bitmap_extension_payload: None,
             }),
             100,
         );
@@ -2627,7 +2649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_dex_meteora_buy_uses_bitmap_extension_pda_when_cache_has_extension() {
+    async fn cross_dex_meteora_buy_uses_program_id_when_internal_bitmap_has_active_bit() {
         use crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 
         let (plan, _, _) = build_prod_pattern_cross_dex_plan(true).await;
@@ -2635,16 +2657,107 @@ mod tests {
             .buy_instructions
             .first()
             .expect("meteora buy ix present");
-        let pool = Pubkey::from_str("2TD1fMPg2w7Hjt8bASSdxi92YFNQFgvdznqVApe3NGpn").unwrap();
-        let expected =
-            MeteoraDlmmSwapBuilder::derive_bitmap_extension_pda(&pool).expect("derive bitmap pda");
-        assert_eq!(
-            buy_ix.accounts[1].pubkey, expected,
-            "pool with has_bitmap_extension=true must use bitmap-extension PDA at account index 1"
-        );
         let program_id =
             Pubkey::from_str(crate::solana::dex::meteora_dlmm::METEORA_DLMM_PROGRAM).unwrap();
-        assert_ne!(buy_ix.accounts[1].pubkey, program_id);
+        assert_eq!(
+            buy_ix.accounts[1].pubkey,
+            program_id,
+            "internal bitmap bit at active index must use DLMM program id at account 1 even when has_bitmap_extension side flag is true"
+        );
+        assert_ne!(
+            buy_ix.accounts[1].pubkey,
+            MeteoraDlmmSwapBuilder::derive_bitmap_extension_pda(
+                &Pubkey::from_str("2TD1fMPg2w7Hjt8bASSdxi92YFNQFgvdznqVApe3NGpn").unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_dex_meteora_buy_uses_extension_pda_when_internal_bitmap_empty() {
+        use crate::solana::dex::meteora_swap_builder::{
+            MeteoraDlmmSwapBuilder, METEORA_BITMAP_EXTENSION_PAYLOAD_LEN,
+        };
+
+        let wallet = Keypair::new();
+        let token_mint = Pubkey::new_unique();
+        let buy_pool = Pubkey::from_str("2TD1fMPg2w7Hjt8bASSdxi92YFNQFgvdznqVApe3NGpn").unwrap();
+        let sell_pool = Pubkey::new_unique();
+        let cache = Arc::new(LivePoolCache::new());
+        let sol_mint = Pubkey::from_str(SOL_MINT).unwrap();
+        let mut ext = vec![0u8; METEORA_BITMAP_EXTENSION_PAYLOAD_LEN];
+        // WSOL -> token is XtoY; extension search starts at index -513 (negative plane page 0).
+        ext[768] = 1;
+        cache.upsert(
+            buy_pool,
+            CachedPoolState::Meteora(MeteoraState {
+                token_x_mint: sol_mint,
+                token_y_mint: token_mint,
+                reserve_x: Pubkey::new_unique(),
+                reserve_y: Pubkey::new_unique(),
+                active_id: -244,
+                bin_step: 10,
+                reserve_x_balance: Some(50_000_000_000),
+                reserve_y_balance: Some(1_000_000_000_000),
+                dlmm_bin_params_account_seeded: true,
+                bin_array_bitmap: Some([0u64; 16]),
+                bitmap_extension_payload: Some(ext),
+            }),
+            100,
+        );
+        let sell_pool_accounts = pump_amm_v14_pool_accounts(sell_pool, token_mint);
+        cache.upsert(
+            sell_pool,
+            CachedPoolState::PumpAmm(PumpAmmState {
+                base_mint: token_mint,
+                quote_mint: sol_mint,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_reserve: Some(1_000_000_000_000),
+                quote_reserve: Some(50_000_000_000),
+                pool_accounts: sell_pool_accounts,
+                creator: None,
+            }),
+            100,
+        );
+        cache.set_pump_amm_sell_layout_ready(&sell_pool, true);
+
+        let rpc = Arc::new(SolanaRpc::new("http://127.0.0.1:0"));
+        let mut handler = CrossDexHandler::new(rpc, Some(wallet.pubkey()))
+            .with_rpc_url("http://127.0.0.1:0".to_string())
+            .with_pool_cache(cache);
+        handler.init_dexes().await.expect("init_dexes");
+
+        let mut intent = cross_dex_test_intent(&token_mint, &buy_pool, &sell_pool);
+        // Force LivePoolCache inject (includes bitmap + extension payload); intent buy accounts would overwrite connector state.
+        if let Some(start) = intent
+            .resources
+            .accounts
+            .iter()
+            .position(|s| s.starts_with("buy_pool_accounts_start:"))
+        {
+            let count = intent.resources.accounts[start]
+                .strip_prefix("buy_pool_accounts_start:")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0);
+            intent.resources.accounts.drain(start..start + 1 + count);
+        }
+        let validation = cross_dex_validation_fixture(&token_mint);
+        let plan = handler
+            .build_swap_plan(
+                &intent,
+                &validation,
+                CrossDexPlanOptions {
+                    skip_token_ata_create: true,
+                },
+            )
+            .await
+            .expect("plan");
+        let buy_ix = plan.buy_instructions.first().expect("buy ix");
+        assert_eq!(
+            buy_ix.accounts[1].pubkey,
+            MeteoraDlmmSwapBuilder::derive_bitmap_extension_pda(&buy_pool).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2805,6 +2918,8 @@ mod tests {
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(50_000_000_000),
                 dlmm_bin_params_account_seeded: true,
+                bin_array_bitmap: Some(meteora_test_bitmap_for_active_id(-281)),
+                bitmap_extension_payload: None,
             }),
             100,
         );
@@ -3013,6 +3128,8 @@ mod tests {
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(50_000_000_000),
                 dlmm_bin_params_account_seeded: true,
+                bin_array_bitmap: Some(meteora_test_bitmap_for_active_id(-281)),
+                bitmap_extension_payload: None,
             }),
             100,
         );
@@ -3397,6 +3514,8 @@ mod tests {
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(50_000_000_000),
                 dlmm_bin_params_account_seeded: true,
+                bin_array_bitmap: Some(meteora_test_bitmap_for_active_id(-281)),
+                bitmap_extension_payload: None,
             }),
             100,
         );
@@ -3567,6 +3686,8 @@ mod tests {
                 reserve_x_balance: Some(1_000_000_000_000),
                 reserve_y_balance: Some(50_000_000_000),
                 dlmm_bin_params_account_seeded: true,
+                bin_array_bitmap: Some(meteora_test_bitmap_for_active_id(-281)),
+                bitmap_extension_payload: None,
             }),
             100,
         );

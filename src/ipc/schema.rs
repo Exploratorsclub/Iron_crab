@@ -2982,6 +2982,14 @@ pub const POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY: &str = "meteora_dlmm_bin_
 pub const POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY: &str =
     "meteora_dlmm_has_bitmap_extension";
 
+/// Meteora DLMM: internal bin-array bitmap — 16 comma-separated decimal `u64` words (LB pair offset 584).
+pub const POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY: &str =
+    "meteora_dlmm_bin_array_bitmap";
+
+/// Meteora DLMM: `BinArrayBitmapExtension` payload hex (bytes 40..1576).
+pub const POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY: &str =
+    "meteora_dlmm_bitmap_extension_payload";
+
 /// Pool cache update type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

@@ -1583,6 +1583,12 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
         {
             host.live_pool_cache()
                 .set_meteora_dlmm_has_bitmap_extension(&lb_pair, true);
+            if let Some(payload) =
+                MeteoraDlmmSwapBuilder::parse_bitmap_extension_payload(account_data)
+            {
+                host.live_pool_cache()
+                    .set_meteora_dlmm_bitmap_extension_payload(&lb_pair, payload);
+            }
             if host.is_hot_pool(&lb_pair) {
                 if let Some(balance_update) =
                     md_sidefx_build_balance_updated_from_cache(host, run_id, &lb_pair, *slot)
