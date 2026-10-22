@@ -7,7 +7,9 @@ use crate::execution::live_pool_cache::{
 };
 use crate::ipc::{
     DexPoolReadiness, NATIVE_SOL_MINT, POOL_CACHE_UPDATE_METEORA_DLMM_ACTIVE_ID_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY,
     POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY,
+    POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY,
     POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY,
     POOL_CACHE_UPDATE_METEORA_DLMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_DLMM_VAULTS_KEY,
     POOL_CACHE_UPDATE_ORCA_FEE_RATE_KEY, POOL_CACHE_UPDATE_ORCA_LIQUIDITY_KEY,
@@ -186,6 +188,8 @@ fn meteora_dlmm_onchain_mints_for_pool_cache_update(s: &MeteoraState) -> String 
 pub fn meteora_dlmm_metadata_for_pool_cache_update(
     s: &MeteoraState,
     has_bitmap_extension: Option<bool>,
+    bin_array_bitmap: Option<[u64; 16]>,
+    bitmap_extension_payload: Option<&[u8]>,
 ) -> HashMap<String, String> {
     let mut meta = HashMap::new();
     meta.insert(
@@ -204,6 +208,23 @@ pub fn meteora_dlmm_metadata_for_pool_cache_update(
         meta.insert(
             POOL_CACHE_UPDATE_METEORA_DLMM_BIN_STEP_KEY.to_string(),
             s.bin_step.to_string(),
+        );
+    }
+    if let Some(bitmap) = bin_array_bitmap {
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY.to_string(),
+            crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::format_bin_array_bitmap_tag(
+                &bitmap,
+            ),
+        );
+    }
+    if let Some(payload) = bitmap_extension_payload {
+        meta.insert(
+            POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY.to_string(),
+            payload
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>(),
         );
     }
     if let Some(has) = has_bitmap_extension {

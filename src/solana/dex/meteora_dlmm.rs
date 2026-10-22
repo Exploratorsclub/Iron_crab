@@ -45,6 +45,8 @@ struct PoolCache {
     /// Reserve balances fetched from vaults (cached)
     reserve_x_balance: Option<u64>,
     reserve_y_balance: Option<u64>,
+    bin_array_bitmap: Option<[u64; 16]>,
+    bitmap_extension_payload: Option<Vec<u8>>,
     last_updated: std::time::SystemTime,
 }
 
@@ -201,6 +203,20 @@ impl MeteoraDlmm {
                 entry.pool.bin_step = state.bin_step;
                 entry.reserve_x_balance = state.reserve_x_balance;
                 entry.reserve_y_balance = state.reserve_y_balance;
+                if let Some(bitmap) = self
+                    .live_pool_cache
+                    .as_ref()
+                    .and_then(|c| c.meteora_dlmm_bin_array_bitmap(pool_address))
+                {
+                    entry.bin_array_bitmap = Some(bitmap);
+                }
+                if let Some(payload) = self
+                    .live_pool_cache
+                    .as_ref()
+                    .and_then(|c| c.meteora_dlmm_bitmap_extension_payload(pool_address))
+                {
+                    entry.bitmap_extension_payload = Some(payload);
+                }
                 entry.last_updated = std::time::SystemTime::now();
             }
             return Ok(false);
@@ -219,11 +235,21 @@ impl MeteoraDlmm {
             token_y_program: None,
         };
 
+        let bin_array_bitmap = self
+            .live_pool_cache
+            .as_ref()
+            .and_then(|c| c.meteora_dlmm_bin_array_bitmap(pool_address));
+        let bitmap_extension_payload = self
+            .live_pool_cache
+            .as_ref()
+            .and_then(|c| c.meteora_dlmm_bitmap_extension_payload(pool_address));
         let cache_entry = PoolCache {
             address: *pool_address,
             pool,
             reserve_x_balance: state.reserve_x_balance,
             reserve_y_balance: state.reserve_y_balance,
+            bin_array_bitmap,
+            bitmap_extension_payload,
             last_updated: std::time::SystemTime::now(),
         };
 
@@ -550,11 +576,14 @@ impl Dex for MeteoraDlmm {
             .map_err(|e| anyhow!("Failed to parse DLMM pool {}: {}", pool_address, e))?;
 
         // Insert into cache
+        let bin_array_bitmap = MeteoraDlmmSwapBuilder::parse_lb_pair_internal_bitmap(&account.data);
         let cache = PoolCache {
             address: *pool_address,
             pool: pool.clone(),
             reserve_x_balance: None,
             reserve_y_balance: None,
+            bin_array_bitmap,
+            bitmap_extension_payload: None,
             last_updated: std::time::SystemTime::now(),
         };
 
@@ -639,6 +668,7 @@ impl Dex for MeteoraDlmm {
         // Parse tagged values (active_id, bin_step) from remaining accounts
         let mut active_id: i32 = 0;
         let mut bin_step: u16 = 10; // Default
+        let mut bin_array_bitmap: Option<[u64; 16]> = None;
 
         for account in accounts.iter().skip(3) {
             if let Some(value) = account.strip_prefix("active_id:") {
@@ -648,6 +678,25 @@ impl Dex for MeteoraDlmm {
             } else if let Some(value) = account.strip_prefix("bin_step:") {
                 if let Ok(v) = value.parse::<u16>() {
                     bin_step = v;
+                }
+            } else if let Some(value) = account.strip_prefix("bin_array_bitmap:") {
+                bin_array_bitmap = MeteoraDlmmSwapBuilder::parse_bin_array_bitmap_tag(value);
+            }
+        }
+
+        let mut bitmap_extension_payload: Option<Vec<u8>> = None;
+        for account in accounts.iter().skip(3) {
+            if let Some(hex) = account.strip_prefix("bitmap_extension_hex:") {
+                if hex.len() % 2 == 0 {
+                    let mut out = Vec::with_capacity(hex.len() / 2);
+                    for i in (0..hex.len()).step_by(2) {
+                        if let Ok(byte) = u8::from_str_radix(&hex[i..i + 2], 16) {
+                            out.push(byte);
+                        }
+                    }
+                    if !out.is_empty() {
+                        bitmap_extension_payload = Some(out);
+                    }
                 }
             }
         }
@@ -665,11 +714,14 @@ impl Dex for MeteoraDlmm {
             token_y_program: None,
         };
 
+        let extension_for_live_cache = bitmap_extension_payload.clone();
         let cache = PoolCache {
             address: pool_pk,
             pool: pool.clone(),
             reserve_x_balance: None,
             reserve_y_balance: None,
+            bin_array_bitmap,
+            bitmap_extension_payload,
             last_updated: std::time::SystemTime::now(),
         };
 
@@ -683,6 +735,14 @@ impl Dex for MeteoraDlmm {
         );
 
         self.pools.insert(pool_pk, cache);
+        if let Some(ref lpc) = self.live_pool_cache {
+            if let Some(bitmap) = bin_array_bitmap {
+                lpc.set_meteora_dlmm_bin_array_bitmap(&pool_pk, bitmap);
+            }
+            if let Some(payload) = extension_for_live_cache {
+                lpc.set_meteora_dlmm_bitmap_extension_payload(&pool_pk, payload);
+            }
+        }
 
         // Update mint index
         self.mint_index
@@ -844,66 +904,28 @@ impl Dex for MeteoraDlmm {
         // cross_dex_handler caches these via cache_extra_data("token_program:<mint>", program_id)
         // For arbitrage, 99%+ of tokens use SPL Token. Token-2022 is rare.
         // If we default wrong for a Token-2022 mint, the TX will fail at simulation.
-        let spl_token_program = spl_token::id();
-        let token_2022_id = spl_token::solana_program::pubkey::Pubkey::new_from_array(
-            Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
-                .unwrap_or_default()
-                .to_bytes(),
-        );
-
-        // Priority 1: Check extra_data cache (populated by cross_dex_handler from Intent)
-        // Priority 2: Use pool.token_x_program / pool.token_y_program (if populated from DexPoolAccounts)
-        // Priority 3: Default to SPL Token
         let token_x_key = format!("token_program:{}", pool.token_x_mint);
         let token_y_key = format!("token_program:{}", pool.token_y_mint);
 
-        let token_x_program_spl = self
-            .extra_data
-            .get(&token_x_key)
-            .and_then(|v| Pubkey::from_str(v.value()).ok())
-            .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
-            .or_else(|| {
-                pool.token_x_program.map(|p| {
-                    spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes())
-                })
-            })
-            .unwrap_or(spl_token_program);
+        let token_x_extra = self.extra_data.get(&token_x_key).map(|v| v.value().clone());
+        let token_y_extra = self.extra_data.get(&token_y_key).map(|v| v.value().clone());
+        let token_x_program_sdk = MeteoraDlmmSwapBuilder::resolve_token_program_for_mint(
+            &pool.token_x_mint,
+            token_x_extra.as_deref(),
+            pool.token_x_program,
+        )?;
+        let token_y_program_sdk = MeteoraDlmmSwapBuilder::resolve_token_program_for_mint(
+            &pool.token_y_mint,
+            token_y_extra.as_deref(),
+            pool.token_y_program,
+        )?;
 
-        let token_y_program_spl = self
-            .extra_data
-            .get(&token_y_key)
-            .and_then(|v| Pubkey::from_str(v.value()).ok())
-            .map(|p| spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes()))
-            .or_else(|| {
-                pool.token_y_program.map(|p| {
-                    spl_token::solana_program::pubkey::Pubkey::new_from_array(p.to_bytes())
-                })
-            })
-            .unwrap_or(spl_token_program);
-
-        // Log which source we're using for token programs
-        let x_from_cache = self.extra_data.contains_key(&token_x_key);
-        let y_from_cache = self.extra_data.contains_key(&token_y_key);
-        let x_is_2022 = token_x_program_spl == token_2022_id;
-        let y_is_2022 = token_y_program_spl == token_2022_id;
-
-        if x_from_cache || y_from_cache || x_is_2022 || y_is_2022 {
-            info!(
-                pool = %pool_addr,
-                token_x_program = %token_x_program_spl,
-                token_y_program = %token_y_program_spl,
-                x_from_cache,
-                y_from_cache,
-                x_is_token_2022 = x_is_2022,
-                y_is_token_2022 = y_is_2022,
-                "Meteora: using token programs (GEYSER-FIRST)"
-            );
-        } else {
-            debug!(
-                pool = %pool_addr,
-                "Meteora: defaulting to SPL Token for both mints (most common case)"
-            );
-        }
+        let token_x_program_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+            token_x_program_sdk.to_bytes(),
+        );
+        let token_y_program_spl = spl_token::solana_program::pubkey::Pubkey::new_from_array(
+            token_y_program_sdk.to_bytes(),
+        );
 
         // Derive ATAs for user with correct token programs
         let user_token_x_spl =
@@ -941,9 +963,17 @@ impl Dex for MeteoraDlmm {
         // CRITICAL: Pass actual token programs (SPL Token or Token-2022) for correct ATA handling
         let swap_builder = MeteoraDlmmSwapBuilder::new(self.rpc.clone());
 
-        // Convert spl_token Pubkeys back to solana_sdk Pubkeys for builder
-        let token_x_program_sdk = Pubkey::new_from_array(token_x_program_spl.to_bytes());
-        let token_y_program_sdk = Pubkey::new_from_array(token_y_program_spl.to_bytes());
+        let bin_array_bitmap = pool_cache.bin_array_bitmap.or_else(|| {
+            self.live_pool_cache
+                .as_ref()
+                .and_then(|c| c.meteora_dlmm_bin_array_bitmap(&pool_addr))
+        });
+        let bitmap_extension_payload: Option<Vec<u8>> =
+            pool_cache.bitmap_extension_payload.clone().or_else(|| {
+                self.live_pool_cache
+                    .as_ref()
+                    .and_then(|c| c.meteora_dlmm_bitmap_extension_payload(&pool_addr))
+            });
 
         let bin_array_coverage = {
             let use_active_only = self
@@ -969,16 +999,6 @@ impl Dex for MeteoraDlmm {
             );
         }
 
-        let has_bitmap_extension = self
-            .extra_data
-            .get(crate::solana::dex::meteora_swap_builder::METEORA_HAS_BITMAP_EXTENSION_KEY)
-            .and_then(|v| v.parse::<bool>().ok())
-            .or_else(|| {
-                self.live_pool_cache
-                    .as_ref()
-                    .and_then(|cache| cache.meteora_dlmm_has_bitmap_extension(&pool_addr))
-            });
-
         let ix = swap_builder.build_swap_with_bins_sync_coverage(
             &pool_addr,
             &pool.reserve_x,
@@ -996,7 +1016,8 @@ impl Dex for MeteoraDlmm {
             pool.active_id,
             pool.bin_step,
             bin_array_coverage,
-            has_bitmap_extension,
+            bin_array_bitmap,
+            bitmap_extension_payload.as_deref(),
         )?;
 
         Ok(vec![ix])
@@ -1030,6 +1051,18 @@ impl Dex for MeteoraDlmm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
+
+    fn bin_array_bitmap_tag_for_active_id(active_id: i32) -> String {
+        let idx = MeteoraDlmmSwapBuilder::bin_id_to_bin_array_index(active_id);
+        let mut bitmap = [0u64; 16];
+        let bit_pos = (idx + 512) as u32;
+        bitmap[(bit_pos / 64) as usize] = 1u64 << (bit_pos % 64);
+        format!(
+            "bin_array_bitmap:{}",
+            MeteoraDlmmSwapBuilder::format_bin_array_bitmap_tag(&bitmap)
+        )
+    }
 
     #[tokio::test]
     async fn test_update_reserve_balances_rejects_on_cache_miss_when_geyser_only() {
@@ -1093,6 +1126,7 @@ mod tests {
                     reserve_y.to_string(),
                     "active_id:100".to_string(),
                     "bin_step:10".to_string(),
+                    bin_array_bitmap_tag_for_active_id(100),
                 ],
             )
             .expect("set_pool_from_accounts");
@@ -1157,6 +1191,7 @@ mod tests {
                     reserve_y.to_string(),
                     format!("active_id:{active_id}"),
                     "bin_step:10".to_string(),
+                    bin_array_bitmap_tag_for_active_id(active_id),
                 ],
             )
             .expect("set_pool_from_accounts");

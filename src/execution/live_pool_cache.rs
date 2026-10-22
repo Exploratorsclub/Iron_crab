@@ -770,6 +770,12 @@ pub struct LivePoolCache {
     /// Side map (not in [`MeteoraState`]) so Level-5 eval struct literals stay stable.
     meteora_dlmm_has_bitmap_extension_by_pool: DashMap<Pubkey, bool>,
 
+    /// Meteora DLMM LB-pair internal bin-array bitmap (16 words @ offset 584). Not in [`MeteoraState`].
+    meteora_dlmm_bin_array_bitmap_by_pool: DashMap<Pubkey, [u64; 16]>,
+
+    /// Meteora DLMM `BinArrayBitmapExtension` payload bytes `[40, 1576)`.
+    meteora_dlmm_bitmap_extension_payload_by_pool: DashMap<Pubkey, Vec<u8>>,
+
     /// PumpSwap pool-market → extended `sell` layout observed on-chain (Scope 46).
     /// **Not** part of [`PumpAmmState`] so external crates (Level-5 eval) keep stable struct literals.
     /// Monotonic flag: once true, never cleared.
@@ -833,6 +839,8 @@ impl LivePoolCache {
             orca_readiness_by_pool: DashMap::new(),
             meteora_dlmm_readiness_by_pool: DashMap::new(),
             meteora_dlmm_has_bitmap_extension_by_pool: DashMap::new(),
+            meteora_dlmm_bin_array_bitmap_by_pool: DashMap::new(),
+            meteora_dlmm_bitmap_extension_payload_by_pool: DashMap::new(),
             pump_amm_sell_extended_flag_by_market: DashMap::new(),
             pump_amm_sell_extended_third_meta_by_market: DashMap::new(),
             pump_amm_sell_extended_tail_0_by_market: DashMap::new(),
@@ -1687,21 +1695,70 @@ impl LivePoolCache {
             .map(|v| *v)
     }
 
-    /// JetStream / Geyser metadata: merge bitmap-extension existence into side map.
+    pub fn set_meteora_dlmm_bin_array_bitmap(&self, pool: &Pubkey, bitmap: [u64; 16]) {
+        self.meteora_dlmm_bin_array_bitmap_by_pool
+            .insert(*pool, bitmap);
+    }
+
+    pub fn meteora_dlmm_bin_array_bitmap(&self, pool: &Pubkey) -> Option<[u64; 16]> {
+        self.meteora_dlmm_bin_array_bitmap_by_pool
+            .get(pool)
+            .map(|v| *v)
+    }
+
+    /// Geyser: store extension payload (bytes 40..1576 of extension account).
+    pub fn set_meteora_dlmm_bitmap_extension_payload(&self, pool: &Pubkey, payload: Vec<u8>) {
+        self.meteora_dlmm_bitmap_extension_payload_by_pool
+            .insert(*pool, payload);
+    }
+
+    pub fn meteora_dlmm_bitmap_extension_payload(&self, pool: &Pubkey) -> Option<Vec<u8>> {
+        self.meteora_dlmm_bitmap_extension_payload_by_pool
+            .get(pool)
+            .map(|v| v.clone())
+    }
+
+    /// LB pair account parse (904 bytes): internal bitmap words at offset 584.
+    pub fn ingest_meteora_dlmm_lb_pair_bitmap_from_account_data(&self, pool: &Pubkey, data: &[u8]) {
+        if let Some(bitmap) =
+            crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::parse_lb_pair_internal_bitmap(
+                data,
+            )
+        {
+            self.set_meteora_dlmm_bin_array_bitmap(pool, bitmap);
+        }
+    }
+
+    /// JetStream / Geyser metadata: merge DLMM bitmap side maps (missing keys do not clear existing).
     pub fn merge_meteora_dlmm_bitmap_extension_from_metadata(
         &self,
         pool: &Pubkey,
         meta: Option<&std::collections::HashMap<String, String>>,
     ) {
-        use crate::ipc::POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY;
+        use crate::ipc::{
+            POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY,
+            POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY,
+            POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY,
+        };
         let Some(m) = meta else {
             return;
         };
-        let Some(v) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY) else {
-            return;
-        };
-        if let Ok(has_extension) = v.parse::<bool>() {
-            self.set_meteora_dlmm_has_bitmap_extension(pool, has_extension);
+        if let Some(v) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_HAS_BITMAP_EXTENSION_KEY) {
+            if let Ok(has_extension) = v.parse::<bool>() {
+                self.set_meteora_dlmm_has_bitmap_extension(pool, has_extension);
+            }
+        }
+        if let Some(tag) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BIN_ARRAY_BITMAP_KEY) {
+            if let Some(bitmap) =
+                crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder::parse_bin_array_bitmap_tag(tag)
+            {
+                self.set_meteora_dlmm_bin_array_bitmap(pool, bitmap);
+            }
+        }
+        if let Some(hex) = m.get(POOL_CACHE_UPDATE_METEORA_DLMM_BITMAP_EXTENSION_PAYLOAD_KEY) {
+            if let Some(payload) = decode_meteora_extension_payload_hex(hex) {
+                self.set_meteora_dlmm_bitmap_extension_payload(pool, payload);
+            }
         }
     }
 
@@ -2917,6 +2974,18 @@ fn parse_raydium_cpmm(data: &[u8]) -> Option<CachedPoolState> {
         reserve_0: None,
         reserve_1: None,
     }))
+}
+
+fn decode_meteora_extension_payload_hex(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
+        out.push(byte);
+    }
+    Some(out)
 }
 
 fn parse_meteora_dlmm(data: &[u8]) -> Option<CachedPoolState> {

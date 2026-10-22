@@ -298,10 +298,13 @@ fn md_sidefx_build_balance_updated_from_cache(
                 .merge_orca_pool_readiness(*pool_pubkey, readiness);
         }
         CachedPoolState::Meteora(s) => {
+            let lpc = host.live_pool_cache();
             balance_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(
                 s,
-                host.live_pool_cache()
-                    .meteora_dlmm_has_bitmap_extension(pool_pubkey),
+                lpc.meteora_dlmm_has_bitmap_extension(pool_pubkey),
+                lpc.meteora_dlmm_bin_array_bitmap(pool_pubkey),
+                lpc.meteora_dlmm_bitmap_extension_payload(pool_pubkey)
+                    .as_deref(),
             ));
             let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
             balance_update.set_dex_readiness_in_metadata(readiness);
@@ -1583,6 +1586,12 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
         {
             host.live_pool_cache()
                 .set_meteora_dlmm_has_bitmap_extension(&lb_pair, true);
+            if let Some(payload) =
+                MeteoraDlmmSwapBuilder::parse_bitmap_extension_payload(account_data)
+            {
+                host.live_pool_cache()
+                    .set_meteora_dlmm_bitmap_extension_payload(&lb_pair, payload);
+            }
             if host.is_hot_pool(&lb_pair) {
                 if let Some(balance_update) =
                     md_sidefx_build_balance_updated_from_cache(host, run_id, &lb_pair, *slot)
@@ -1653,6 +1662,10 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
             // Stale Geyser snapshot (e.g. HIGH/LOW queue reorder for same pubkey): skip downstream
             // JetStream / MarketEvent side effects so trading state cannot regress.
             return;
+        }
+        if matches!(&cached_state, CachedPoolState::Meteora(_)) && account_data.len() == 904 {
+            host.live_pool_cache()
+                .ingest_meteora_dlmm_lb_pair_bitmap_from_account_data(pool_pubkey, account_data);
         }
 
         // I-MD-4: publish merged MASTER row (not partial account-parse clone with 0/0 reserves).
@@ -1989,10 +2002,13 @@ pub fn md_sidefx_process_live_pool_cache_account_update(
                     pool_update.set_dex_readiness_in_metadata(readiness);
                 }
                 CachedPoolState::Meteora(s) => {
+                    let lpc = host.live_pool_cache();
                     pool_update.metadata = Some(meteora_dlmm_metadata_for_pool_cache_update(
                         s,
-                        host.live_pool_cache()
-                            .meteora_dlmm_has_bitmap_extension(pool_pubkey),
+                        lpc.meteora_dlmm_has_bitmap_extension(pool_pubkey),
+                        lpc.meteora_dlmm_bin_array_bitmap(pool_pubkey),
+                        lpc.meteora_dlmm_bitmap_extension_payload(pool_pubkey)
+                            .as_deref(),
                     ));
                     let readiness = meteora_dlmm_readiness_for_pool_cache_update(s);
                     pool_update.set_dex_readiness_in_metadata(readiness);
@@ -2237,10 +2253,13 @@ pub fn md_sidefx_process_vault_balance_tick(
                 host.live_pool_cache().get(&vault_view.pool_address)
             {
                 let mut meta = balance_update.metadata.take().unwrap_or_default();
+                let lpc = host.live_pool_cache();
                 for (k, v) in meteora_dlmm_metadata_for_pool_cache_update(
                     s,
-                    host.live_pool_cache()
-                        .meteora_dlmm_has_bitmap_extension(&vault_view.pool_address),
+                    lpc.meteora_dlmm_has_bitmap_extension(&vault_view.pool_address),
+                    lpc.meteora_dlmm_bin_array_bitmap(&vault_view.pool_address),
+                    lpc.meteora_dlmm_bitmap_extension_payload(&vault_view.pool_address)
+                        .as_deref(),
                 ) {
                     meta.insert(k, v);
                 }
