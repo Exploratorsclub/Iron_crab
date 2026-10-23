@@ -149,7 +149,8 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
-    config_subject, ensure_execution_results_stream, execution_results_consumer_config,
+    config_subject, ensure_execution_results_stream, ensure_token_program_stream,
+    execution_results_consumer_config,
     split_arb_track_requests_update, trim_reconcile_update_to_budget, ArbTrackActiveEntry,
     ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRemovedEntry, ArbTrackRequestsUpdate,
     ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME,
@@ -10165,6 +10166,14 @@ async fn main() -> Result<()> {
     };
 
     let token_program_consumer = if let Some(ref nats) = ctx.nats {
+        if let Err(e) = ensure_token_program_stream(nats.client()).await {
+            warn!(
+                error = %e,
+                stream = TOKEN_PROGRAM_STREAM_NAME,
+                "Failed to ensure TOKEN_PROGRAM JetStream stream (will still try bootstrap/live consumer)"
+            );
+        }
+
         let ctx_bootstrap = Arc::clone(&ctx);
         match bootstrap_token_program_from_jetstream(nats, |update| {
             if let Some((mint, token_program)) = acceptable_token_program_update(update) {
