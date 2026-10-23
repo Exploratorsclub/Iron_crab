@@ -8,6 +8,14 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-TOKEN-PROGRAM-JETSTREAM: Arb-Tracker leer nach Neustart trotz TokenMintInfo (Prod `964d743`, A.57)
+**Datum**: 2026-10-23  
+**Problem**: Prod `964d743`: Quotes liefen, 0 Arb-Intents. `create_arb_intent` lehnte mit `token program unknown (GEYSER-FIRST)` ab. `TokenMintInfo` ging nur über Core-NATS (nicht persistent); nach Neustart oder verlorenen Mint-Updates blieb `TokenArbTracker.token_program` leer, obwohl Vault/Mint-Owner schon beobachtet waren.  
+**Fix**: JetStream-Stream `TOKEN_PROGRAM` mit Subject `ironcrab.token_program.{mint}` (`max_messages_per_subject=1`). Market-Data publiziert `TokenProgramUpdate` aus Mint-Account- und Vault-Owner-Pfad (dedupliziert pro Prozess). arb-strategy und execution-engine bootstrappen ephemeral mit `DeliverPolicy::LastPerSubject`, Live-Consumer `DeliverPolicy::New`. Core-`TokenMintInfo` bleibt für Supply/Decimals.  
+**Invarianten**: A.57, I-7, I-4b, I-MD-5, I-12.  
+**Dateien**: `jetstream.rs`, `ipc/schema.rs`, `execution/token_program_sync.rs`, `market_data/ingest/account_handler.rs`, `market_data/sidefx/handlers.rs`, `arb_strategy.rs`, `execution_engine.rs`, `market_data.rs`, `docs/BUGS_FIXES.md`
+
+
 ### FIX-PUMP-FEE-CONFIG-MD-SESSION: FeeConfig nur in totem `cache_geyser` abonniert (Prod `1db61b9`)
 **Datum**: 2026-09-28  
 **Problem**: Prod `1db61b9`: Pump-Quotes blieben `None`, weil `PUMP_AMM_FEE_CONFIG_CACHE` leer war. Der Geyser-Filter saß in `build_cache_subscribe_request` (`cache_geyser`), aber `spawn_cache_geyser_task` startet die execution-engine nicht. Market-Data droppte FeeConfig-Updates als `NonDexNonMembership`.  

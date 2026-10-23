@@ -69,12 +69,16 @@ use ironcrab::execution::pump_amm_fee_config_sync::{
     bootstrap_pump_amm_global_fee_config_from_jetstream,
     create_pump_amm_global_fee_config_live_consumer,
 };
+use ironcrab::execution::token_program_sync::{
+    acceptable_token_program_update, bootstrap_token_program_from_jetstream,
+    create_token_program_live_consumer,
+};
 use ironcrab::ipc::ExecutionResult;
 use ironcrab::ipc::{
     BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
     IntentTier, MarketEvent, MarketEventKind, OrcaTickSnapshot, PoolCacheUpdate,
-    PoolCacheUpdateType, PumpAmmGlobalFeeConfigUpdate, TradeIntent, TradeResources, TradeSide,
-    TradingRegime,
+    PoolCacheUpdateType, PumpAmmGlobalFeeConfigUpdate, TokenProgramUpdate, TradeIntent,
+    TradeResources, TradeSide, TradingRegime,
 };
 use ironcrab::metrics::{
     arb_heartbeat_finished, arb_pool_cache_apply_batches_inc, arb_pool_cache_sync_fetch_empty_inc,
@@ -145,11 +149,12 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{
     arb_strategy_pool_cache_live_consumer_config, arb_track_payload_bytes, config_consumer_config,
-    config_subject, ensure_execution_results_stream, execution_results_consumer_config,
-    split_arb_track_requests_update, trim_reconcile_update_to_budget, ArbTrackActiveEntry,
-    ArbTrackActiveReason, ArbTrackReadiness, ArbTrackRemovedEntry, ArbTrackRequestsUpdate,
-    ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES, CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME,
-    PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME, STREAM_NAME, TOPIC_EXECUTION_RESULTS,
+    config_subject, ensure_execution_results_stream, ensure_token_program_stream,
+    execution_results_consumer_config, split_arb_track_requests_update,
+    trim_reconcile_update_to_budget, ArbTrackActiveEntry, ArbTrackActiveReason, ArbTrackReadiness,
+    ArbTrackRemovedEntry, ArbTrackRequestsUpdate, ARB_TRACK_PUBLISH_MAX_PAYLOAD_BYTES,
+    CONFIG_STREAM_NAME, EXECUTION_RESULTS_STREAM_NAME, PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME,
+    STREAM_NAME, TOKEN_PROGRAM_STREAM_NAME, TOPIC_EXECUTION_RESULTS,
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
@@ -9719,6 +9724,48 @@ fn spawn_arb_pump_amm_global_fee_config_worker(consumer: JetStreamPullConsumer) 
     });
 }
 
+fn spawn_arb_token_program_jetstream_worker(ctx: Arc<ArbContext>, consumer: JetStreamPullConsumer) {
+    tokio::spawn(async move {
+        loop {
+            use futures::StreamExt;
+            match consumer
+                .fetch()
+                .max_messages(16)
+                .expires(Duration::from_millis(250))
+                .messages()
+                .await
+            {
+                Ok(mut messages) => {
+                    while let Some(msg_result) = messages.next().await {
+                        if let Ok(msg) = msg_result {
+                            NATS_MESSAGES_RECEIVED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            match serde_json::from_slice::<TokenProgramUpdate>(&msg.payload) {
+                                Ok(update) => {
+                                    if let Some((mint, token_program)) =
+                                        acceptable_token_program_update(&update)
+                                    {
+                                        ctx.handle_token_mint_info(mint, token_program);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to deserialize TokenProgramUpdate");
+                                }
+                            }
+                            if let Err(e) = msg.ack().await {
+                                warn!(error = %e, "Failed to ack TokenProgramUpdate");
+                            }
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Err(_) => {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    });
+}
+
 fn spawn_arb_config_js_worker(ctx: Arc<ArbContext>, consumer: JetStreamPullConsumer) {
     tokio::spawn(async move {
         loop {
@@ -10117,6 +10164,57 @@ async fn main() -> Result<()> {
         None
     };
 
+    let token_program_consumer = if let Some(ref nats) = ctx.nats {
+        if let Err(e) = ensure_token_program_stream(nats.client()).await {
+            warn!(
+                error = %e,
+                stream = TOKEN_PROGRAM_STREAM_NAME,
+                "Failed to ensure TOKEN_PROGRAM JetStream stream (will still try bootstrap/live consumer)"
+            );
+        }
+
+        let ctx_bootstrap = Arc::clone(&ctx);
+        match bootstrap_token_program_from_jetstream(nats, |update| {
+            if let Some((mint, token_program)) = acceptable_token_program_update(update) {
+                ctx_bootstrap.handle_token_mint_info(mint, token_program);
+                true
+            } else {
+                false
+            }
+        })
+        .await
+        {
+            Ok(applied) if applied > 0 => {
+                info!(
+                    applied_mints = applied,
+                    "Arb token program: bootstrap applied JetStream snapshots (A.57)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "Arb token program JetStream bootstrap failed");
+            }
+        }
+
+        match create_token_program_live_consumer(nats).await {
+            Ok(Some(consumer)) => {
+                info!(
+                    stream = TOKEN_PROGRAM_STREAM_NAME,
+                    deliver_policy = "New",
+                    "Arb token program live consumer created (ephemeral, A.57)"
+                );
+                Some(consumer)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "Failed to create arb token program live JetStream consumer");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // JetStream consumer for ExecutionResults — release in-flight arb dedup on terminal EE outcomes.
     let execution_results_consumer = if let Some(ref nats) = ctx.nats {
         if let Err(e) = ensure_execution_results_stream(nats.client()).await {
@@ -10210,6 +10308,10 @@ async fn main() -> Result<()> {
     if let Some(consumer) = pump_amm_fee_config_consumer {
         info!("Starting dedicated Pump FeeConfig JetStream worker (A.56)");
         spawn_arb_pump_amm_global_fee_config_worker(consumer);
+    }
+    if let Some(consumer) = token_program_consumer {
+        info!("Starting dedicated token program JetStream worker (A.57)");
+        spawn_arb_token_program_jetstream_worker(ctx.clone(), consumer);
     }
     if let Some(consumer) = execution_results_consumer {
         info!("Starting dedicated ExecutionResults JetStream worker (in-flight arb dedup)");

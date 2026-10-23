@@ -73,8 +73,8 @@ use ironcrab::ipc::{
     FairnessPolicy, FeePolicy, FillStatus, FillUnavailableReason, IntentOrigin, IntentTier,
     KillSwitchContext, MarketEvent, MarketEventKind, PoolCacheUpdate, PositionAuthoritySnapshot,
     PriorityFeePercentiles, PumpAmmGlobalFeeConfigUpdate, RecordHeader, RejectReason,
-    SimulationResult, TradeExecutionConstraints, TradeIntent, TradeResources, TradeSide,
-    TradingRegime, POSITION_AUTHORITY_KV_BUCKET,
+    SimulationResult, TokenProgramUpdate, TradeExecutionConstraints, TradeIntent, TradeResources,
+    TradeSide, TradingRegime, POSITION_AUTHORITY_KV_BUCKET,
 };
 use ironcrab::ipc::{ControlRequest, ControlRequestKind, ControlResponse, ControlResponseStatus};
 use ironcrab::metrics::{
@@ -116,16 +116,16 @@ use ironcrab::metrics::{
 };
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
-    ensure_pump_amm_global_fee_config_stream, ensure_trade_intents_stream,
-    pool_cache_live_consumer_config_execution_engine, wallet_snapshot_consumer_config,
-    wallet_snapshot_live_consumer_config_execution_engine,
+    ensure_pump_amm_global_fee_config_stream, ensure_token_program_stream,
+    ensure_trade_intents_stream, pool_cache_live_consumer_config_execution_engine,
+    wallet_snapshot_consumer_config, wallet_snapshot_live_consumer_config_execution_engine,
     wallet_tx_confirm_live_consumer_config_execution_engine, MomentumActivePinReason,
     MomentumActivePoolEntry, MomentumActivePoolsUpdate, NatsClient, NatsConfig, CONFIG_STREAM_NAME,
     MOMENTUM_ACTIVE_POOLS_WIRE_VERSION, PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME, STREAM_NAME,
-    TOPIC_CONTROL_REQUESTS, TOPIC_CONTROL_RESPONSES, TOPIC_DECISION_RECORDS,
-    TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS, TOPIC_MOMENTUM_ACTIVE_POOLS,
-    TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS, TRADE_INTENTS_STREAM_NAME,
-    WALLET_SNAPSHOT_STREAM_NAME, WALLET_TX_CONFIRM_STREAM_NAME,
+    TOKEN_PROGRAM_STREAM_NAME, TOPIC_CONTROL_REQUESTS, TOPIC_CONTROL_RESPONSES,
+    TOPIC_DECISION_RECORDS, TOPIC_EXECUTION_RESULTS, TOPIC_MARKET_EVENTS,
+    TOPIC_MOMENTUM_ACTIVE_POOLS, TOPIC_PRIORITY_FEE_SAMPLES, TOPIC_TRADE_INTENTS,
+    TRADE_INTENTS_STREAM_NAME, WALLET_SNAPSHOT_STREAM_NAME, WALLET_TX_CONFIRM_STREAM_NAME,
 };
 use ironcrab::position_authority::{
     open_positions_count_from_kv_snapshots, position_authority_drift_ee_vs_kv,
@@ -7323,6 +7323,10 @@ use ironcrab::execution::pump_amm_fee_config_sync::{
     bootstrap_pump_amm_global_fee_config_from_jetstream,
     create_pump_amm_global_fee_config_live_consumer,
 };
+use ironcrab::execution::token_program_sync::{
+    apply_token_program_jetstream_update_live_pool_cache, bootstrap_token_program_from_jetstream,
+    create_token_program_live_consumer,
+};
 
 /// Bootstrap open positions count from wallet snapshots (JetStream)
 ///
@@ -7981,6 +7985,115 @@ async fn start_pump_amm_global_fee_config_jetstream_tasks(
         Ok(None) => {}
         Err(e) => {
             warn!(error = %e, "Failed to create Pump AMM FeeConfig live JetStream consumer");
+        }
+    }
+}
+
+async fn run_token_program_jetstream_consumer_task(
+    cache: Arc<ironcrab::execution::live_pool_cache::LivePoolCache>,
+    consumer: JetStreamPullConsumer,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    use futures::StreamExt;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            info!("Token program JetStream consumer task shutting down");
+            break;
+        }
+
+        match consumer
+            .fetch()
+            .max_messages(EE_JETSTREAM_CONSUMER_BATCH_MAX)
+            .expires(EE_JETSTREAM_CONSUMER_FETCH_EXPIRES)
+            .messages()
+            .await
+        {
+            Ok(mut messages) => {
+                while let Some(msg_result) = messages.next().await {
+                    match msg_result {
+                        Ok(msg) => {
+                            match serde_json::from_slice::<TokenProgramUpdate>(&msg.payload) {
+                                Ok(update) => {
+                                    if apply_token_program_jetstream_update_live_pool_cache(
+                                        &cache, &update,
+                                    ) {
+                                        debug!(
+                                            slot = update.slot,
+                                            mint = %update.mint,
+                                            "Applied TokenProgramUpdate to SLAVE LivePoolCache"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to deserialize TokenProgramUpdate");
+                                }
+                            }
+                            if let Err(e) = msg.ack().await {
+                                warn!(error = %e, "Failed to ack TokenProgramUpdate");
+                            }
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "JetStream token program fetch returned error");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "No new TokenProgramUpdate messages");
+            }
+        }
+
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn start_token_program_jetstream_tasks(
+    nats_client: &NatsClient,
+    cache: Arc<ironcrab::execution::live_pool_cache::LivePoolCache>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    if ensure_token_program_stream(nats_client.client())
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    match bootstrap_token_program_from_jetstream(nats_client, |update| {
+        apply_token_program_jetstream_update_live_pool_cache(cache.as_ref(), update)
+    })
+    .await
+    {
+        Ok(applied) if applied > 0 => {
+            info!(
+                applied_mints = applied,
+                "Token program: bootstrap applied JetStream snapshots (A.57)"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(error = %e, "Token program JetStream bootstrap failed");
+        }
+    }
+
+    match create_token_program_live_consumer(nats_client).await {
+        Ok(Some(consumer)) => {
+            let shutdown_rx_tp = shutdown_rx.clone();
+            let cache_spawn = Arc::clone(&cache);
+            tokio::spawn(async move {
+                run_token_program_jetstream_consumer_task(cache_spawn, consumer, shutdown_rx_tp)
+                    .await;
+            });
+            info!(
+                stream = TOKEN_PROGRAM_STREAM_NAME,
+                deliver_policy = "New",
+                "Token program live consumer task started (ephemeral, A.57)"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(error = %e, "Failed to create token program live JetStream consumer");
         }
     }
 }
@@ -8857,6 +8970,11 @@ async fn main() -> Result<()> {
 
     if let Some(ref nats_client) = &nats {
         start_pump_amm_global_fee_config_jetstream_tasks(nats_client, shutdown_rx.clone()).await;
+    }
+
+    if let (Some(ref nats_client), Some(ref cache)) = (&nats, &live_pool_cache) {
+        start_token_program_jetstream_tasks(nats_client, Arc::clone(cache), shutdown_rx.clone())
+            .await;
     }
 
     // I-24d: No global Startup-Seeding/Discovery-Rebuild. market-data is Discovery authority.

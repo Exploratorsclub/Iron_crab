@@ -3211,3 +3211,35 @@ impl PumpAmmGlobalFeeConfigUpdate {
         }
     }
 }
+
+// ============================================================================
+// Observed token program per mint (A.57 — market-data Geyser → JetStream)
+// ============================================================================
+
+/// Last observed SPL Token or Token-2022 program for a mint (A.57).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenProgramUpdate {
+    #[serde(flatten)]
+    pub header: RecordHeader,
+    pub slot: u64,
+    pub mint: String,
+    pub token_program: String,
+}
+
+impl TokenProgramUpdate {
+    pub fn new(
+        component: &str,
+        build: &str,
+        run_id: &str,
+        slot: u64,
+        mint: &str,
+        token_program: &str,
+    ) -> Self {
+        Self {
+            header: RecordHeader::new(component, build, run_id),
+            slot,
+            mint: mint.to_string(),
+            token_program: token_program.to_string(),
+        }
+    }
+}

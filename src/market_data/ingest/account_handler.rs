@@ -12,7 +12,7 @@ use super::account_parse::{
     wsol_ata_balance_lamports_from_geyser_data, WalletGeyserUpdateSource,
 };
 use super::dlmm_bin_publish::filter_dlmm_bins_for_publish;
-use crate::ipc::{MarketEvent, MarketEventKind, NATIVE_SOL_MINT};
+use crate::ipc::{MarketEvent, MarketEventKind, TokenProgramUpdate, NATIVE_SOL_MINT};
 use crate::market_data::ingest::AccountUpdateClass;
 use crate::market_data::md_state::MdStateSender;
 use crate::market_data::orca_tick_publish::publish_orca_tick_array_from_geyser;
@@ -30,6 +30,10 @@ use crate::metrics::{
     inc_market_data_dlmm_bin_publish_enrich_total, inc_market_data_dlmm_bin_publish_exec_hot_total,
     inc_market_data_dlmm_bin_replay_publish_total, record_market_data_tokio_progress,
     record_market_data_unparsed_account_dropped, MarketDataUnparsedAccountDropReason,
+};
+use crate::nats::jetstream::{
+    token_program_jetstream_enqueue_wanted, token_program_jetstream_mark_enqueued,
+    token_program_subject,
 };
 use crate::nats::wallet_snapshot_subject;
 use crate::solana::dex::meteora_bin_array_layout::BinArray;
@@ -451,6 +455,32 @@ pub async fn handle_geyser_account_update<H: AccountIngestHost>(
                     }),
                 )
                 .await;
+
+                let mint_pk = account_update.pubkey;
+                let program_pk = account_update.owner;
+                if token_program_jetstream_enqueue_wanted(mint_pk, program_pk) {
+                    let payload = TokenProgramUpdate::new(
+                        "market-data",
+                        host.account_build_version(),
+                        run_id,
+                        account_update.slot,
+                        &mint_pk.to_string(),
+                        &program_pk.to_string(),
+                    );
+                    let subject = token_program_subject(&mint_pk.to_string());
+                    if account_path_enqueue_jetstream(
+                        publish_tx,
+                        host.account_nats(),
+                        subject,
+                        &payload,
+                        "TokenProgramUpdate (mint account)",
+                        false,
+                    )
+                    .await
+                    {
+                        token_program_jetstream_mark_enqueued(mint_pk, program_pk);
+                    }
+                }
             }
             return;
         }
