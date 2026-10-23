@@ -926,7 +926,8 @@ mod tests {
             _payload: serde_json::Value,
             _log_fail: &'static str,
             _bump_market_events_published_total: bool,
-        ) {
+        ) -> bool {
+            true
         }
         fn flush_lru_touches(&self, _scratch: &mut MdSidefxBurstScratch) {}
         fn live_pool_cache(&self) -> &crate::execution::live_pool_cache::LivePoolCache {
@@ -1127,7 +1128,8 @@ mod tests {
             _payload: serde_json::Value,
             _log_fail: &'static str,
             _bump_market_events_published_total: bool,
-        ) {
+        ) -> bool {
+            true
         }
         fn flush_lru_touches(&self, _scratch: &mut MdSidefxBurstScratch) {}
         fn live_pool_cache(&self) -> &crate::execution::live_pool_cache::LivePoolCache {

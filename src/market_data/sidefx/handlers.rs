@@ -21,6 +21,7 @@ use crate::execution::live_pool_cache::{
     raydium_amm_readiness_for_pool_cache_update, CachedPoolState, PumpFunState,
     SetPumpAmmPoolAccountsResult,
 };
+use crate::ipc::TokenProgramUpdate;
 use crate::ipc::{
     DexPoolReadiness, MarketEvent, MarketEventKind, PoolCacheUpdate, NATIVE_SOL_MINT,
     POOL_CACHE_UPDATE_METEORA_CPMM_ONCHAIN_MINTS_KEY, POOL_CACHE_UPDATE_METEORA_CPMM_VAULTS_KEY,
@@ -39,7 +40,10 @@ use crate::metrics::{
     record_market_data_bonding_curve_grpc_to_devwallet_ms,
     record_market_data_pool_mint_map_to_devwallet_ms, MarketDataLatencySegment,
 };
-use crate::nats::jetstream::pool_subject;
+use crate::nats::jetstream::{
+    pool_subject, token_program_jetstream_enqueue_wanted, token_program_jetstream_mark_enqueued,
+    token_program_subject,
+};
 use crate::solana::dex::meteora_swap_builder::MeteoraDlmmSwapBuilder;
 use crate::solana::dex_parser::DexType;
 use solana_sdk::pubkey::Pubkey;
@@ -66,42 +70,67 @@ fn md_sidefx_maybe_publish_vault_observed_token_program(
     if mint == Pubkey::default() || !is_observed_spl_token_program(&token_program) {
         return;
     }
-    if host.live_pool_cache().get_mint_program(&mint) == Some(token_program) {
-        return;
-    }
-    let mint_event = MarketEvent::new(
-        "market-data",
-        host.build_version(),
-        run_id,
-        host.next_event_id(),
-        "geyser_vault",
-        Some(slot),
-        MarketEventKind::TokenMintInfo {
-            mint: mint.to_string(),
-            token_program: token_program.to_string(),
-            decimals: 0,
-            supply: 0,
-            mint_authority: None,
-            freeze_authority: None,
-        },
-    );
-    host.write_market_event_jsonl(&mint_event);
-    if host.nats_enabled() {
-        let enqueued = host.enqueue_core_market_event(
-            mint_event,
-            Some(MarketEventCorePublishTrace {
-                recv_at: grpc_recv_at,
-                cold_path: false,
-                segment: MarketDataLatencySegment::Other,
-            }),
+
+    let jetstream_wanted = token_program_jetstream_enqueue_wanted(mint, token_program);
+    let core_mint_info_needed =
+        host.live_pool_cache().get_mint_program(&mint) != Some(token_program);
+
+    if core_mint_info_needed {
+        let mint_event = MarketEvent::new(
+            "market-data",
+            host.build_version(),
+            run_id,
+            host.next_event_id(),
+            "geyser_vault",
+            Some(slot),
+            MarketEventKind::TokenMintInfo {
+                mint: mint.to_string(),
+                token_program: token_program.to_string(),
+                decimals: 0,
+                supply: 0,
+                mint_authority: None,
+                freeze_authority: None,
+            },
         );
-        if enqueued {
+        host.write_market_event_jsonl(&mint_event);
+        if host.nats_enabled() {
+            let enqueued = host.enqueue_core_market_event(
+                mint_event,
+                Some(MarketEventCorePublishTrace {
+                    recv_at: grpc_recv_at,
+                    cold_path: false,
+                    segment: MarketDataLatencySegment::Other,
+                }),
+            );
+            if enqueued {
+                host.live_pool_cache()
+                    .update_mint_program(&mint, token_program);
+            }
+        } else {
             host.live_pool_cache()
                 .update_mint_program(&mint, token_program);
         }
-    } else {
-        host.live_pool_cache()
-            .update_mint_program(&mint, token_program);
+    }
+
+    if jetstream_wanted && host.nats_enabled() {
+        let payload = TokenProgramUpdate::new(
+            "market-data",
+            host.build_version(),
+            run_id,
+            slot,
+            &mint.to_string(),
+            &token_program.to_string(),
+        );
+        let subject = token_program_subject(&mint.to_string());
+        if sidefx_host_enqueue_jetstream(
+            host,
+            subject,
+            &payload,
+            "TokenProgramUpdate (vault observed)",
+            false,
+        ) {
+            token_program_jetstream_mark_enqueued(mint, token_program);
+        }
     }
 }
 
@@ -111,7 +140,7 @@ fn sidefx_host_enqueue_jetstream<T: serde::Serialize>(
     payload: &T,
     log_fail: &'static str,
     bump_market_events_published_total: bool,
-) {
+) -> bool {
     let payload = match serde_json::to_value(payload) {
         Ok(v) => v,
         Err(e) => {
@@ -120,7 +149,7 @@ fn sidefx_host_enqueue_jetstream<T: serde::Serialize>(
                 msg = log_fail,
                 "md-sidefx: failed to serialize JetStream payload"
             );
-            return;
+            return false;
         }
     };
     host.enqueue_jetstream(
@@ -128,7 +157,7 @@ fn sidefx_host_enqueue_jetstream<T: serde::Serialize>(
         payload,
         log_fail,
         bump_market_events_published_total,
-    );
+    )
 }
 
 fn record_arb_quality_master_update(host: &dyn SidefxWorkerHost, update: &PoolCacheUpdate) {

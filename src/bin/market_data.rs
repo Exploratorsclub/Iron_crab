@@ -192,7 +192,7 @@ use ironcrab::metrics::{
 use ironcrab::nats::{
     config_consumer_config, config_subject, ensure_execution_results_stream,
     ensure_pool_cache_stream, ensure_pump_amm_global_fee_config_stream,
-    ensure_wallet_snapshot_stream, ensure_wallet_tx_confirm_stream,
+    ensure_token_program_stream, ensure_wallet_snapshot_stream, ensure_wallet_tx_confirm_stream,
     execution_results_consumer_config, pool_subject,
     pump_amm_global_fee_config_stream_message_count, wallet_snapshot_consumer_config,
     wallet_snapshot_subject, wallet_tx_confirm_subject, ArbTrackActiveEntry, ArbTrackReadiness,
@@ -519,16 +519,16 @@ impl SidefxWorkerHost for MarketDataSidefxHost {
         payload: serde_json::Value,
         log_fail: &'static str,
         bump_market_events_published_total: bool,
-    ) {
+    ) -> bool {
         let Some(tx) = self.publish_tx.as_ref() else {
-            return;
+            return false;
         };
         let job = AccountPathNatsJob::JetStream {
             subject,
             payload,
             bump_market_events_published_total,
         };
-        let _ = try_enqueue_account_path_nats_job(tx, job, log_fail);
+        try_enqueue_account_path_nats_job(tx, job, log_fail)
     }
 
     fn flush_lru_touches(&self, scratch: &mut MdSidefxBurstScratch) {
@@ -9872,6 +9872,14 @@ async fn main() -> Result<()> {
                 error!(error = %e, "Failed to create/update JetStream PUMP_AMM_GLOBAL_FEE_CONFIG stream");
             } else {
                 info!("JetStream PUMP_AMM_GLOBAL_FEE_CONFIG stream ready (A.56 FeeConfig)");
+            }
+
+            if let Err(e) = ensure_token_program_stream(client.client()).await {
+                error!(error = %e, "Failed to create/update JetStream TOKEN_PROGRAM stream");
+            } else {
+                info!(
+                    "JetStream TOKEN_PROGRAM stream ready (A.57 observed token program per mint)"
+                );
             }
 
             // PR3: JetStream stream for wallet TX confirmations (execution-engine confirm path)

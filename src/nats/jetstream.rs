@@ -33,6 +33,17 @@ pub const PUMP_AMM_GLOBAL_FEE_CONFIG_STREAM_NAME: &str = "PUMP_AMM_GLOBAL_FEE_CO
 /// Fixed subject (single global account; not under POOL_CACHE).
 pub const TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG: &str = "ironcrab.pump_amm.global_fee_config";
 
+/// JetStream stream for observed token program per mint (A.57).
+pub const TOKEN_PROGRAM_STREAM_NAME: &str = "TOKEN_PROGRAM";
+
+/// Subject pattern: one compacted message per mint.
+pub const TOPIC_TOKEN_PROGRAM_PATTERN: &str = "ironcrab.token_program.>";
+
+/// Subject for a specific mint (`max_messages_per_subject = 1` on stream).
+pub fn token_program_subject(mint: &str) -> String {
+    format!("ironcrab.token_program.{}", mint)
+}
+
 /// JetStream stream name for pool cache updates
 pub const STREAM_NAME: &str = "POOL_CACHE";
 
@@ -239,6 +250,68 @@ pub fn pump_amm_global_fee_config_live_consumer_config() -> jetstream::consumer:
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
         filter_subject: TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG.to_string(),
         max_ack_pending: 16,
+        ..Default::default()
+    }
+}
+
+/// Create or update JetStream stream for observed token programs per mint (A.57).
+pub async fn ensure_token_program_stream(client: &async_nats::Client) -> Result<()> {
+    let jetstream = jetstream::new(client.clone());
+
+    let stream_config = jetstream::stream::Config {
+        name: TOKEN_PROGRAM_STREAM_NAME.to_string(),
+        subjects: vec![TOPIC_TOKEN_PROGRAM_PATTERN.to_string()],
+        retention: jetstream::stream::RetentionPolicy::Limits,
+        max_age: std::time::Duration::from_secs(7 * 24 * 60 * 60),
+        storage: jetstream::stream::StorageType::File,
+        num_replicas: 1,
+        discard: jetstream::stream::DiscardPolicy::Old,
+        max_messages_per_subject: 1,
+        allow_rollup: true,
+        ..Default::default()
+    };
+
+    match jetstream.get_or_create_stream(stream_config).await {
+        Ok(mut stream) => {
+            let info = stream.info().await?;
+            info!(
+                stream_name = %TOKEN_PROGRAM_STREAM_NAME,
+                subjects = %TOPIC_TOKEN_PROGRAM_PATTERN,
+                max_msgs_per_subject = 1,
+                num_messages = info.state.messages,
+                "JetStream TOKEN_PROGRAM stream ready"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                stream_name = %TOKEN_PROGRAM_STREAM_NAME,
+                error = %e,
+                "Failed to create/update TOKEN_PROGRAM stream"
+            );
+            Err(e).context("TOKEN_PROGRAM stream creation/update failed")
+        }
+    }
+}
+
+/// Ephemeral bootstrap: `LastPerSubject` across all mint subjects (re-read every process start).
+pub fn token_program_bootstrap_consumer_config() -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::LastPerSubject,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        filter_subject: TOPIC_TOKEN_PROGRAM_PATTERN.to_string(),
+        max_ack_pending: 256,
+        ..Default::default()
+    }
+}
+
+/// Ephemeral live consumer: incremental token-program updates after consumer creation.
+pub fn token_program_live_consumer_config() -> jetstream::consumer::pull::Config {
+    jetstream::consumer::pull::Config {
+        deliver_policy: jetstream::consumer::DeliverPolicy::New,
+        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+        filter_subject: TOPIC_TOKEN_PROGRAM_PATTERN.to_string(),
+        max_ack_pending: 256,
         ..Default::default()
     }
 }
@@ -631,6 +704,57 @@ pub fn trade_intents_consumer_config() -> jetstream::consumer::pull::Config {
     }
 }
 
+// ============================================================================
+// A.57 market-data: observed token program JetStream publish gate (process-local)
+// ============================================================================
+
+use dashmap::DashMap;
+use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
+use std::sync::LazyLock;
+
+static TOKEN_PROGRAM_JETSTREAM_ENQUEUED: LazyLock<DashMap<Pubkey, Pubkey>> =
+    LazyLock::new(DashMap::new);
+
+/// True when Geyser owner is SPL Token or Token-2022 (A.57).
+#[must_use]
+pub fn observed_spl_token_program_pubkey(program: &Pubkey) -> bool {
+    program.to_bytes() == spl_token::ID.to_bytes()
+        || program.to_bytes() == spl_token_2022::ID.to_bytes()
+}
+
+/// True when the string parses to SPL Token or Token-2022.
+#[must_use]
+pub fn observed_spl_token_program_str(program: &str) -> bool {
+    Pubkey::from_str(program)
+        .ok()
+        .is_some_and(|pk| observed_spl_token_program_pubkey(&pk))
+}
+
+/// Whether market-data should enqueue a JetStream `TokenProgramUpdate` for this mint/program.
+#[must_use]
+pub fn token_program_jetstream_enqueue_wanted(mint: Pubkey, program: Pubkey) -> bool {
+    if mint == Pubkey::default() || !observed_spl_token_program_pubkey(&program) {
+        return false;
+    }
+    !matches!(
+        TOKEN_PROGRAM_JETSTREAM_ENQUEUED.get(&mint),
+        Some(existing) if *existing == program
+    )
+}
+
+/// Record a successful JetStream enqueue for deduplication (A.57).
+pub fn token_program_jetstream_mark_enqueued(mint: Pubkey, program: Pubkey) {
+    if observed_spl_token_program_pubkey(&program) {
+        TOKEN_PROGRAM_JETSTREAM_ENQUEUED.insert(mint, program);
+    }
+}
+
+#[cfg(test)]
+pub fn token_program_jetstream_enqueue_state_reset_for_tests() {
+    TOKEN_PROGRAM_JETSTREAM_ENQUEUED.clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,5 +893,47 @@ mod tests {
             jetstream::consumer::DeliverPolicy::New
         ));
         assert_eq!(cfg.filter_subject, TOPIC_PUMP_AMM_GLOBAL_FEE_CONFIG);
+    }
+
+    #[test]
+    fn token_program_bootstrap_consumer_is_ephemeral_last_per_subject() {
+        let cfg = token_program_bootstrap_consumer_config();
+        assert!(cfg.durable_name.is_none());
+        assert!(matches!(
+            cfg.deliver_policy,
+            jetstream::consumer::DeliverPolicy::LastPerSubject
+        ));
+        assert_eq!(cfg.filter_subject, TOPIC_TOKEN_PROGRAM_PATTERN);
+    }
+
+    #[test]
+    fn token_program_live_consumer_is_ephemeral_new() {
+        let cfg = token_program_live_consumer_config();
+        assert!(cfg.durable_name.is_none());
+        assert!(matches!(
+            cfg.deliver_policy,
+            jetstream::consumer::DeliverPolicy::New
+        ));
+        assert_eq!(cfg.filter_subject, TOPIC_TOKEN_PROGRAM_PATTERN);
+    }
+
+    #[test]
+    fn token_program_jetstream_enqueue_dedup_per_mint() {
+        token_program_jetstream_enqueue_state_reset_for_tests();
+        let mint = Pubkey::new_unique();
+        let token_2022 = Pubkey::new_from_array(spl_token_2022::id().to_bytes());
+        assert!(token_program_jetstream_enqueue_wanted(mint, token_2022));
+        token_program_jetstream_mark_enqueued(mint, token_2022);
+        assert!(!token_program_jetstream_enqueue_wanted(mint, token_2022));
+        token_program_jetstream_enqueue_state_reset_for_tests();
+    }
+
+    #[test]
+    fn token_program_jetstream_rejects_non_spl_program() {
+        token_program_jetstream_enqueue_state_reset_for_tests();
+        let mint = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        assert!(!token_program_jetstream_enqueue_wanted(mint, other));
+        token_program_jetstream_enqueue_state_reset_for_tests();
     }
 }

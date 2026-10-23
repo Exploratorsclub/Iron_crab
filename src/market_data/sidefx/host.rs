@@ -46,7 +46,7 @@ pub trait SidefxWorkerHost: Send + Sync {
         payload: serde_json::Value,
         log_fail: &'static str,
         bump_market_events_published_total: bool,
-    );
+    ) -> bool;
     fn flush_lru_touches(&self, scratch: &mut MdSidefxBurstScratch);
 
     fn live_pool_cache(&self) -> &LivePoolCache;
