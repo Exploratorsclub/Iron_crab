@@ -2201,6 +2201,7 @@ fn parse_raydium_cpmm_transaction(update: &GeyserTransactionUpdate) -> Option<Pa
 mod tests {
     use super::*;
     use crate::solana::dex::pumpfun::PUMPFUN_BUY_EXACT_SOL_IN_DISCRIMINATOR;
+    use crate::solana::dex::pumpfun_amm::PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS;
     use crate::solana::geyser_listener::{
         GeyserTransactionUpdate, InnerInstruction, TokenAmount, TokenBalance,
     };
@@ -3479,5 +3480,41 @@ mod tests {
             }
             _ => panic!("expected Trade"),
         }
+    }
+
+    /// A.58: 17-account buys must not parse as legacy 23-account v14 (would mis-assign program at GVA slot).
+    #[test]
+    fn a58_parse_pump_buy_17_accounts_does_not_emit_v14_with_program_at_gva_slot() {
+        let pump_program = Pubkey::from_str(PUMPFUN_AMM_PROGRAM).unwrap();
+        let buy_disc = anchor_disc("buy_exact_quote_in");
+        let mut data = buy_disc.to_vec();
+        data.extend_from_slice(&100u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+
+        let mut instruction_accounts: Vec<Pubkey> = (0..PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS)
+            .map(|_| Pubkey::new_unique())
+            .collect();
+        instruction_accounts[16] = pump_program;
+
+        let update = GeyserTransactionUpdate {
+            signature: "a58-pump-17-account-buy".to_string(),
+            slot: 1,
+            account_keys: instruction_accounts.clone(),
+            instruction_accounts,
+            instruction_data: data,
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+            pre_balances: vec![],
+            post_balances: vec![],
+            fee_lamports: 0,
+            compute_units_consumed: None,
+            grpc_recv_at: Instant::now(),
+        };
+
+        assert!(
+            parse_pumpfun_amm_transaction(&update).is_none(),
+            "17-account legacy buy disc must not parse (threshold remains 23)"
+        );
     }
 }

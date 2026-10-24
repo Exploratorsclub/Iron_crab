@@ -40,11 +40,12 @@ use crate::solana::dex::orca::Orca;
 use crate::solana::dex::pumpfun_amm::{
     pump_amm_buy_program_ix_index, pump_amm_canonical_global_config,
     pump_amm_normalize_v14_pool_accounts, pump_amm_resolve_sell_pre_fee_meta_1_for_build,
-    pump_amm_sell_ix_uses_global_fee_at, pump_amm_singleton_global_volume_accumulator_pub,
-    PumpFunAmmDex, PUMPFUN_AMM_BUY_EXT_FEE_CONFIG_IX, PUMPFUN_AMM_BUY_EXT_FEE_PROGRAM_IX,
-    PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
-    PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS,
-    PUMPFUN_AMM_SELL_FEE_CONFIG_IX_V2, PUMPFUN_AMM_SELL_FEE_PROGRAM_IX_V2,
+    pump_amm_sell_ix_uses_global_fee_at, PumpFunAmmDex, PUMPFUN_AMM_BUY_EXT_FEE_CONFIG_IX,
+    PUMPFUN_AMM_BUY_EXT_FEE_PROGRAM_IX, PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS,
+    PUMPFUN_AMM_BUY_V2_FEE_CONFIG_IX, PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS,
+    PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
+    PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_FEE_CONFIG_IX_V2,
+    PUMPFUN_AMM_SELL_FEE_PROGRAM_IX_V2,
 };
 use crate::solana::dex::raydium::Raydium;
 use crate::solana::dex::{Dex, Quote};
@@ -482,28 +483,6 @@ impl CrossDexHandler {
                 pool_str
             ));
         }
-        if is_buy_leg
-            && sell_requires_pre_fee_metas
-            && sell_requires_cashback_remaining
-            && !sell_layout_ready
-        {
-            return Err(anyhow!(
-                "pump_amm BUY: extended v2 layout required for pool {} but LivePoolCache layout not ready",
-                pool_str
-            ));
-        }
-        if is_buy_leg
-            && sell_requires_cashback_remaining
-            && !sell_requires_pre_fee_metas
-            && !sell_layout_ready
-            && sell_cashback_third_meta.is_none()
-        {
-            return Err(anyhow!(
-                "pump_amm BUY: extended layout required for pool {} but LivePoolCache layout not ready (missing third_meta/tails)",
-                pool_str
-            ));
-        }
-
         let global_volume_accumulator = pool_accounts
             .get(11)
             .copied()
@@ -518,17 +497,11 @@ impl CrossDexHandler {
             } else {
                 (cached_sell_pre_fee_meta_1, "cache_unvalidated")
             }
-        } else if is_buy_leg && sell_requires_pre_fee_metas {
-            pump_amm_resolve_sell_pre_fee_meta_1_for_build(
-                &pool_pk,
-                pump_amm_singleton_global_volume_accumulator_pub(),
-                cached_sell_pre_fee_meta_1,
-            )
         } else {
             (cached_sell_pre_fee_meta_1, "cache")
         };
 
-        let use_extended_layout = sell_requires_cashback_remaining && (is_sell_leg || is_buy_leg);
+        let use_extended_layout = sell_requires_cashback_remaining && is_sell_leg;
 
         let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
             input_mint,
@@ -544,7 +517,7 @@ impl CrossDexHandler {
             } else {
                 None
             },
-            sell_requires_pre_fee_metas && (is_sell_leg || is_buy_leg),
+            sell_requires_pre_fee_metas && is_sell_leg,
             sell_pre_fee_meta_1,
             sell_extended_tail_0,
             sell_extended_tail_1,
@@ -583,6 +556,8 @@ impl CrossDexHandler {
             };
             let (fee_cfg_ix, fee_prog_ix) = if is_sell_leg {
                 pump_amm_sell_ix_uses_global_fee_at(account_count).unwrap_or((0, 0))
+            } else if account_count == PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS {
+                (PUMPFUN_AMM_BUY_V2_FEE_CONFIG_IX, 0)
             } else if account_count == PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS {
                 (20, 21)
             } else if account_count == PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS {
@@ -1896,7 +1871,7 @@ mod tests {
         pump_amm_buy_program_ix_index, pump_amm_canonical_global_config,
         pump_amm_lookup_pool_creator_by_base_mint, pump_amm_test_seed_fee_config_and_pool_context,
         PUMPFUN_AMM_BUILD_SWAP_FEE_CONFIG_STR, PUMPFUN_AMM_BUILD_SWAP_FEE_PROGRAM_STR,
-        PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS, PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
+        PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS,
     };
     use crate::solana::dex::router::Router;
     use crate::solana::dex::Quote;
@@ -2643,8 +2618,8 @@ mod tests {
 
         let alt = prod_on_chain_alt_fixture();
         let (tx, _, _, _, plan_ixs) = compile_cross_dex_bundle_tx_prod_alt(&wallet, &plan);
-        // Bundle: CU limit, CU price, Pump buy, Meteora sell, tip → buy at index 2.
-        assert_pump_global_config_prod_alt_compile(&tx, &plan_ixs, &alt, 3, wrong_gc, canonical_gc);
+        // Bundle: CU limit, CU price, Pump buy, Meteora sell, tip → pump buy at instruction index 2.
+        assert_pump_global_config_prod_alt_compile(&tx, &plan_ixs, &alt, 2, wrong_gc, canonical_gc);
     }
 
     #[tokio::test]
@@ -2835,8 +2810,8 @@ mod tests {
         let buy_swap_ix = pump_amm_swap_ix_from_plan_instructions(&ixs);
         assert_eq!(
             buy_swap_ix.accounts.len(),
-            PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS,
-            "cashback-only BUY must use 26-account extended layout"
+            PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS,
+            "A.58: arb BUY must use buy_exact_quote_in_v2 (17 accounts) regardless of sell cashback layout"
         );
         assert!(pump_amm_buy_program_ix_index(buy_swap_ix.accounts.len()).is_some());
     }
