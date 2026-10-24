@@ -15,6 +15,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 **Invarianten**: A.58, I-7, I-4, I-9, I-12.  
 **Dateien**: `src/solana/dex/pumpfun_amm.rs`, `src/solana/cross_dex_handler.rs`, `src/solana/dex_parser.rs` (Unit-Test), `docs/BUGS_FIXES.md`
 
+### FIX-ARB-FEE-PROFITABILITY-PRE-FILTER: Arb publizierte Intents unter EE-Fee-Floor (Prod `7751521`)
+**Datum**: 2026-10-24  
+**Problem**: Prod `7751521`: 10 von 40 Arb-Intents wurden in der Execution-Engine mit `FEE_UNPROFITABLE` / Check `fee_profitability` abgelehnt (Spread 16–20 bps). EE-Kosten ~27,5 bps (Priority 600k µ/CU × 450k CU + 5k Base auf 0,1 SOL) plus Minimum 10 bps — Strategy nutzte nur Spread ohne dieselbe bps-Rechnung.  
+**Fix**: Gemeinsame Funktion `profitability_after_tx_fees_bps` (EE + arb-strategy). `create_arb_intent` filtert vor Publish mit Cross-DEX-CU-Maximum und `FeePolicy::priority_fee_for_intent` wie EE-Gate.  
+**Invarianten**: I-7 (kein RPC), I-9 (Simulation unverändert), I-12 (kein stiller Intent-Verlust — Reject vor Publish).  
+**Dateien**: `src/execution/bundle_auction.rs`, `src/ipc/schema.rs`, `src/bin/execution_engine.rs`, `src/bin/arb_strategy.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-TOKEN-PROGRAM-JETSTREAM: Arb-Tracker leer nach Neustart trotz TokenMintInfo (Prod `964d743`, A.57)
 **Datum**: 2026-10-23  
 **Problem**: Prod `964d743`: Quotes liefen, 0 Arb-Intents. `create_arb_intent` lehnte mit `token program unknown (GEYSER-FIRST)` ab. `TokenMintInfo` ging nur über Core-NATS (nicht persistent); nach Neustart oder verlorenen Mint-Updates blieb `TokenArbTracker.token_program` leer, obwohl Vault/Mint-Owner schon beobachtet waren.  

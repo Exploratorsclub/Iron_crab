@@ -733,6 +733,24 @@ impl Default for FeePolicy {
 }
 
 impl FeePolicy {
+    /// Build runtime fee policy from `[execution_engine.fee_policy]` (same mapping as execution-engine).
+    pub fn from_fee_policy_cfg(fp: &crate::config::FeePolicyCfg) -> Self {
+        Self {
+            default_compute_units: fp.default_compute_units,
+            max_compute_units: fp.max_compute_units,
+            arb_compute_units: fp.arb_compute_units,
+            default_priority_fee_micro_lamports: fp.default_priority_fee_micro_lamports,
+            max_priority_fee_micro_lamports: fp.max_priority_fee_micro_lamports,
+            tier0_priority_fee_micro_lamports: fp.tier0_priority_fee_micro_lamports,
+            urgency_multiplier_elevated: 2.0,
+            urgency_multiplier_urgent: 5.0,
+            max_tx_cost_lamports: fp.max_tx_cost_lamports,
+            min_profit_after_fees_bps: fp.min_profit_after_fees_bps,
+            tier1_fee_percentile: fp.tier1_fee_percentile,
+            tier1_fee_multiplier: fp.tier1_fee_multiplier,
+        }
+    }
+
     /// Calculate effective compute units for an intent
     pub fn compute_units_for_intent(&self, intent: &TradeIntent) -> u32 {
         // Use hint if provided and within limits

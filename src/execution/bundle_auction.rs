@@ -136,6 +136,32 @@ pub fn estimate_priority_fee_lamports(micro_lamports_per_cu: u64, compute_units:
     (micro_lamports_per_cu as u128 * compute_units as u128 / 1_000_000) as u64
 }
 
+/// Total TX cost (base + priority) in lamports for fee-profitability gates (EE + arb-strategy).
+pub fn estimate_tx_cost_lamports(priority_fee_micro_lamports: u64, compute_units: u32) -> u64 {
+    SOLANA_TX_BASE_FEE_LAMPORTS
+        + estimate_priority_fee_lamports(priority_fee_micro_lamports, compute_units)
+}
+
+/// Shared bps profitability gate: `expected_roi_bps` minus fee cost in bps of capital.
+pub fn profitability_after_tx_fees_bps(
+    priority_fee_micro_lamports: u64,
+    compute_units: u32,
+    required_capital_lamports: u64,
+    expected_roi_bps: i32,
+    min_profit_after_fees_bps: i32,
+) -> (bool, i32) {
+    if required_capital_lamports == 0 {
+        return (false, 0);
+    }
+    let total_cost = estimate_tx_cost_lamports(priority_fee_micro_lamports, compute_units);
+    let cost_bps = ((total_cost as u128 * 10_000) / required_capital_lamports as u128) as i32;
+    let profit_after_fees = expected_roi_bps - cost_bps;
+    (
+        profit_after_fees >= min_profit_after_fees_bps,
+        profit_after_fees,
+    )
+}
+
 /// Minimum estimated profit so [`cross_dex_effective_bundle_tip_lamports`] succeeds at `tip_default_bps`.
 pub fn min_profit_for_bundle_landing(
     jito_tip_floor_lamports: u64,
@@ -308,6 +334,21 @@ mod tests {
             &params,
         );
         assert!(matches!(outcome, CrossDexBundleTipOutcome::Rejected { .. }));
+    }
+
+    #[test]
+    fn prod_fee_profitability_20bps_spread_fails_at_27_cost_bps() {
+        let (ok, profit) = profitability_after_tx_fees_bps(600_000, 450_000, 100_000_000, 20, 10);
+        assert!(!ok);
+        assert_eq!(estimate_tx_cost_lamports(600_000, 450_000), 275_000);
+        assert_eq!(profit, -7);
+    }
+
+    #[test]
+    fn prod_fee_profitability_76bps_spread_passes() {
+        let (ok, profit) = profitability_after_tx_fees_bps(600_000, 450_000, 100_000_000, 76, 10);
+        assert!(ok);
+        assert_eq!(profit, 49);
     }
 
     #[test]
