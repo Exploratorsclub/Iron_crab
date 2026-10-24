@@ -439,17 +439,84 @@ fn is_profitable_after_fees_with_compute_units(
     intent: &TradeIntent,
     compute_units: u32,
 ) -> (bool, i32) {
-    let (_, _, total_cost) = estimate_tx_cost_with_compute_units(policy, intent, compute_units);
-    let capital = intent.required_capital.raw;
-    if capital == 0 {
-        return (false, 0);
-    }
-    let cost_bps = ((total_cost as u128 * 10_000) / capital as u128) as i32;
-    let profit_after_fees = intent.expected_roi_bps - cost_bps;
-    (
-        profit_after_fees >= policy.min_profit_after_fees_bps,
-        profit_after_fees,
+    ironcrab::execution::bundle_auction::profitability_after_tx_fees_bps(
+        policy.priority_fee_for_intent(intent),
+        compute_units,
+        intent.required_capital.raw,
+        intent.expected_roi_bps,
+        policy.min_profit_after_fees_bps,
     )
+}
+
+#[cfg(test)]
+mod fee_profitability_gate_tests {
+    use super::is_profitable_after_fees_with_compute_units;
+    use ironcrab::execution::bundle_auction::{
+        estimate_tx_cost_lamports, profitability_after_tx_fees_bps,
+    };
+    use ironcrab::ipc::{
+        ExplicitAmount, FeePolicy, IntentOrigin, IntentTier, TradeIntent, TradeResources,
+        TradeSide, TradingRegime,
+    };
+
+    #[test]
+    fn shared_formula_prod_case_20bps_spread_not_profitable() {
+        let (ok, profit) = profitability_after_tx_fees_bps(600_000, 450_000, 100_000_000, 20, 10);
+        assert!(!ok);
+        assert_eq!(estimate_tx_cost_lamports(600_000, 450_000), 275_000);
+        assert_eq!(profit, -7);
+    }
+
+    #[test]
+    fn shared_formula_76bps_spread_profitable() {
+        let (ok, profit) = profitability_after_tx_fees_bps(600_000, 450_000, 100_000_000, 76, 10);
+        assert!(ok);
+        assert_eq!(profit, 49);
+    }
+
+    #[test]
+    fn ee_wrapper_matches_shared_formula() {
+        let policy = FeePolicy {
+            default_priority_fee_micro_lamports: 600_000,
+            tier0_priority_fee_micro_lamports: 600_000,
+            max_priority_fee_micro_lamports: 1_000_000,
+            min_profit_after_fees_bps: 10,
+            ..FeePolicy::default()
+        };
+        let intent = TradeIntent::new(
+            "arb-strategy",
+            "test",
+            "run",
+            "arb-test-1".to_string(),
+            "arb-strategy",
+            IntentTier::Arb,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(100_000_000, 9),
+            TradeResources {
+                input_mint: "So11111111111111111111111111111111111111112".to_string(),
+                output_mint: "mint".to_string(),
+                pools: vec!["a".into(), "b".into()],
+                accounts: vec![],
+                token_program: None,
+            },
+            20,
+            100,
+            TradeSide::Buy,
+            TradingRegime::NotApplicable,
+        )
+        .with_bundle(Some(100_000))
+        .with_fee_hints(Some(400_000), None, None);
+
+        let ee = is_profitable_after_fees_with_compute_units(&policy, &intent, 450_000);
+        let shared = profitability_after_tx_fees_bps(
+            policy.priority_fee_for_intent(&intent),
+            450_000,
+            100_000_000,
+            20,
+            10,
+        );
+        assert_eq!(ee, shared);
+    }
 }
 
 /// Gate for one-shot Orca Whirlpool recovery on cross-DEX arb when the SELL leg is Orca.

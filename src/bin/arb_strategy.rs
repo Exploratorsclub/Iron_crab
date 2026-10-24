@@ -58,7 +58,8 @@ use ironcrab::arbitrage::{
 };
 use ironcrab::config::Config as AppConfig;
 use ironcrab::execution::bundle_auction::{
-    cross_dex_effective_bundle_tip_lamports, BundleAuctionParams, CrossDexBundleTipOutcome,
+    cross_dex_effective_bundle_tip_lamports, profitability_after_tx_fees_bps, BundleAuctionParams,
+    CrossDexBundleTipOutcome,
 };
 use ironcrab::execution::live_pool_cache::{
     create_shared_cache, CachedPoolState, LivePoolCache, MeteoraState, SharedLivePoolCache,
@@ -75,8 +76,8 @@ use ironcrab::execution::token_program_sync::{
 };
 use ironcrab::ipc::ExecutionResult;
 use ironcrab::ipc::{
-    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, IntentOrigin,
-    IntentTier, MarketEvent, MarketEventKind, OrcaTickSnapshot, PoolCacheUpdate,
+    BinData, ConfigUpdate, ConfigUpdateResponse, ConfigUpdateStatus, ExplicitAmount, FeePolicy,
+    IntentOrigin, IntentTier, MarketEvent, MarketEventKind, OrcaTickSnapshot, PoolCacheUpdate,
     PoolCacheUpdateType, PumpAmmGlobalFeeConfigUpdate, TokenProgramUpdate, TradeIntent,
     TradeResources, TradeSide, TradingRegime,
 };
@@ -158,6 +159,7 @@ use ironcrab::nats::{
 };
 use ironcrab::nats::{NatsClient, NatsConfig};
 use ironcrab::nats::{TOPIC_ARB_TRACK_REQUESTS, TOPIC_MARKET_EVENTS, TOPIC_TRADE_INTENTS};
+use ironcrab::solana::cross_dex_handler::CrossDexHandler;
 use ironcrab::solana::dex::orca_tick_array::{
     derive_tick_array_pda, swap_direction_tick_array_starts,
 };
@@ -317,6 +319,8 @@ struct ArbConfig {
     arb_max_leg_age_slots: u64,
     /// Jito bundle auction parameters (from [execution_engine.fee_policy] + jito tip).
     bundle_auction: BundleAuctionParams,
+    /// Execution-engine fee policy (same `[execution_engine.fee_policy]` load path as EE).
+    fee_policy: FeePolicy,
 }
 
 impl Default for ArbConfig {
@@ -341,6 +345,7 @@ impl Default for ArbConfig {
             arb_max_leg_slot_delta: 0,
             arb_max_leg_age_slots: 16,
             bundle_auction: BundleAuctionParams::default(),
+            fee_policy: FeePolicy::default(),
         };
         sync_arb_probe_to_max_position(&mut cfg);
         cfg
@@ -396,6 +401,9 @@ fn load_initial_arb_config(config_path: &Path) -> ArbConfig {
         .and_then(|e| e.fee_policy.as_ref());
     cfg.bundle_auction =
         BundleAuctionParams::from_fee_policy_cfg(fee_policy_cfg, jito_tip_lamports);
+    cfg.fee_policy = fee_policy_cfg
+        .map(FeePolicy::from_fee_policy_cfg)
+        .unwrap_or_default();
 
     // Map min_profit_bps -> min_profit_lamports by interpreting it as net profit bps
     // relative to max_position_lamports.
@@ -8747,6 +8755,33 @@ fn append_orca_tick_array_accounts_for_arb_leg(
 }
 
 /// Creates an arb intent from the opportunity.
+/// Rejects published when spread does not clear execution-engine `fee_profitability` gate.
+static ARB_REJECTED_FEE_UNPROFITABLE: AtomicU64 = AtomicU64::new(0);
+
+fn cross_dex_effective_compute_units(plan_cu: u32, policy_cu: u32) -> u32 {
+    plan_cu.max(policy_cu)
+}
+
+/// Fee-profitability pre-check aligned with execution-engine (cross-DEX CU max + policy priority fee).
+fn arb_intent_fee_profitability(
+    fee_policy: &FeePolicy,
+    intent: &TradeIntent,
+    buy_dex: &str,
+    sell_dex: &str,
+) -> (bool, i32) {
+    let policy_cu = fee_policy.compute_units_for_intent(intent);
+    let plan_cu = CrossDexHandler::estimate_cross_dex_compute_units(buy_dex, sell_dex);
+    let compute_units =
+        cross_dex_effective_compute_units(plan_cu, policy_cu).min(fee_policy.max_compute_units);
+    profitability_after_tx_fees_bps(
+        fee_policy.priority_fee_for_intent(intent),
+        compute_units,
+        intent.required_capital.raw,
+        intent.expected_roi_bps,
+        fee_policy.min_profit_after_fees_bps,
+    )
+}
+
 /// Returns None if required DexPoolAccounts are missing for ANY pool.
 ///
 /// GEYSER-FIRST PRINCIPLE (TARGET_ARCHITECTURE.md §4.5):
@@ -9093,6 +9128,32 @@ fn create_arb_intent(ctx: &ArbContext, opp: &ArbOpportunity) -> Option<TradeInte
         opp.estimated_profit_lamports,
         config.min_profit_lamports
     ));
+
+    let (fee_profitable, profit_after_fees_bps) =
+        arb_intent_fee_profitability(&config.fee_policy, &intent, &opp.buy_dex, &opp.sell_dex);
+    if !fee_profitable {
+        let policy_cu = config.fee_policy.compute_units_for_intent(&intent);
+        let plan_cu =
+            CrossDexHandler::estimate_cross_dex_compute_units(&opp.buy_dex, &opp.sell_dex);
+        let compute_units = cross_dex_effective_compute_units(plan_cu, policy_cu)
+            .min(config.fee_policy.max_compute_units);
+        let cost_bps = opp.spread_bps as i32 - profit_after_fees_bps;
+        warn!(
+            mint = %opp.base_mint,
+            buy_dex = %opp.buy_dex,
+            sell_dex = %opp.sell_dex,
+            spread_bps = opp.spread_bps,
+            cost_bps,
+            profit_after_fees_bps,
+            min_profit_after_fees_bps = config.fee_policy.min_profit_after_fees_bps,
+            compute_units,
+            trade_amount_lamports = opp.trade_amount_lamports,
+            reason = "fee_profitability",
+            "Rejecting arb intent: spread below execution fee floor"
+        );
+        ARB_REJECTED_FEE_UNPROFITABLE.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
 
     Some(intent)
 }
@@ -17685,6 +17746,46 @@ mod pool_accounts_coverage_tests {
             .expect("tracker")
             .token_program = Some(spl_token::ID.to_string());
         assert!(create_arb_intent(&ctx, &opp).is_some());
+    }
+
+    #[test]
+    fn arb_fee_profitability_gate_rejects_prod_20bps_spread() {
+        let fee_policy = FeePolicy {
+            default_priority_fee_micro_lamports: 600_000,
+            tier0_priority_fee_micro_lamports: 0,
+            max_priority_fee_micro_lamports: 1_000_000,
+            arb_compute_units: 400_000,
+            min_profit_after_fees_bps: 10,
+            ..FeePolicy::default()
+        };
+        let intent = TradeIntent::new(
+            "arb-strategy",
+            "test",
+            "run",
+            "arb-fee-gate-1".to_string(),
+            "arb-strategy",
+            IntentTier::Arb,
+            IntentOrigin::StrategyA,
+            ExplicitAmount::new(100_000_000, 9),
+            TradeResources {
+                input_mint: "So11111111111111111111111111111111111111112".to_string(),
+                output_mint: "mint".to_string(),
+                pools: vec!["buy".into(), "sell".into()],
+                accounts: vec![],
+                token_program: None,
+            },
+            20,
+            100,
+            TradeSide::Buy,
+            TradingRegime::NotApplicable,
+        )
+        .with_bundle(Some(100_000))
+        .with_fee_hints(Some(400_000), None, Some(1));
+
+        let (profitable, profit_bps) =
+            arb_intent_fee_profitability(&fee_policy, &intent, "pump_amm", "meteora_dlmm");
+        assert!(!profitable);
+        assert_eq!(profit_bps, -7);
     }
 
     #[test]
