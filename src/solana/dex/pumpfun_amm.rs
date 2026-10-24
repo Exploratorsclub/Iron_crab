@@ -565,9 +565,16 @@ pub const PUMPFUN_AMM_BUY_PROGRAM_IX_V2: usize = 16;
 /// Account count for standard PumpSwap `buy_exact_quote_in`.
 pub const PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS: usize = 23;
 
+/// A.58: Pump arb/momentum BUY uses on-chain `buy_exact_quote_in_v2` (17 accounts).
+pub const PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS: usize = 17;
+pub const PUMPFUN_AMM_BUY_V2_PROGRAM_IX: usize = 16;
+pub const PUMPFUN_AMM_BUY_V2_FEE_CONFIG_IX: usize = 13;
+pub const PUMPFUN_AMM_BUY_V2_USER_VOLUME_IX: usize = 12;
+
 #[must_use]
 pub fn pump_amm_buy_program_ix_index(account_count: usize) -> Option<usize> {
     match account_count {
+        PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS => Some(PUMPFUN_AMM_BUY_V2_PROGRAM_IX),
         PUMPFUN_AMM_BUY_TOTAL_ACCOUNTS => Some(PUMPFUN_AMM_BUY_PROGRAM_IX),
         PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS
         | PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
@@ -1932,6 +1939,7 @@ impl PumpAmmPoolStatic {
 struct PumpAmmUserAccounts {
     user_base_ta: Pubkey,
     user_quote_ta: Pubkey,
+    #[allow(dead_code)]
     user_volume_accumulator: Pubkey,
 }
 
@@ -3658,6 +3666,59 @@ impl PumpFunAmmDex {
         user: Pubkey,
     ) -> Pubkey {
         Pubkey::find_program_address(&[b"user_volume_accumulator", user.as_ref()], &program_id).0
+    }
+
+    /// A.58: Build metas + ix data for on-chain `buy_exact_quote_in_v2` (17 accounts, no GVA).
+    #[allow(clippy::too_many_arguments)]
+    fn build_buy_exact_quote_in_v2_metas_and_data(
+        program_id: Pubkey,
+        pool_market: Pubkey,
+        user: Pubkey,
+        global_config: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        pool_base_vault: Pubkey,
+        pool_quote_vault: Pubkey,
+        user_base_ta: Pubkey,
+        user_quote_ta: Pubkey,
+        base_tp: Pubkey,
+        quote_tp: Pubkey,
+        coin_creator_vault_ata: Pubkey,
+        event_authority: Pubkey,
+        amount_in: u64,
+        min_out: u64,
+    ) -> Result<(Vec<AccountMeta>, Vec<u8>)> {
+        if coin_creator_vault_ata == Pubkey::default() {
+            return Err(anyhow!(
+                "pump_amm BUY v2: coin_creator_vault_ata (pool_accounts[9]) missing"
+            ));
+        }
+        let fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?;
+        let user_vol =
+            Self::derive_pump_amm_user_volume_accumulator_for_sell_cashback(program_id, user);
+        let system_program = Pubkey::new_from_array(solana_system_program::id().to_bytes());
+        let metas = vec![
+            AccountMeta::new(pool_market, false),
+            AccountMeta::new(user, true),
+            AccountMeta::new_readonly(global_config, false),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(user_base_ta, false),
+            AccountMeta::new(user_quote_ta, false),
+            AccountMeta::new(pool_base_vault, false),
+            AccountMeta::new(pool_quote_vault, false),
+            AccountMeta::new_readonly(base_tp, false),
+            AccountMeta::new_readonly(quote_tp, false),
+            AccountMeta::new_readonly(system_program, false),
+            AccountMeta::new(user_vol, false),
+            AccountMeta::new_readonly(fee_config, false),
+            AccountMeta::new(coin_creator_vault_ata, false),
+            AccountMeta::new_readonly(event_authority, false),
+            AccountMeta::new_readonly(program_id, false),
+        ];
+        let disc = anchor_disc("buy_exact_quote_in_v2");
+        let data = Self::build_ix_data(disc, amount_in, min_out);
+        Ok((metas, data))
     }
 
     /// First two trailing `sell` metas (#21 user volume WSOL ATA, #22 user volume accumulator) when
@@ -7186,23 +7247,7 @@ impl Dex for PumpFunAmmDex {
             .unwrap_or_else(|| {
                 Self::derive_ata_with_program(user, pool.quote_mint, quote_token_program)
             });
-        let user_volume = user_acc
-            .as_ref()
-            .map(|u| u.user_volume_accumulator)
-            .unwrap_or_else(|| {
-                Self::derive_user_volume_accumulator(program_id, pool.pool_market, user)
-            });
-
-        let disc = if is_buy {
-            anchor_disc("buy_exact_quote_in")
-        } else {
-            anchor_disc("sell")
-        };
-        let data = Self::build_ix_data(disc, amount_in, min_out);
-
-        // Account ordering differs between BUY (23 accounts) and SELL (21 accounts).
-        // Reference: observed on-chain Pump.fun AMM swap transactions.
-        // BUY includes global_volume_accumulator (#16) and user_volume (#19), SELL does not.
+        // Account ordering differs between BUY (A.58: 17-account `buy_exact_quote_in_v2`) and SELL.
         let global_config = Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG)?;
         if pool.global_config != global_config {
             warn!(
@@ -7219,9 +7264,33 @@ impl Dex for PumpFunAmmDex {
                 "pump_amm build_swap_ix: cached pool.event_authority != canonical; using canonical"
             );
         }
-        // SELL meta #19/#20: global Fee Program accounts (mainnet-constant). Cached `pool.fee_config`
-        // may differ from v14/market parse — using it as SELL meta #19 caused Anchor Custom(3002)
-        // (wrong account type vs program expectation); Scope 59 restores global constant semantics.
+        if is_buy {
+            let (metas, data) = Self::build_buy_exact_quote_in_v2_metas_and_data(
+                program_id,
+                pool.pool_market,
+                user,
+                global_config,
+                pool.base_mint,
+                pool.quote_mint,
+                pool.pool_base_vault,
+                pool.pool_quote_vault,
+                user_base_ta,
+                user_quote_ta,
+                base_token_program,
+                quote_token_program,
+                pool.coin_creator_vault_ata,
+                event_authority,
+                amount_in,
+                min_out,
+            )?;
+            return Ok(vec![Instruction {
+                program_id,
+                accounts: metas,
+                data,
+            }]);
+        }
+
+        // SELL meta #19/#20: global Fee Program accounts (mainnet-constant).
         let sell_fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?;
         let sell_fee_program = Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID)?;
         let (protocol_fee_recipient, protocol_fee_recipient_ta) =
@@ -7231,6 +7300,8 @@ impl Dex for PumpFunAmmDex {
                 pool.quote_mint,
                 quote_token_program,
             )?;
+        let disc = anchor_disc("sell");
+        let data = Self::build_ix_data(disc, amount_in, min_out);
         let mut metas = vec![
             AccountMeta::new(pool.pool_market, false),         // 0
             AccountMeta::new(user, true),                      // 1
@@ -7256,110 +7327,88 @@ impl Dex for PumpFunAmmDex {
             AccountMeta::new_readonly(event_authority, false), // 15
         ];
 
-        if is_buy {
-            // BUY: accounts 16-22 (23 total)
-            metas.push(AccountMeta::new(pool.global_volume_accumulator, false)); // 16
-            metas.push(AccountMeta::new(pool.coin_creator_vault_ata, false)); // 17
-            metas.push(AccountMeta::new_readonly(
-                pool.coin_creator_vault_authority,
-                false,
-            )); // 18
-            metas.push(AccountMeta::new(user_volume, false)); // 19
-            metas.push(AccountMeta::new_readonly(pool.fee_config, false)); // 20
-            metas.push(AccountMeta::new_readonly(pool.fee_program, false)); // 21
-            metas.push(AccountMeta::new_readonly(program_id, false)); // 22
-        } else {
-            // SELL: 21 base metas; extended path adds three trailing accounts when observed on-chain.
-            metas.push(AccountMeta::new_readonly(program_id, false)); // 16
-            metas.push(AccountMeta::new(pool.coin_creator_vault_ata, false)); // 17
-            metas.push(AccountMeta::new_readonly(
-                pool.coin_creator_vault_authority,
-                false,
-            )); // 18
-                // `pools_by_base` can be stale vs monotonic LivePoolCache (Geyser); prefer DashMap for extended SELL.
-            let mut sell_requires_cashback_remaining = pool.sell_requires_cashback_remaining;
-            let mut sell_cashback_third_meta = pool.sell_cashback_third_meta;
-            let mut cached_observed_volume_tail_0 = pool.sell_extended_tail_0;
-            let mut cached_observed_volume_tail_1 = pool.sell_extended_tail_1;
-            let mut sell_extended_fee_tail_0 = pool.sell_extended_fee_tail_0;
-            let mut sell_extended_fee_tail_1 = pool.sell_extended_fee_tail_1;
-            let mut sell_requires_pre_fee_metas = pool.sell_requires_pre_fee_metas;
-            let mut sell_pre_fee_meta_1 = pool.sell_pre_fee_meta_1;
-            let mut sell_requires_fee_tail =
-                pool.sell_extended_fee_tail_0.is_some() && pool.sell_extended_fee_tail_1.is_some();
-            if let Some(ref cache) = self.live_pool_cache {
-                let (dash_flag, dash_third, dash_t0, dash_t1) =
-                    cache.pump_amm_sell_extended_layout(&pool.pool_market);
-                let (dash_fee_t0, dash_fee_t1) =
-                    cache.pump_amm_sell_fee_tail_layout(&pool.pool_market);
-                if dash_flag {
-                    sell_requires_cashback_remaining = true;
-                    sell_cashback_third_meta = dash_third.or(sell_cashback_third_meta);
-                    cached_observed_volume_tail_0 = dash_t0.or(cached_observed_volume_tail_0);
-                    cached_observed_volume_tail_1 = dash_t1.or(cached_observed_volume_tail_1);
-                    sell_extended_fee_tail_0 = dash_fee_t0.or(sell_extended_fee_tail_0);
-                    sell_extended_fee_tail_1 = dash_fee_t1.or(sell_extended_fee_tail_1);
-                }
-                if cache.pump_amm_sell_requires_pre_fee_metas(&pool.pool_market) {
-                    sell_requires_pre_fee_metas = true;
-                }
-                if cache.pump_amm_sell_requires_fee_tail(&pool.pool_market) {
-                    sell_requires_fee_tail = true;
-                }
-                sell_pre_fee_meta_1 = cache
-                    .pump_amm_sell_pre_fee_meta_1(&pool.pool_market)
-                    .or(sell_pre_fee_meta_1);
+        // SELL: 21 base metas; extended path adds three trailing accounts when observed on-chain.
+        metas.push(AccountMeta::new_readonly(program_id, false)); // 16
+        metas.push(AccountMeta::new(pool.coin_creator_vault_ata, false)); // 17
+        metas.push(AccountMeta::new_readonly(
+            pool.coin_creator_vault_authority,
+            false,
+        )); // 18
+            // `pools_by_base` can be stale vs monotonic LivePoolCache (Geyser); prefer DashMap for extended SELL.
+        let mut sell_requires_cashback_remaining = pool.sell_requires_cashback_remaining;
+        let mut sell_cashback_third_meta = pool.sell_cashback_third_meta;
+        let mut cached_observed_volume_tail_0 = pool.sell_extended_tail_0;
+        let mut cached_observed_volume_tail_1 = pool.sell_extended_tail_1;
+        let mut sell_extended_fee_tail_0 = pool.sell_extended_fee_tail_0;
+        let mut sell_extended_fee_tail_1 = pool.sell_extended_fee_tail_1;
+        let mut sell_requires_pre_fee_metas = pool.sell_requires_pre_fee_metas;
+        let mut sell_pre_fee_meta_1 = pool.sell_pre_fee_meta_1;
+        let mut sell_requires_fee_tail =
+            pool.sell_extended_fee_tail_0.is_some() && pool.sell_extended_fee_tail_1.is_some();
+        if let Some(ref cache) = self.live_pool_cache {
+            let (dash_flag, dash_third, dash_t0, dash_t1) =
+                cache.pump_amm_sell_extended_layout(&pool.pool_market);
+            let (dash_fee_t0, dash_fee_t1) = cache.pump_amm_sell_fee_tail_layout(&pool.pool_market);
+            if dash_flag {
+                sell_requires_cashback_remaining = true;
+                sell_cashback_third_meta = dash_third.or(sell_cashback_third_meta);
+                cached_observed_volume_tail_0 = dash_t0.or(cached_observed_volume_tail_0);
+                cached_observed_volume_tail_1 = dash_t1.or(cached_observed_volume_tail_1);
+                sell_extended_fee_tail_0 = dash_fee_t0.or(sell_extended_fee_tail_0);
+                sell_extended_fee_tail_1 = dash_fee_t1.or(sell_extended_fee_tail_1);
             }
-            Self::push_pump_amm_sell_global_fee_metas(
-                &mut metas,
-                sell_requires_pre_fee_metas,
-                pool.global_volume_accumulator,
-                sell_pre_fee_meta_1,
-                sell_fee_config,
-                sell_fee_program,
-            )?;
-            let mut volume_quote_ata_create: Option<PumpAmmVolumeQuoteAtaCreate> = None;
-            if sell_requires_cashback_remaining {
-                let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
-                else {
-                    return Err(anyhow!(
+            if cache.pump_amm_sell_requires_pre_fee_metas(&pool.pool_market) {
+                sell_requires_pre_fee_metas = true;
+            }
+            if cache.pump_amm_sell_requires_fee_tail(&pool.pool_market) {
+                sell_requires_fee_tail = true;
+            }
+            sell_pre_fee_meta_1 = cache
+                .pump_amm_sell_pre_fee_meta_1(&pool.pool_market)
+                .or(sell_pre_fee_meta_1);
+        }
+        Self::push_pump_amm_sell_global_fee_metas(
+            &mut metas,
+            sell_requires_pre_fee_metas,
+            pool.global_volume_accumulator,
+            sell_pre_fee_meta_1,
+            sell_fee_config,
+            sell_fee_program,
+        )?;
+        let mut volume_quote_ata_create: Option<PumpAmmVolumeQuoteAtaCreate> = None;
+        if sell_requires_cashback_remaining {
+            let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default()) else {
+                return Err(anyhow!(
                         "pump_amm SELL: extended layout required but sell_cashback_third_meta missing (authoritative observation required)"
                     ));
-                };
-                volume_quote_ata_create = Self::push_pump_amm_sell_extended_trailing_metas(
-                    &mut metas,
-                    pool.pool_market,
-                    pool.base_mint,
-                    user,
-                    pool.quote_mint,
-                    quote_token_program,
-                    third,
-                    sell_requires_pre_fee_metas,
-                    sell_requires_fee_tail,
-                    sell_extended_fee_tail_0,
-                    sell_extended_fee_tail_1,
-                    cached_observed_volume_tail_0,
-                    cached_observed_volume_tail_1,
-                    false,
-                    true,
-                )?;
-            }
-            let swap_ix = Instruction {
-                program_id,
-                accounts: metas,
-                data,
             };
-            return Ok(pump_amm_prepend_volume_quote_ata_create_if_needed(
-                volume_quote_ata_create,
-                swap_ix,
-            ));
+            volume_quote_ata_create = Self::push_pump_amm_sell_extended_trailing_metas(
+                &mut metas,
+                pool.pool_market,
+                pool.base_mint,
+                user,
+                pool.quote_mint,
+                quote_token_program,
+                third,
+                sell_requires_pre_fee_metas,
+                sell_requires_fee_tail,
+                sell_extended_fee_tail_0,
+                sell_extended_fee_tail_1,
+                cached_observed_volume_tail_0,
+                cached_observed_volume_tail_1,
+                false,
+                true,
+            )?;
         }
-
-        Ok(vec![Instruction {
+        let swap_ix = Instruction {
             program_id,
             accounts: metas,
             data,
-        }])
+        };
+        Ok(pump_amm_prepend_volume_quote_ata_create_if_needed(
+            volume_quote_ata_create,
+            swap_ix,
+        ))
     }
 
     fn list_pairs(&self) -> Vec<(String, String)> {
@@ -7494,35 +7543,6 @@ impl PumpFunAmmDex {
         let coin_creator_vault_authority = pool_accounts[10];
         let global_volume_accumulator = pool_accounts[11]; // REQUIRED for BUY!
 
-        // BUY uses pool row fee fields from v14 ([12]/[13]); SELL meta #19/#20 must use global
-        // Fee Program accounts (same as successful mainnet reference txs). v14[12] is not always
-        // the SELL fee_config account type — using it caused Custom(3002) (Scope 58 regression).
-        let parsed_fee_config = pool_accounts[12];
-        let parsed_fee_program = pool_accounts[13];
-        let buy_fee_config = if parsed_fee_config == Pubkey::default() {
-            warn!(
-                "pump_amm build_swap_ix_from_pool_accounts: pool_accounts[12] fee_config missing — falling back to PUMPFUN_AMM_FEE_CONFIG constant"
-            );
-            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?
-        } else {
-            parsed_fee_config
-        };
-        let buy_fee_program = if parsed_fee_program == Pubkey::default() {
-            warn!(
-                "pump_amm build_swap_ix_from_pool_accounts: pool_accounts[13] fee_program missing — falling back to expected fee program id"
-            );
-            expected_fee_program
-        } else if parsed_fee_program != expected_fee_program {
-            warn!(
-                from_pool_accounts = %parsed_fee_program,
-                expected = %expected_fee_program,
-                "pump_amm build_swap_ix_from_pool_accounts: pool_accounts[13] fee_program != expected; using pool_accounts value (authoritative for BUY)"
-            );
-            parsed_fee_program
-        } else {
-            parsed_fee_program
-        };
-
         let sell_fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG)?;
         let sell_fee_program = expected_fee_program;
 
@@ -7561,204 +7581,94 @@ impl PumpFunAmmDex {
         let user_base_ta = Self::derive_ata_with_program(user, base_mint, base_tp);
         let user_quote_ta = Self::derive_ata_with_program(user, quote_mint, quote_tp);
 
-        // User volume accumulator is a PDA; needed for BUY transactions.
-        let user_vol = Self::derive_user_volume_accumulator(program_id, pool_market, user);
-
-        let disc = if is_buy {
-            anchor_disc("buy_exact_quote_in")
+        // A.58: BUY is always `buy_exact_quote_in_v2` (17 accounts); SELL layout flags do not apply.
+        let (metas, data) = if is_buy {
+            Self::build_buy_exact_quote_in_v2_metas_and_data(
+                program_id,
+                pool_market,
+                user,
+                global_config,
+                base_mint,
+                quote_mint,
+                pool_base_vault,
+                pool_quote_vault,
+                user_base_ta,
+                user_quote_ta,
+                base_tp,
+                quote_tp,
+                coin_creator_vault_ata,
+                event_authority,
+                amount_in,
+                min_out,
+            )?
         } else {
-            anchor_disc("sell")
-        };
-        let data = Self::build_ix_data(disc, amount_in, min_out);
-
-        // Account ordering differs between BUY (23 accounts) and SELL (21 accounts).
-        // BUY requires global_volume_accumulator and user_volume_accumulator.
-        // See dex_parser.rs for reference account ordering from on-chain transactions.
-        let metas = if is_buy {
-            let buy_base = vec![
-                AccountMeta::new(pool_market, false),                     // 0
-                AccountMeta::new(user, true),                             // 1
-                AccountMeta::new_readonly(global_config, false),          // 2
-                AccountMeta::new_readonly(base_mint, false),              // 3
-                AccountMeta::new_readonly(quote_mint, false),             // 4
-                AccountMeta::new(user_base_ta, false),                    // 5
-                AccountMeta::new(user_quote_ta, false),                   // 6
-                AccountMeta::new(pool_base_vault, false),                 // 7
-                AccountMeta::new(pool_quote_vault, false),                // 8
-                AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
-                AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
-                AccountMeta::new_readonly(base_tp, false), // 11 - base token program (Token-2022 aware)
-                AccountMeta::new_readonly(quote_tp, false), // 12 - quote token program (always SPL)
-                AccountMeta::new_readonly(
-                    Pubkey::new_from_array(solana_system_program::id().to_bytes()),
-                    false,
-                ), // 13
-                AccountMeta::new_readonly(
-                    Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
-                    false,
-                ), // 14
-                AccountMeta::new_readonly(event_authority, false), // 15
-            ];
-
-            let buy_extended_v2 = sell_requires_pre_fee_metas && sell_requires_cashback_remaining;
-
-            if buy_extended_v2 {
-                let singleton_gva = pump_amm_singleton_global_volume_accumulator(&program_id);
-                let (buy_pre_fee_1, pre_fee_source) =
-                    pump_amm_resolve_sell_pre_fee_meta_1_for_build(
-                        &pool_market,
-                        singleton_gva,
-                        sell_pre_fee_meta_1,
-                    );
-                let buy_pre_fee_1 = buy_pre_fee_1.ok_or_else(|| {
-                    anyhow!(
-                        "pump_amm BUY: 27-account layout requires sell_pre_fee_meta_1 (cache/Geyser observation required; resolved={pre_fee_source})"
-                    )
-                })?;
-                let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
-                else {
-                    return Err(anyhow!(
-                        "pump_amm BUY: extended v2 layout required but sell_cashback_third_meta missing (Geyser/LivePoolCache observation required)"
-                    ));
-                };
-                let mut metas = buy_base;
-                metas.push(AccountMeta::new_readonly(program_id, false)); // 16
-                metas.push(AccountMeta::new(global_volume_accumulator, false)); // 17
-                metas.push(AccountMeta::new(coin_creator_vault_ata, false)); // 18
-                metas.push(AccountMeta::new_readonly(singleton_gva, false)); // 19 pre_fee_0
-                metas.push(AccountMeta::new_readonly(buy_pre_fee_1, false)); // 20 pre_fee_1
-                metas.push(AccountMeta::new_readonly(buy_fee_config, false)); // 21
-                metas.push(AccountMeta::new_readonly(buy_fee_program, false)); // 22
-                volume_quote_ata_create = Self::push_pump_amm_sell_extended_trailing_metas(
+            let disc = anchor_disc("sell");
+            let data = Self::build_ix_data(disc, amount_in, min_out);
+            let metas = {
+                // SELL: 21 base metas; some pools require three trailing accounts (mainnet 24-account sells).
+                let mut metas = vec![
+                    AccountMeta::new(pool_market, false),                     // 0
+                    AccountMeta::new(user, true),                             // 1
+                    AccountMeta::new_readonly(global_config, false),          // 2
+                    AccountMeta::new_readonly(base_mint, false),              // 3
+                    AccountMeta::new_readonly(quote_mint, false),             // 4
+                    AccountMeta::new(user_base_ta, false),                    // 5
+                    AccountMeta::new(user_quote_ta, false),                   // 6
+                    AccountMeta::new(pool_base_vault, false),                 // 7
+                    AccountMeta::new(pool_quote_vault, false),                // 8
+                    AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
+                    AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
+                    AccountMeta::new_readonly(base_tp, false), // 11 - base token program (Token-2022 aware)
+                    AccountMeta::new_readonly(quote_tp, false), // 12 - quote token program (always SPL)
+                    AccountMeta::new_readonly(
+                        Pubkey::new_from_array(solana_system_program::id().to_bytes()),
+                        false,
+                    ), // 13
+                    AccountMeta::new_readonly(
+                        Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
+                        false,
+                    ), // 14
+                    AccountMeta::new_readonly(event_authority, false), // 15
+                    AccountMeta::new_readonly(program_id, false), // 16
+                    AccountMeta::new(coin_creator_vault_ata, false), // 17
+                    AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
+                ];
+                Self::push_pump_amm_sell_global_fee_metas(
                     &mut metas,
-                    pool_market,
-                    base_mint,
-                    user,
-                    quote_mint,
-                    quote_tp,
-                    third,
-                    true,
-                    sell_requires_fee_tail,
-                    sell_extended_fee_tail_0,
-                    sell_extended_fee_tail_1,
-                    sell_extended_tail_0,
-                    sell_extended_tail_1,
-                    cold_path_prefer_derived_on_mismatch,
-                    false,
+                    sell_requires_pre_fee_metas,
+                    global_volume_accumulator,
+                    sell_pre_fee_meta_1,
+                    sell_fee_config,
+                    sell_fee_program,
                 )?;
-                metas
-            } else if sell_requires_cashback_remaining {
-                let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
-                else {
-                    return Err(anyhow!(
-                        "pump_amm BUY: extended layout required but sell_cashback_third_meta missing (Geyser/LivePoolCache observation required)"
-                    ));
-                };
-                let mut metas = buy_base;
-                metas.push(AccountMeta::new_readonly(program_id, false)); // 16
-                metas.push(AccountMeta::new(global_volume_accumulator, false)); // 17
-                metas.push(AccountMeta::new(coin_creator_vault_ata, false)); // 18
-                metas.push(AccountMeta::new_readonly(buy_fee_config, false)); // 19
-                metas.push(AccountMeta::new_readonly(buy_fee_program, false)); // 20
-                volume_quote_ata_create = Self::push_pump_amm_sell_extended_trailing_metas(
-                    &mut metas,
-                    pool_market,
-                    base_mint,
-                    user,
-                    quote_mint,
-                    quote_tp,
-                    third,
-                    false,
-                    sell_requires_fee_tail,
-                    sell_extended_fee_tail_0,
-                    sell_extended_fee_tail_1,
-                    sell_extended_tail_0,
-                    sell_extended_tail_1,
-                    cold_path_prefer_derived_on_mismatch,
-                    false,
-                )?;
-                metas
-            } else if sell_requires_pre_fee_metas {
-                return Err(anyhow!(
-                    "pump_amm BUY: partial extended layout flags (pre_fee={sell_requires_pre_fee_metas}, cashback={sell_requires_cashback_remaining}) — need authoritative v2 layout from LivePoolCache"
-                ));
-            } else {
-                let mut metas = buy_base;
-                metas.push(AccountMeta::new(global_volume_accumulator, false)); // 16
-                metas.push(AccountMeta::new(coin_creator_vault_ata, false)); // 17
-                metas.push(AccountMeta::new_readonly(
-                    coin_creator_vault_authority,
-                    false,
-                )); // 18
-                metas.push(AccountMeta::new(user_vol, false)); // 19
-                metas.push(AccountMeta::new_readonly(buy_fee_config, false)); // 20
-                metas.push(AccountMeta::new_readonly(buy_fee_program, false)); // 21
-                metas.push(AccountMeta::new_readonly(program_id, false)); // 22
-                metas
-            }
-        } else {
-            // SELL: 21 base metas; some pools require three trailing accounts (mainnet 24-account sells).
-            let mut metas = vec![
-                AccountMeta::new(pool_market, false),                     // 0
-                AccountMeta::new(user, true),                             // 1
-                AccountMeta::new_readonly(global_config, false),          // 2
-                AccountMeta::new_readonly(base_mint, false),              // 3
-                AccountMeta::new_readonly(quote_mint, false),             // 4
-                AccountMeta::new(user_base_ta, false),                    // 5
-                AccountMeta::new(user_quote_ta, false),                   // 6
-                AccountMeta::new(pool_base_vault, false),                 // 7
-                AccountMeta::new(pool_quote_vault, false),                // 8
-                AccountMeta::new_readonly(protocol_fee_recipient, false), // 9
-                AccountMeta::new(protocol_fee_recipient_ta, false),       // 10
-                AccountMeta::new_readonly(base_tp, false), // 11 - base token program (Token-2022 aware)
-                AccountMeta::new_readonly(quote_tp, false), // 12 - quote token program (always SPL)
-                AccountMeta::new_readonly(
-                    Pubkey::new_from_array(solana_system_program::id().to_bytes()),
-                    false,
-                ), // 13
-                AccountMeta::new_readonly(
-                    Pubkey::new_from_array(spl_associated_token_account::id().to_bytes()),
-                    false,
-                ), // 14
-                AccountMeta::new_readonly(event_authority, false), // 15
-                AccountMeta::new_readonly(program_id, false), // 16
-                AccountMeta::new(coin_creator_vault_ata, false), // 17
-                AccountMeta::new_readonly(coin_creator_vault_authority, false), // 18
-            ];
-            Self::push_pump_amm_sell_global_fee_metas(
-                &mut metas,
-                sell_requires_pre_fee_metas,
-                global_volume_accumulator,
-                sell_pre_fee_meta_1,
-                sell_fee_config,
-                sell_fee_program,
-            )?;
-            if sell_requires_cashback_remaining {
-                let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
-                else {
-                    return Err(anyhow!(
+                if sell_requires_cashback_remaining {
+                    let Some(third) = sell_cashback_third_meta.filter(|p| *p != Pubkey::default())
+                    else {
+                        return Err(anyhow!(
                         "pump_amm SELL: extended layout required but sell_cashback_third_meta missing (MASTER/Geyser observation required)"
                     ));
-                };
-                volume_quote_ata_create = Self::push_pump_amm_sell_extended_trailing_metas(
-                    &mut metas,
-                    pool_market,
-                    base_mint,
-                    user,
-                    quote_mint,
-                    quote_tp,
-                    third,
-                    sell_requires_pre_fee_metas,
-                    sell_requires_fee_tail,
-                    sell_extended_fee_tail_0,
-                    sell_extended_fee_tail_1,
-                    sell_extended_tail_0,
-                    sell_extended_tail_1,
-                    cold_path_prefer_derived_on_mismatch,
-                    true,
-                )?;
-            }
-            metas
+                    };
+                    volume_quote_ata_create = Self::push_pump_amm_sell_extended_trailing_metas(
+                        &mut metas,
+                        pool_market,
+                        base_mint,
+                        user,
+                        quote_mint,
+                        quote_tp,
+                        third,
+                        sell_requires_pre_fee_metas,
+                        sell_requires_fee_tail,
+                        sell_extended_fee_tail_0,
+                        sell_extended_fee_tail_1,
+                        sell_extended_tail_0,
+                        sell_extended_tail_1,
+                        cold_path_prefer_derived_on_mismatch,
+                        true,
+                    )?;
+                }
+                metas
+            };
+            (metas, data)
         };
 
         let swap_ix = Instruction {
@@ -9887,7 +9797,146 @@ mod tests {
         assert_ne!(tail_2, Pubkey::default());
     }
 
-    /// Arb/cross-dex regression: 27-account `buy_exact_quote_in` must place AMM program at #16, not singleton GVA at #16 (prod Custom(3008)).
+    fn pump_amm_test_v14_pool_accounts(pool_market: Pubkey, base_mint: Pubkey) -> Vec<Pubkey> {
+        vec![
+            pool_market,
+            Pubkey::from_str(PUMPFUN_AMM_GLOBAL_CONFIG).unwrap(),
+            base_mint,
+            Pubkey::from_str(WSOL_MINT).unwrap(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap(),
+            Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
+        ]
+    }
+
+    /// A.58: Pump arb BUY is always `buy_exact_quote_in_v2` (17 accounts); sell cashback flags must not expand the buy.
+    #[test]
+    fn a58_buy_exact_quote_in_v2_layout_and_invariants() {
+        let program_id = Pubkey::from_str(PUMPFUN_AMM_PROGRAM_ID).unwrap();
+        let fee_config = Pubkey::from_str(PUMPFUN_AMM_FEE_CONFIG).unwrap();
+        let user_a = Pubkey::new_unique();
+        let user_b = Pubkey::new_unique();
+        let mainnet_user =
+            Pubkey::from_str("DqmCUWSvw82faoweZcMh9Mvg56vYfmp1mydt7DKo3Kn6").unwrap();
+        let expected_mainnet_vol =
+            Pubkey::from_str("6o1SKtkQBTSY1KVqGbsHGrh1dAzyBGkLC86635CN4EuU").unwrap();
+        let base_mint = Pubkey::new_unique();
+        let pool_market = Pubkey::new_unique();
+        let coin_creator_ata = Pubkey::new_unique();
+        let token_2022 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+        let v2_disc = anchor_disc("buy_exact_quote_in_v2");
+        let legacy_buy_disc = anchor_disc("buy_exact_quote_in");
+
+        let build_buy = |user: Pubkey, coin_ata: Pubkey, tp: Option<Pubkey>| {
+            let mut v14 = pump_amm_test_v14_pool_accounts(pool_market, base_mint);
+            v14[9] = coin_ata;
+            PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+                WSOL_MINT,
+                &base_mint.to_string(),
+                42,
+                7,
+                user,
+                &v14,
+                tp,
+                true,
+                Some(Pubkey::new_unique()),
+                true,
+                None,
+                Some(Pubkey::new_unique()),
+                Some(Pubkey::new_unique()),
+                None,
+                None,
+                true,
+                false,
+            )
+        };
+
+        let ixs = build_buy(user_a, coin_creator_ata, Some(token_2022)).expect("buy build");
+        let ix = pump_amm_swap_ix_from_build(&ixs);
+        assert_eq!(ix.accounts.len(), PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS);
+        assert_eq!(ix.data.len(), 24);
+        assert_eq!(&ix.data[0..8], &v2_disc);
+        assert!(!ix.data.windows(8).any(|w| w == legacy_buy_disc));
+        assert_eq!(
+            ix.accounts[PUMPFUN_AMM_BUY_V2_FEE_CONFIG_IX].pubkey,
+            fee_config
+        );
+        assert_eq!(
+            ix.accounts[PUMPFUN_AMM_BUY_V2_PROGRAM_IX].pubkey,
+            program_id
+        );
+        assert_eq!(ix.accounts[9].pubkey, token_2022);
+        let vol_a = PumpFunAmmDex::derive_pump_amm_user_volume_accumulator_for_sell_cashback(
+            program_id, user_a,
+        );
+        assert_eq!(ix.accounts[PUMPFUN_AMM_BUY_V2_USER_VOLUME_IX].pubkey, vol_a);
+        let vol_b = PumpFunAmmDex::derive_pump_amm_user_volume_accumulator_for_sell_cashback(
+            program_id, user_b,
+        );
+        assert_ne!(vol_a, vol_b);
+        let ixs_b = build_buy(user_b, coin_creator_ata, Some(token_2022)).expect("buy b");
+        assert_ne!(
+            pump_amm_swap_ix_from_build(&ixs_b).accounts[PUMPFUN_AMM_BUY_V2_USER_VOLUME_IX].pubkey,
+            vol_a
+        );
+        let ixs_mainnet = build_buy(
+            mainnet_user,
+            coin_creator_ata,
+            Some(test_spl_token_program()),
+        )
+        .expect("mainnet user buy");
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs_mainnet).accounts[PUMPFUN_AMM_BUY_V2_USER_VOLUME_IX]
+                .pubkey,
+            expected_mainnet_vol
+        );
+        let writable: [bool; 17] = [
+            true, true, false, false, false, true, true, true, true, false, false, false, true,
+            false, true, false, false,
+        ];
+        for (i, w) in writable.iter().enumerate() {
+            assert_eq!(
+                ix.accounts[i].is_writable, *w,
+                "writable mismatch at index {i}"
+            );
+        }
+
+        let mut v14_missing = pump_amm_test_v14_pool_accounts(pool_market, base_mint);
+        v14_missing[9] = Pubkey::default();
+        let err = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+            WSOL_MINT,
+            &base_mint.to_string(),
+            1,
+            1,
+            user_a,
+            &v14_missing,
+            Some(test_spl_token_program()),
+            true,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect_err("missing coin creator ata");
+        assert!(
+            err.to_string().contains("coin_creator_vault_ata"),
+            "got: {err}"
+        );
+    }
+
+    /// A.58: extended sell/cashback cache flags must not expand BUY beyond 17 accounts (program at #16).
     #[test]
     fn p184g_build_swap_27_account_buy_program_slot_is_amm_not_pre_fee() {
         let pool_market = *PUMP_AMM_STUCK_POOL_MARKET;
@@ -9937,11 +9986,11 @@ mod tests {
             false,
             false,
         )
-        .expect("27-account BUY build");
+        .expect("BUY build with extended sell flags");
 
         assert_eq!(
             pump_amm_swap_ix_from_build(&ixs).accounts.len(),
-            PUMPFUN_AMM_SELL_EXTENDED_V2_TOTAL_ACCOUNTS
+            PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS
         );
         let program_ix =
             pump_amm_buy_program_ix_index(pump_amm_swap_ix_from_build(&ixs).accounts.len())
@@ -9952,10 +10001,6 @@ mod tests {
         );
         assert_ne!(
             pump_amm_swap_ix_from_build(&ixs).accounts[program_ix].pubkey,
-            singleton_gva
-        );
-        assert_eq!(
-            pump_amm_swap_ix_from_build(&ixs).accounts[PUMPFUN_AMM_SELL_PRE_FEE_0_IX_V2].pubkey,
             singleton_gva
         );
     }
@@ -10009,11 +10054,11 @@ mod tests {
             true,
             false,
         )
-        .expect("26-account BUY cashback extended");
+        .expect("BUY with sell cashback flags");
 
         assert_eq!(
             pump_amm_swap_ix_from_build(&ixs).accounts.len(),
-            PUMPFUN_AMM_SELL_CASHBACK_TOTAL_ACCOUNTS
+            PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS
         );
         let program_ix =
             pump_amm_buy_program_ix_index(pump_amm_swap_ix_from_build(&ixs).accounts.len())
@@ -10021,14 +10066,6 @@ mod tests {
         assert_eq!(
             pump_amm_swap_ix_from_build(&ixs).accounts[program_ix].pubkey,
             program_id
-        );
-        assert_eq!(
-            pump_amm_swap_ix_from_build(&ixs).accounts[PUMPFUN_AMM_BUY_EXT_FEE_CONFIG_IX].pubkey,
-            fee0
-        );
-        assert_eq!(
-            pump_amm_swap_ix_from_build(&ixs).accounts[PUMPFUN_AMM_BUY_EXT_FEE_PROGRAM_IX].pubkey,
-            fee1
         );
     }
 
@@ -10081,30 +10118,22 @@ mod tests {
             false,
             false,
         )
-        .expect("extended BUY with derived volume tails");
+        .expect("A.58 BUY ignores sell volume tails");
 
-        assert_eq!(ixs.len(), 2, "CreateIdempotent + swap");
-        let ata_prog = Pubkey::new_from_array(spl_associated_token_account::id().to_bytes());
-        assert_eq!(ixs[0].program_id, ata_prog);
-        assert!(
-            ixs[0].accounts.iter().any(|m| m.pubkey == derived_vol),
-            "create ix owner must be user volume PDA"
-        );
-        assert!(
-            ixs[0].accounts.iter().any(|m| m.pubkey == wsol),
-            "create ix mint must be quote (WSOL)"
-        );
-        assert!(
-            ixs[0].accounts.iter().any(|m| m.pubkey == quote_tp),
-            "create ix token program must be SPL Token for WSOL"
-        );
         assert_eq!(
-            pump_amm_swap_ix_from_build(&ixs).accounts[21].pubkey,
-            derived_vol_ata
+            ixs.len(),
+            1,
+            "single swap ix (no volume WSOL ATA create on buy v2)"
         );
+        let swap = pump_amm_swap_ix_from_build(&ixs);
+        assert_eq!(swap.accounts.len(), PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS);
         assert_eq!(
-            pump_amm_swap_ix_from_build(&ixs).accounts[22].pubkey,
+            swap.accounts[PUMPFUN_AMM_BUY_V2_USER_VOLUME_IX].pubkey,
             derived_vol
+        );
+        assert_ne!(
+            swap.accounts[PUMPFUN_AMM_BUY_V2_USER_VOLUME_IX].pubkey,
+            derived_vol_ata
         );
     }
 
@@ -10162,22 +10191,16 @@ mod tests {
             false,
             false,
         )
-        .expect("24-account BUY with sell pool-v2 tail in cache");
+        .expect("A.58 BUY with sell pool-v2 tail in cache");
 
-        assert_eq!(ixs.len(), 2, "CreateIdempotent + swap");
-        let ata_prog = Pubkey::new_from_array(spl_associated_token_account::id().to_bytes());
-        assert_eq!(ixs[0].program_id, ata_prog);
-        assert!(
-            ixs[0].accounts.iter().any(|m| m.pubkey == derived_vol),
-            "create ix owner must be user volume PDA"
-        );
+        assert_eq!(ixs.len(), 1);
+        let swap = pump_amm_swap_ix_from_build(&ixs);
         assert_eq!(
-            pump_amm_swap_ix_from_build(&ixs).accounts[21].pubkey,
-            derived_vol_ata,
-            "buy #21 must be derived volume WSOL ATA, not pool-v2 PDA"
+            swap.accounts[PUMPFUN_AMM_BUY_V2_USER_VOLUME_IX].pubkey,
+            derived_vol
         );
         assert_ne!(
-            pump_amm_swap_ix_from_build(&ixs).accounts[21].pubkey,
+            swap.accounts[PUMPFUN_AMM_BUY_V2_USER_VOLUME_IX].pubkey,
             pool_v2
         );
     }
@@ -10229,11 +10252,11 @@ mod tests {
             false,
             false,
         )
-        .expect("24-account BUY cashback extended");
+        .expect("BUY with cashback flags");
 
         assert_eq!(
             pump_amm_swap_ix_from_build(&ixs).accounts.len(),
-            PUMPFUN_AMM_SELL_EXTENDED_TOTAL_ACCOUNTS
+            PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS
         );
         let program_ix =
             pump_amm_buy_program_ix_index(pump_amm_swap_ix_from_build(&ixs).accounts.len())
@@ -10267,7 +10290,7 @@ mod tests {
             Pubkey::from_str(PUMPFUN_AMM_FEE_PROGRAM_ID).unwrap(),
         ];
 
-        let err = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
+        let ixs = PumpFunAmmDex::build_swap_ix_from_pool_accounts_with_extended_tail(
             WSOL_MINT,
             &base_mint.to_string(),
             1,
@@ -10286,16 +10309,11 @@ mod tests {
             false,
             false,
         )
-        .expect_err("must fail without third_meta");
+        .expect("A.58 BUY must not depend on sell third_meta");
 
-        let msg = err.to_string();
-        assert!(
-            msg.contains("sell_cashback_third_meta missing"),
-            "expected third_meta missing error, got: {msg}"
-        );
-        assert!(
-            !msg.contains("partial extended layout flags"),
-            "must not surface misleading partial-flag error: {msg}"
+        assert_eq!(
+            pump_amm_swap_ix_from_build(&ixs).accounts.len(),
+            PUMPFUN_AMM_BUY_V2_TOTAL_ACCOUNTS
         );
     }
 

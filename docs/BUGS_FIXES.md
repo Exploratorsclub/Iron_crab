@@ -8,6 +8,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-PUMP-ARB-BUY-V2: Arb-Pump-Buy nutzte `buy_exact_quote_in` mit GVA statt `buy_exact_quote_in_v2` (A.58)
+**Datum**: 2026-10-24  
+**Problem**: Prod `7751521`: 30 Simulationen `InstructionError(4, Custom(3007))` — `BuyExactQuoteIn` mit falschem `global_volume_accumulator` (Fee-Program-Owner statt AMM). Cashback-Sell-Layout koppelte den Buy an 23–27 Accounts; Live-Swaps auf dem Pool sind `buy_exact_quote_in_v2` (17 Accounts, kein GVA).  
+**Fix**: Buy-Builder (Arb/`build_swap_ix_from_pool_accounts*`, `build_swap_ix`) emittiert immer Discriminator `buy_exact_quote_in_v2` mit 17 Accounts (User-Volume-PDA nur User-Seed, FeeConfig-Konstante, `coin_creator_vault_ata` aus v14[9]). Sell-Layout-Flags gelten nur für die Sell-Leg. Parser-Schwelle 23 Accounts unverändert.  
+**Invarianten**: A.58, I-7, I-4, I-9, I-12.  
+**Dateien**: `src/solana/dex/pumpfun_amm.rs`, `src/solana/cross_dex_handler.rs`, `src/solana/dex_parser.rs` (Unit-Test), `docs/BUGS_FIXES.md`
+
 ### FIX-TOKEN-PROGRAM-JETSTREAM: Arb-Tracker leer nach Neustart trotz TokenMintInfo (Prod `964d743`, A.57)
 **Datum**: 2026-10-23  
 **Problem**: Prod `964d743`: Quotes liefen, 0 Arb-Intents. `create_arb_intent` lehnte mit `token program unknown (GEYSER-FIRST)` ab. `TokenMintInfo` ging nur über Core-NATS (nicht persistent); nach Neustart oder verlorenen Mint-Updates blieb `TokenArbTracker.token_program` leer, obwohl Vault/Mint-Owner schon beobachtet waren.  
