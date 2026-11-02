@@ -268,6 +268,8 @@ const ARB_POOL_CACHE_APPLY_BATCH_MAX: usize = 20;
 const ARB_TRACKER_WRITE_QUEUE_CAP: usize = 8192;
 /// Slots left free on the tracker-write queue for ApplyTrade / FinalizeOpportunity.
 const ARB_TRACKER_WRITE_TRADE_RESERVE: usize = 256;
+/// Max SeedPoolCache jobs moved from coalescer to queue per flush call.
+const ARB_TRACKER_WRITE_SEED_FLUSH_BATCH: usize = 32;
 /// Max distinct pool keys coalesced before latest-wins eviction (tracker-write ingress).
 const ARB_TRACKER_WRITE_COALESCER_CAP: usize = 65536;
 /// Bounded side-map for DexPoolAccounts that arrive before a mint tracker exists.
@@ -5102,7 +5104,7 @@ impl ArbTrackerWriteCoalescer {
         TrackerWriteCoalescerInsert::Queued
     }
 
-    fn flush(&mut self, handle: &ArbTrackerWriteHandle) {
+    fn flush_pool_state_and_dex(&mut self, handle: &ArbTrackerWriteHandle) {
         let pool_keys: Vec<String> = self.pool_state_updates.keys().cloned().collect();
         for key in pool_keys {
             let Some(job) = self.pool_state_updates.remove(&key) else {
@@ -5129,19 +5131,48 @@ impl ArbTrackerWriteCoalescer {
                 }
             }
         }
-        let seed_keys: Vec<String> = self.seed_pool_cache.keys().cloned().collect();
-        for key in seed_keys {
+    }
+
+    fn flush_seed_pool_cache_batch(&mut self, handle: &ArbTrackerWriteHandle, max_seeds: usize) {
+        let mut sent = 0usize;
+        while sent < max_seeds {
+            let Some(key) = self.seed_pool_cache.keys().next().cloned() else {
+                break;
+            };
             let Some(job) = self.seed_pool_cache.remove(&key) else {
                 continue;
             };
             match handle.try_enqueue_coalescer_flush(job, ArbTrackerWriteJobType::SeedPoolCache) {
-                Ok(()) => arb_tracker_write_coalesced_flushed_inc(),
+                Ok(()) => {
+                    arb_tracker_write_coalesced_flushed_inc();
+                    sent += 1;
+                }
                 Err(job) => {
                     self.seed_pool_cache.insert(key, *job);
                     return;
                 }
             }
         }
+    }
+
+    #[allow(dead_code)] // unit tests call `coalescer.flush` directly
+    fn flush(&mut self, handle: &ArbTrackerWriteHandle) {
+        self.flush_pool_state_and_dex(handle);
+        self.flush_seed_pool_cache_batch(handle, ARB_TRACKER_WRITE_SEED_FLUSH_BATCH);
+    }
+
+    #[cfg(test)]
+    fn flush_pool_state_and_dex_for_test(&mut self, handle: &ArbTrackerWriteHandle) {
+        self.flush_pool_state_and_dex(handle);
+    }
+
+    #[cfg(test)]
+    fn flush_seed_pool_cache_batch_for_test(
+        &mut self,
+        handle: &ArbTrackerWriteHandle,
+        max_seeds: usize,
+    ) {
+        self.flush_seed_pool_cache_batch(handle, max_seeds);
     }
 
     #[cfg(test)]
@@ -5497,7 +5528,7 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
                     let (reply_tx, reply_rx) = oneshot::channel();
                     // Flush coalesced PoolStateUpdates before ApplyTrade so writer applies fresh
                     // reserves (FIFO) before apply_trade_to_tracker.
-                    ctx.flush_tracker_write_coalescer();
+                    ctx.flush_tracker_write_coalescer_before_apply_trade();
                     if !ctx.tracker_write.try_enqueue(
                         ArbTrackerWriteJob::ApplyTrade {
                             job: job.clone(),
@@ -5508,6 +5539,7 @@ fn spawn_arb_two_hop_worker(ctx: Arc<ArbContext>, mut rx: mpsc::Receiver<ArbTwoH
                         debug!("Dropped ApplyTrade (tracker-write queue full)");
                         continue;
                     }
+                    ctx.flush_tracker_write_coalescer_seed_batch();
                     set_arb_two_hop_blocked_on_apply_trade(true);
                     let apply_result = match reply_rx.await {
                         Ok(Some(result)) => result,
@@ -5955,9 +5987,24 @@ impl ArbContext {
         result
     }
 
+    fn flush_tracker_write_coalescer_before_apply_trade(&self) {
+        let mut coalescer = self.tracker_write_coalescer.lock();
+        coalescer.flush_pool_state_and_dex(&self.tracker_write);
+        set_arb_tracker_write_coalescer_pending(coalescer.pending_len() as u64);
+    }
+
+    fn flush_tracker_write_coalescer_seed_batch(&self) {
+        let mut coalescer = self.tracker_write_coalescer.lock();
+        coalescer
+            .flush_seed_pool_cache_batch(&self.tracker_write, ARB_TRACKER_WRITE_SEED_FLUSH_BATCH);
+        set_arb_tracker_write_coalescer_pending(coalescer.pending_len() as u64);
+    }
+
     fn flush_tracker_write_coalescer(&self) {
         let mut coalescer = self.tracker_write_coalescer.lock();
-        coalescer.flush(&self.tracker_write);
+        coalescer.flush_pool_state_and_dex(&self.tracker_write);
+        coalescer
+            .flush_seed_pool_cache_batch(&self.tracker_write, ARB_TRACKER_WRITE_SEED_FLUSH_BATCH);
         set_arb_tracker_write_coalescer_pending(coalescer.pending_len() as u64);
     }
 
@@ -11516,6 +11563,52 @@ mod event_pipeline_tests {
             tx.capacity(),
             capacity_before_second_flush,
             "second seed flush must stop when free capacity equals reserve"
+        );
+    }
+
+    #[test]
+    fn reserve_tracker_write_apply_trade_precedes_seeds_in_queue() {
+        use ironcrab::metrics::ArbTrackerWriteJobType;
+
+        let channel_cap = 512_usize;
+        let (tx, mut rx) = mpsc::channel::<ArbTrackerWriteJob>(channel_cap);
+        let handle = ArbTrackerWriteHandle {
+            tx: tx.clone(),
+            capacity: channel_cap,
+        };
+        let mut coalescer = ArbTrackerWriteCoalescer::new();
+        for i in 0..100usize {
+            coalescer.insert_seed_pool_cache(
+                sample_pool_cache_update_for_coalescer(&format!("pool-seed-{i}"), i as u64),
+                ARB_TRACKER_WRITE_COALESCER_CAP,
+            );
+        }
+        coalescer.flush_pool_state_and_dex_for_test(&handle);
+        assert!(handle.try_enqueue(
+            sample_apply_trade_tracker_job(),
+            ArbTrackerWriteJobType::ApplyTrade,
+        ));
+        coalescer.flush_seed_pool_cache_batch_for_test(&handle, ARB_TRACKER_WRITE_SEED_FLUSH_BATCH);
+
+        match rx.try_recv() {
+            Ok(ArbTrackerWriteJob::ApplyTrade { .. }) => {}
+            Ok(_) | Err(_) => panic!("ApplyTrade must be first job in queue"),
+        }
+        let mut seeds_after_trade = 0usize;
+        while let Ok(job) = rx.try_recv() {
+            match job {
+                ArbTrackerWriteJob::SeedPoolCache { .. } => seeds_after_trade += 1,
+                _ => panic!("only SeedPoolCache may follow ApplyTrade in this scenario"),
+            }
+        }
+        assert!(
+            seeds_after_trade <= ARB_TRACKER_WRITE_SEED_FLUSH_BATCH,
+            "at most {seeds_after_trade} seeds may follow ApplyTrade"
+        );
+        assert_eq!(
+            coalescer.pending_len(),
+            100 - seeds_after_trade,
+            "remaining seeds stay in coalescer"
         );
     }
 
