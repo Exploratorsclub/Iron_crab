@@ -8,6 +8,13 @@ Erstellt: 2026-02-13 | Branch: `architecture-rebuild`
 
 ## 1. BEHOBENE BUGS (Fixes deployed/committed)
 
+### FIX-ARB-TRACKER-WRITE-TRADE-RESERVE: SeedPoolCache füllte tracker-write Queue, ApplyTrade kaum noch (Prod `309cb09`)
+**Datum**: 2026-11-02  
+**Problem**: Prod `309cb09`: `arb_tracker_write_queue_depth` dauerhaft 8192/8192; Seeds per `try_enqueue` teilten FIFO mit ApplyTrade — ~1589 Seeds/30s, nur 1 ApplyTrade, Screen stagnierte.  
+**Fix**: `SeedPoolCache` über `ArbTrackerWriteCoalescer` (latest-wins pro Pool-Adresse). Coalescer-Flush reserviert die letzten 256 Kanal-Slots für ApplyTrade/FinalizeOpportunity. Vor ApplyTrade nur PoolState/Dex-Flush; Seeds höchstens 32 pro Flush und erst nach erfolgreichem ApplyTrade-Enqueue (hinter dem Trade in der FIFO). Sonstige `flush_tracker_write_coalescer`-Aufrufe: PoolState/Dex unbegrenzt mit Reserve, Seeds max. 32.
+**Invarianten**: I-4, I-7, I-9, I-12 unverändert (kein Quote/Send/Intent-Gate).  
+**Dateien**: `src/bin/arb_strategy.rs`, `docs/BUGS_FIXES.md`
+
 ### FIX-PUMP-ARB-BUY-V2: Arb-Pump-Buy nutzte `buy_exact_quote_in` mit GVA statt `buy_exact_quote_in_v2` (A.58)
 **Datum**: 2026-10-24  
 **Problem**: Prod `7751521`: 30 Simulationen `InstructionError(4, Custom(3007))` — `BuyExactQuoteIn` mit falschem `global_volume_accumulator` (Fee-Program-Owner statt AMM). Cashback-Sell-Layout koppelte den Buy an 23–27 Accounts; Live-Swaps auf dem Pool sind `buy_exact_quote_in_v2` (17 Accounts, kein GVA).  
